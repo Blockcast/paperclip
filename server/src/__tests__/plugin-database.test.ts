@@ -206,6 +206,762 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/disallowed/i);
   });
 
+  // PEN-6600. Postgres lexes `.` as its own token, so a qualifying dot may carry
+  // whitespace, a newline or a comment on either side. The ref patterns used to
+  // require a BARE dot, so every form below extracted NO ref at all -- and
+  // `validatePluginRuntimeQuery` had no floor, so an empty ref set read as
+  // permission. Each `toThrow` here passes on the fixed extractor and fails on the
+  // old one; the `not.toThrow` controls fail on a guard that simply refuses
+  // everything.
+  describe("a qualifying dot that is not bare (PEN-6600)", () => {
+    const unreadableReads = {
+      "a space on both sides": "SELECT * FROM public . secrets",
+      "a space on the left only": "SELECT * FROM public .secrets",
+      "a space on the right only": "SELECT * FROM public. secrets",
+      "quoted identifiers and spaces": 'SELECT * FROM "public" . "secrets"',
+      "a newline": "SELECT * FROM public\n.\nsecrets",
+      "a block comment as the separator": "SELECT * FROM public/**/.secrets",
+      "a block comment before the schema": "SELECT * FROM/**/public.secrets",
+    };
+
+    for (const [label, statement] of Object.entries(unreadableReads)) {
+      it(`refuses a cross-schema read written with ${label}`, () => {
+        expect(() => validatePluginRuntimeQuery(statement, "plugin_test", ["issues"])).toThrow();
+      });
+    }
+
+    it("refuses a cross-schema WRITE whose target the extractor cannot read", () => {
+      // The in-namespace FROM ref used to be promoted into `target` while the real
+      // write target was never extracted at all, so the namespace check adjudicated
+      // the wrong object and allowed the write.
+      expect(() =>
+        validatePluginRuntimeExecute(
+          'UPDATE "public" . "agents" SET name = $1 FROM plugin_test.rows',
+          "plugin_test",
+        )
+      ).toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO public . agents SELECT id FROM plugin_test.rows",
+          "plugin_test",
+        )
+      ).toThrow();
+    });
+
+    it("still reads a ref written with a bare dot", () => {
+      // The positive control for the pattern change: tolerating whitespace must not
+      // stop the extractor reading the ordinary form, in either verdict direction.
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM plugin_test.rows", "plugin_test")
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM public.issues", "plugin_test", ["issues"])
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM public.secrets", "plugin_test", ["issues"])
+      ).toThrow(/whitelisted/i);
+    });
+  });
+
+  // The half that fails closed on a lexical form nobody anticipated. The pattern fix
+  // above is a blocklist of the shapes we thought of; this refuses an extraction that
+  // yielded nothing, whatever caused it.
+  describe("ctx.db.query refuses a statement it could not read (PEN-6600)", () => {
+    it("refuses a statement that qualifies no relation at all", () => {
+      // Nothing on this path sets `search_path`, so an UNQUALIFIED name resolves
+      // against `public` and reads a core table. The floor closes that only when the
+      // statement qualifies NOTHING -- `FROM plugin_test.rows, secrets` makes the ref
+      // count 1 and still reads `public.secrets`. See PEN-6604; do not read these two
+      // cases as the hole being shut.
+      expect(() => validatePluginRuntimeQuery("SELECT * FROM issues", "plugin_test", ["issues"]))
+        .toThrow(/schema\.table/i);
+      expect(() => validatePluginRuntimeQuery("SELECT * FROM secrets", "plugin_test"))
+        .toThrow(/schema\.table/i);
+    });
+
+    it("refuses a relation the keyword-anchored patterns cannot reach", () => {
+      // A ref COUNT floor cannot see this one: the first operand of the list is read
+      // and adjudicated, and the second is matched by nothing.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, public.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow(/adjudicate/i);
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "UPDATE plugin_test.a SET x = 1 FROM plugin_test.b, public.secrets",
+          "plugin_test",
+        )
+      ).toThrow(/adjudicate/i);
+    });
+
+    it("leaves a column read through a table alias alone", () => {
+      // The detector keys on SCHEMA-shaped left-hand sides, so ordinary aliased
+      // column reads are none of its business. Without this the guard would refuse
+      // essentially every real query.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT c.id, p.name FROM plugin_test.cursors c LEFT JOIN public.issues p ON p.id = c.issue_id",
+          "plugin_test",
+          ["issues"],
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO plugin_test.a (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("still allows a migration COMMENT on a three-part name", () => {
+      // `COMMENT ON COLUMN` names schema.table.column, which the ref patterns were
+      // never built to read -- which is why the migration floor already exempts
+      // `comment `. The detector inherits the same carve-out rather than inventing a
+      // second rule that disagrees with it.
+      expect(() =>
+        validatePluginMigrationStatement(
+          "COMMENT ON COLUMN plugin_test.rows.id IS 'the row id'",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+  });
+
+  // Ally's round-1 review of this PR reproduced both of these as ALLOW at head
+  // 478a92f4, and both were pre-existing on master rather than introduced here.
+  describe("a relation the extractor could not lex, and a write target it could not read (PEN-6600)", () => {
+    it("refuses a qualified name whose dot is separated by a comment", () => {
+      // `public/**/.secrets` is one schema-qualified name to Postgres: a comment is
+      // whitespace. The ref patterns span `\s*` only, so before `stripSqlComments`
+      // this was invisible to the extractor AND to the detector that backstops it,
+      // and the `refs.length === 0` floor could not fire because the OTHER relation
+      // in the list made the count 1.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, public/**/.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows JOIN public/**/.secrets ON true",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "UPDATE public/**/.agents SET name = $1 FROM plugin_test.rows",
+          "plugin_test",
+        )
+      ).toThrow();
+    });
+
+    it("refuses an execute whose write target is not a schema-qualified name", () => {
+      // The target used to be the first ref carrying any of {into, update, from}.
+      // `from` is in that set for `DELETE FROM x.y`, so an UNQUALIFIED target --
+      // extracted by nothing -- promoted the in-namespace FROM operand into the
+      // target slot and the write landed on `public.agents` through `search_path`.
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "UPDATE agents SET name = $1 FROM plugin_test.rows",
+          "plugin_test",
+        )
+      ).toThrow(/schema\.table/i);
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO agents SELECT * FROM plugin_test.rows",
+          "plugin_test",
+        )
+      ).toThrow(/schema\.table/i);
+      expect(() =>
+        validatePluginRuntimeExecute("DELETE FROM issues WHERE id = $1", "plugin_test")
+      ).toThrow(/schema\.table/i);
+    });
+
+    it("still allows the write shapes the shipped plugins actually use", () => {
+      // Positive controls taken from the alertmanager and llm-wiki corpora: an
+      // aliased UPDATE ... FROM, an aliased INSERT ... ON CONFLICT, and a DELETE.
+      // A target rule that refused these would break a live plugin.
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "UPDATE plugin_test.members AS m SET resolved_at = NULL FROM plugin_test.covers c WHERE c.id = m.cover_id",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO plugin_test.spaces AS s (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "DELETE FROM plugin_test.claims WHERE company_id = $1",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          'UPDATE "plugin_test"."rows" SET name = $1',
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("keeps a comment that is not inside a qualified name harmless", () => {
+      // `stripSqlComments` replaces a comment with the single space Postgres already
+      // treats it as, so stripping must not glue two tokens together or change a
+      // verdict on ordinary commented SQL.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT id -- the row id\nFROM plugin_test.rows",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginMigrationStatement(
+          "CREATE TABLE plugin_test.t /* new */ (id uuid PRIMARY KEY)",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+  });
+
+
+  describe("an identifier whose decoded name is not the characters that spell it (PEN-6600)", () => {
+    it("refuses a Unicode-escape identifier on all three paths", () => {
+      // `U&"\0070ublic"` IS `public` to Postgres -- measured against a real engine,
+      // `SELECT name FROM U&"\0070ublic".secrets` returns the row, and the negative
+      // control `U&"\0070ubliz"` fails with `relation "publiz.secrets" does not exist`,
+      // so the decode is what resolves the name.
+      //
+      // Every control in this file reads the CHARACTERS. `QUALIFIED_NAME` matches its
+      // leftmost candidate at `ublic".secrets`, yielding schema `ublic`, which
+      // `SCHEMA_SHAPED_RE` skips as a table alias -- so the extractor, the detector and
+      // the write-target reader all agreed the statement did not touch `public`.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          String.raw`SELECT * FROM plugin_test.rows, U&"\0070ublic".secrets`,
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow(/unicode-escape identifier/i);
+      expect(() =>
+        validatePluginRuntimeExecute(
+          String.raw`INSERT INTO plugin_test.rows SELECT * FROM U&"\0070ublic".secrets`,
+          "plugin_test",
+        )
+      ).toThrow(/unicode-escape identifier/i);
+      expect(() =>
+        validatePluginMigrationStatement(
+          String.raw`WITH t AS (UPDATE U&"\0070ublic".agents SET name='x' RETURNING id) INSERT INTO plugin_test.log SELECT id FROM t`,
+          "plugin_test",
+          ["agents"],
+        )
+      ).toThrow(/unicode-escape identifier/i);
+    });
+
+    it("refuses it through an escape-string literal that desyncs the quote scanner", () => {
+      // The guard reads the RAW statement, not `normaliseSql` output. Postgres reads
+      // `E'\''` as a complete one-character literal; `stripSqlForKeywordScan` and
+      // `scanSqlSpans` both close the span at the second quote and open a new one at
+      // the third, so everything up to the next quote is blanked -- including a `U&"`
+      // living in it. Against the blanked text all three of these ALLOWED.
+      //
+      // The control below is the point: the same shape naming a plain `public.secrets`
+      // refused either way, so this was specific to the `U&` guard's input, not a
+      // general desync of the detector.
+      //
+      // REBASE NOTE (PEN-6600 onto PEN-5951): these three inputs now meet PEN-5951's
+      // `assertNoEscapeStringLiterals` first, so they are refused for carrying an
+      // `E'...'` prefix rather than for the `U&"..."` inside it. The refusal is the
+      // same and it is strictly EARLIER; the message is what moved. The `U&` guard
+      // itself stays pinned by the three sibling assertions above, which carry no
+      // escape string at all -- so this loosening costs the guard no coverage.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          String.raw`SELECT * FROM plugin_test.rows WHERE a = E'\'' AND b IN (SELECT 1 FROM U&"\0070ublic".secrets) AND c = ''`,
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow(/escape string literal|unicode-escape identifier/i);
+      expect(() =>
+        validatePluginRuntimeExecute(
+          String.raw`INSERT INTO plugin_test.rows SELECT E'\'' FROM U&"\0070ublic".secrets WHERE ''=''`,
+          "plugin_test",
+        )
+      ).toThrow(/escape string literal|unicode-escape identifier/i);
+      expect(() =>
+        validatePluginRuntimeExecute(
+          String.raw`UPDATE plugin_test.rows SET a = E'\'' FROM U&"\0070ublic".secrets WHERE ''=''`,
+          "plugin_test",
+        )
+      ).toThrow(/escape string literal|unicode-escape identifier/i);
+      // Control: plain `public.secrets` in the same shape was refused before this fix
+      // too, by the detector rather than by this guard.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          String.raw`SELECT * FROM plugin_test.rows WHERE a = E'\'' AND b IN (SELECT 1 FROM public.secrets) AND c = ''`,
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("does not refuse an ordinary `&` that merely ends in u", () => {
+      // The refusal is anchored on a word boundary. Without it, a column whose name
+      // ends in `u` bitwise-anded with a quoted name would be refused, and that is a
+      // different token sequence entirely -- a guard that refuses it refuses valid SQL.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          'SELECT menu&"mask" AS flags FROM plugin_test.rows',
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("keeps allowing the quoted identifiers the shipped plugins do use", () => {
+      expect(() =>
+        validatePluginRuntimeQuery('SELECT * FROM "plugin_test".rows', "plugin_test")
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery('SELECT * FROM "plugin_test"."rows"', "plugin_test")
+      ).not.toThrow();
+    });
+
+    it("refuses a relation smuggled past the extractor by a dollar-quoted string", () => {
+      // PINS A DELIBERATE NON-CHANGE. `scanSqlSpans` has no dollar-quote rule, so the
+      // apostrophe inside `$$x'y$$` opens a quoted span that runs to end of input and
+      // swallows the rest of the statement. `stripSqlComments` keeps quoted spans
+      // VERBATIM, so the extractor and the detector still read that tail and refuse the
+      // `public.secrets` in it. Measured against a real Postgres engine: this statement
+      // is ACCEPTED and returns the row, so the refusal is load-bearing.
+      //
+      // ⛔ Blanking `'`-quoted spans before the detector -- an obvious way to stop a
+      // string LITERAL that merely contains a dotted name from being refused -- turns
+      // this case ALLOW, because a span this lexer calls "quoted" is not always a
+      // literal. Teaching the lexer dollar-quoting is PEN-5951; until then this test is
+      // what makes that trade visible instead of silent.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = $$x'y$$ AND b IN (SELECT secrets.c FROM plugin_test.t, public.secrets)",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("refuses a ref the comment strip DELETED when a quote desync inverted parity", () => {
+      // REGRESSION, caught by Ally at e4dd4f956. Routing the extractor and the detector
+      // through `stripSqlComments` closed the `public/**\/.secrets` form and opened a
+      // worse one: `scanSqlSpans` has no rule for `E'\''` or for dollar quotes, so once
+      // quote parity is inverted a `/*` inside a REAL string literal reads as a comment
+      // open and every byte to the next `*\/` is deleted from the stripped text --
+      // taking `public.secrets` with it. `master` refused all three of these; the
+      // reviewed head ALLOWED them, and the third COPIES core rows into a plugin table.
+      //
+      // The fix is not a new ban: a pre-pass may only ADD to what gets checked, so both
+      // halves now read the raw statement AND the stripped one. See
+      // `collectQualifiedRefs`.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          String.raw`SELECT * FROM plugin_test.rows WHERE a = E'\'' AND b = ' /* ' UNION SELECT * FROM public.secrets WHERE c = ' */ '`,
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery(
+          String.raw`SELECT * FROM plugin_test.rows WHERE a = $'$ AND b = ' /* ' UNION SELECT * FROM public.secrets WHERE c = ' */ '`,
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          String.raw`INSERT INTO plugin_test.rows (v) SELECT $'$ || ' /* ' FROM public.secrets WHERE ' */ ' = ''`,
+          "plugin_test",
+        )
+      ).toThrow();
+      // CONTROL, and it is the load-bearing arm: the same shape with no desync trigger
+      // refused at the reviewed head too, so the hole was specific to what the strip
+      // REMOVED and not a general failure of the detector.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          String.raw`SELECT * FROM plugin_test.rows WHERE a = 'x' AND b = ' /* ' UNION SELECT * FROM public.secrets WHERE c = ' */ '`,
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("still reads a comment sitting inside a qualified name", () => {
+      // POSITIVE CONTROL for the arm above: the stripped text is still required, so the
+      // fix must be a UNION of both texts and not a revert to reading raw only.
+      // `plugin_test/**\/.rows` is one name to Postgres and is invisible in raw text.
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM plugin_test/**/.rows", "plugin_test")
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO /*c*/ plugin_test.rows (v) VALUES ($1)",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      // A `/*` inside a literal with BALANCED quotes is not a comment and deletes
+      // nothing, so this must keep passing.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = ' /* still a literal */ '",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("refuses a three-part catalog.schema.table name", () => {
+      // Postgres accepts `db.schema.table` when `db` is the current database, and a
+      // plugin can learn that name with `SELECT current_database()`. The detector's
+      // scan was NON-overlapping, so `paperclip.public.secrets` matched
+      // `paperclip.public` -- schema `paperclip`, skipped as a table alias -- and then
+      // resumed after `public`, so `public.secrets` was never considered. ALLOWED on
+      // master and at the reviewed head, which contradicted the invariant this file
+      // claims to hold.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, paperclip.public.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow(/cannot adjudicate|cannot read schema/i);
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO plugin_test.rows SELECT * FROM paperclip.public.secrets",
+          "plugin_test",
+        )
+      ).toThrow();
+      // Matching every ADJACENT pair closes this at any depth, where banning the
+      // three-part form would be a blocklist the four-part name walks straight past.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, a.b.public.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("does not refuse a qualifier that merely ENDS with a schema name", () => {
+      // The lookbehind is load-bearing and this is its control. An overlapping scan
+      // without it also matches `public.secrets` INSIDE `xpublic.secrets`, which
+      // refuses a statement naming a schema nobody asked about. Measured: with the
+      // lookbehind removed, this case flips to REFUSE.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT xpublic.secrets FROM plugin_test.rows",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("keeps the COMMENT ON carve-out the migration path depends on", () => {
+      // `COMMENT ON COLUMN` names a three-part `schema.table.column`. The overlapping
+      // scan would see `rows.note` there, so the migration path's existing exemption
+      // has to keep covering it -- without this, five shipped statements change verdict.
+      expect(() =>
+        validatePluginMigrationStatement(
+          "COMMENT ON COLUMN plugin_test.rows.note IS 'x'",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginMigrationStatement(
+          "COMMENT ON TABLE plugin_test.rows IS 'x'",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+  });
+
+  describe("a comment inside the name PLUS a quote desync (PEN-6600)", () => {
+    // Round 5 shipped a union -- adjudicate the raw statement AND the
+    // comment-stripped one -- on the claim that "a mis-lex can only ever hide a name
+    // from ONE of them". Ally falsified it: the two texts have two DIFFERENT blind
+    // spots and one statement can carry both. A comment inside the name hid it from
+    // the RAW text; an `E'\''` or `$$'$$` desync made the lexer delete it from the
+    // STRIPPED text. Every statement here was measured ALLOW at head 653a04164 and on
+    // `master`, so each one is a live fail-open these assertions pin shut.
+    it("refuses a line comment inside the name behind an E'' desync", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = E'\\'' UNION SELECT * FROM public--x\n.secrets -- '",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("refuses a line comment inside the name behind a dollar-quote desync", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = $$'$$ UNION SELECT * FROM public--x\n.secrets -- '",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("refuses a block comment inside the name behind an E'' desync", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = E'\\'' AND b = ' /* ' UNION SELECT * FROM public/**/.secrets WHERE c = ' */ '",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    // The one that actually moves core data into a table the plugin can read.
+    it("refuses the exfiltrating INSERT ... SELECT on every path that runs it", () => {
+      const statement = "INSERT INTO plugin_test.rows SELECT E'\\'' FROM public--x\n.secrets -- '";
+      expect(() => validatePluginRuntimeExecute(statement, "plugin_test")).toThrow();
+      expect(() => validatePluginMigrationStatement(statement, "plugin_test")).toThrow();
+    });
+
+    it("refuses UPDATE ... FROM a commented-out core name", () => {
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "UPDATE plugin_test.rows SET a = E'\\'' FROM public--x\n.agents -- '",
+          "plugin_test",
+        )
+      ).toThrow();
+    });
+
+    // Postgres block comments NEST. `scanSqlSpans` stopped at the first `*/`, so it
+    // handed the rest of the comment back as executable code -- and SQL_TOKEN_GAP
+    // cannot span a nested comment either. This form was ALLOWED on `master` and at
+    // 653a04164 with no desync trigger at all, so it is a separate fail-open from
+    // the five above; it is the one case covered by the lexer ALONE.
+    it("refuses a NESTED block comment inside the name", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, public/* /* */ */.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    // ---- CONTROLS. A guard that refuses everything passes every test above. ----
+
+    it("still allows a comment sitting inside the plugin's OWN name", () => {
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM plugin_test/**/.rows", "plugin_test", ["issues"])
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM plugin_test--c\n.rows", "plugin_test", ["issues"])
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO /*c*/ plugin_test.rows (v) VALUES (1)",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("still allows a literal that merely CONTAINS comment punctuation", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = ' /* x */ ' AND b = '-- y'",
+          "plugin_test",
+          ["issues"],
+        )
+      ).not.toThrow();
+    });
+
+    // The lexer now reads `$tag$...$tag$`. `$1` is a PLACEHOLDER and must not be
+    // mistaken for an opener, or every parameterised statement in the corpus becomes
+    // one giant quoted span.
+    it("still allows parameter placeholders next to a dollar sign", () => {
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "UPDATE plugin_test.rows SET a = $1, b = $2 WHERE id = $3",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    // `$` is a legal non-initial identifier character, so `a$b$c` is ONE identifier
+    // and its `$b$` is not a dollar-quote opener. Lexing it as one would open a span
+    // running to the end of the statement, which is the same parity inversion this
+    // block exists to close -- so the name after it must still be adjudicated.
+    it("does not read a dollar inside an identifier as a quote opener", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT a$b$c FROM plugin_test.rows, public.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT a$b$c FROM plugin_test.rows", "plugin_test", ["issues"])
+      ).not.toThrow();
+    });
+  });
+
+  describe("a line terminator and a character class Postgres has and this file did not (PEN-6600)", () => {
+    // Round 6 closed the two blind spots separately and stated one residual: a
+    // NESTED block comment inside a name is spanned by the lexer and NOT by the raw
+    // text. Ally then found both halves of that statement were still reachable.
+    //
+    // Postgres's `scan.l` is the specification both of our readers are approximating,
+    // and it was approximated too narrowly in three character classes:
+    //
+    //   newline     [\n\r]                     -- a line comment ends at EITHER
+    //   ident_cont  [A-Za-z\200-\377_0-9\$]    -- high-bit bytes are identifier text
+    //   dolq_start  [A-Za-z\200-\377_]         -- and dollar-quote tag text
+    //
+    // Every statement in this block was measured ALLOW at head 97ab8aa4c and on
+    // `master`, and accepted by a real Postgres engine, so each one is a live
+    // fail-open these assertions pin shut.
+
+    // ---- `\r` ends a line comment. Neither reader knew that, and they failed in
+    // OPPOSITE directions on the same byte: SQL_TOKEN_GAP's `--[^\n]*\n` could not
+    // span the comment, so the RAW text saw no qualified name; scanSqlSpans ran the
+    // comment to end of input, so the STRIPPED text had the name DELETED. One byte,
+    // both texts blind, no literal and no desync needed.
+    it("refuses a name split by a line comment that a CARRIAGE RETURN ends", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, public--x\r.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("refuses the \\r-commented exfiltrating INSERT ... SELECT on every path", () => {
+      const statement = "INSERT INTO plugin_test.rows SELECT * FROM public--x\r.secrets";
+      expect(() => validatePluginRuntimeExecute(statement, "plugin_test")).toThrow();
+      expect(() => validatePluginMigrationStatement(statement, "plugin_test")).toThrow();
+    });
+
+    it("refuses UPDATE ... FROM a name split by a \\r comment", () => {
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "UPDATE plugin_test.rows SET a = 1 FROM public--x\r.agents",
+          "plugin_test",
+        )
+      ).toThrow();
+    });
+
+    // CRLF is the same comment followed by ordinary whitespace, so the gap must span
+    // both characters rather than stopping at the one it now recognises.
+    it("refuses a name split by a CRLF-terminated line comment", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, public--x\r\n.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    // ---- High-bit characters. Two separate desyncs, both ending in a span that
+    // swallowed the rest of the statement and took the name out of the stripped text.
+    it("refuses a nested-comment name behind a NON-ASCII identifier desync", () => {
+      // `é$b$c` is ONE identifier to Postgres (`$` is ident_cont, `é` is too), so its
+      // `$b$` is not an opener. Reading `é` as a non-identifier character made it one.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT 1 AS é$b$c FROM plugin_test.rows, public/* /* */ */.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    it("refuses a nested-comment name behind a NON-ASCII dollar-quote tag", () => {
+      // `$é$ ... $é$` is a dollar-quoted literal, so the apostrophe inside it is
+      // ordinary text. Not recognising the tag let that apostrophe open a false string.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = $é$'$é$ AND b IN (SELECT 1 FROM public/* /* */ */.secrets) AND c = ''",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow();
+    });
+
+    // ---- The residual itself. A regular expression provably cannot count, so the
+    // RAW half can never span an arbitrarily nested block comment -- round 6 stated
+    // that and left the lexer as the only reader covering it, which is exactly the
+    // dependency both findings above exploited. Refusing the form instead makes the
+    // raw half independent of the lexer for EVERY comment form.
+    it("refuses a nested block comment by its own guard, not by the lexer", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, public/* /* */ */.secrets",
+          "plugin_test",
+          ["issues"],
+        )
+      ).toThrow(/nested/i);
+    });
+
+    // ---- CONTROLS. A guard that refuses everything passes every test above. ----
+
+    it("still allows a \\r comment sitting inside the plugin's OWN name", () => {
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM plugin_test--c\r.rows", "plugin_test", ["issues"])
+      ).not.toThrow();
+    });
+
+    it("still allows a literal that merely CONTAINS a carriage return", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = '-- x\r' AND b = 'y'",
+          "plugin_test",
+          ["issues"],
+        )
+      ).not.toThrow();
+    });
+
+    it("still allows a NON-ASCII dollar-quoted literal", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows WHERE a = $é$ hello $é$",
+          "plugin_test",
+          ["issues"],
+        )
+      ).not.toThrow();
+    });
+
+    it("still allows a NON-ASCII identifier that contains a dollar sign", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT é$b$c FROM plugin_test.rows",
+          "plugin_test",
+          ["issues"],
+        )
+      ).not.toThrow();
+    });
+
+    // The nesting refusal must be a refusal of NESTING, not of a second comment.
+    it("still allows two separate block comments in one statement", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT /* a */ * FROM /* b */ plugin_test.rows",
+          "plugin_test",
+          ["issues"],
+        )
+      ).not.toThrow();
+    });
+  });
+
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
     expect(() =>
       validatePluginRuntimeQuery(
