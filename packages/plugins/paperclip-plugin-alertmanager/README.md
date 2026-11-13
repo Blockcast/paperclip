@@ -321,8 +321,22 @@ question the invocation-budget pre-check answered), which PEN-6229 coded. ⛔ Th
 documentation, not a constraint.
 ⛔ **`NULL` means NOT RECORDED** — a row written before this column, a branch
 that attempted no wake, or a host that dropped the wake without naming a cause.
-It never means the wake was delivered; `wake_outcome` is the field that answers
-that, and it has always been `NOT NULL`.
+
+⛔⛔ **On a `refused` row a NULL cause ALSO means the refusal is NOT
+ESTABLISHED, and a run may exist** (PEN-6121, 2026-11-13; migration `014`).
+Every coded gate refuses before the run is created and attaches `details.code`,
+so a rejection *carrying* a cause does prove no run was queued — and an
+*uncoded* one proves nothing. `issues.requestWakeup` creates the run first and
+writes its `issue.assignment_wakeup_requested` activity row second, so a throw
+in between leaves the run alive, the activity row absent, and this column
+`NULL`. Measured once on PEN-5911: run `651a67f2` was created at
+`05:36:25.568Z` carrying `contextSnapshot.source = alertmanager-escalation` — a
+value only this ladder sets — the comment said "no run was queued for Devops" at
+`05:36:58Z`, and that run started at `05:37:59Z` and succeeded. Such a row now
+carries a `wake_detail` saying so, and the thread says "could NOT be confirmed"
+rather than asserting the negative. To settle one, look for a run with that
+`contextSnapshot.source` inside the sweep window; **do not** settle it on the
+missing activity row, which is missing by construction here.
 
 ⛔ **They are two tokens because the host drops a wake in two ways and only one
 of them throws.** `requestWakeup` *rejects* on no assignee, a terminal status,
@@ -340,6 +354,11 @@ wakes are dropped. **Query both tokens; the partial index covers both.**
 -- Escalation passes whose wake never reached a run: everything this platform
 -- believed it had delivered and had not. Both tokens — querying only
 -- 'refused' silently omits the larger half (see above).
+--
+-- PEN-6121 2026-11-13: this is an UPPER BOUND, not a count. A 'refused' row
+-- with wake_cause IS NULL is not established as undelivered (migration 014),
+-- so add `wake_cause IS NOT NULL OR wake_outcome = 'declined'` when you need
+-- the established-undelivered set rather than the suspected one.
 SELECT observed_at, alert_issue_id, alertname, escalation_attempt, wake_outcome
   FROM plugin_alertmanager_184163d1ba.alert_attendance_observations
  WHERE company_id = $1 AND wake_outcome IN ('refused', 'declined')

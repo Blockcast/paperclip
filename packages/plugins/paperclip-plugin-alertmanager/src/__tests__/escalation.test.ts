@@ -1905,7 +1905,14 @@ describe("PEN-2918 attendance observations", () => {
   it("records a REFUSED wake as such, and the thread says so instead of claiming the owner was woken", async () => {
     const store = buildFakeAlertmanagerStore();
     const { ctx, mocks } = sweepContext(due(), "cto", store);
-    mocks.issues.requestWakeup = vi.fn(async () => { throw new Error("Issue is not wakeable in status: backlog"); });
+    // CODED refusal: the host named the gate, so the negative IS established
+    // and the sentence may assert it. The uncoded case is a different test
+    // below — PEN-6121 2026-11-13 — and it must NOT assert the negative.
+    mocks.issues.requestWakeup = vi.fn(async () => {
+      throw Object.assign(new Error("Issue is not wakeable in status: backlog"), {
+        data: { code: "issue.not_wakeable" },
+      });
+    });
     await runAlertEscalationSweep(ctx, config(), NOW);
 
     expect(store.attendance).toHaveLength(1);
@@ -1916,6 +1923,54 @@ describe("PEN-2918 attendance observations", () => {
     // Fixed sentence only — never the raw error, which is operator-readable here.
     expect(String(store.attendance[0].wake_detail)).not.toContain("not wakeable in status");
     expect(body).not.toContain("not wakeable in status");
+  });
+
+  /**
+   * PEN-6121 (2026-11-13) — an UNCODED rejection is not a refusal, and the
+   * thread must not say it is.
+   *
+   * Measured on PEN-5911: the ladder recorded `refused` and posted "no run was
+   * queued for Devops" at 05:36:58Z, while run `651a67f2` — created 05:36:25Z
+   * carrying `contextSnapshot.source = "alertmanager-escalation"`, which only
+   * this ladder's wake call sets — started at 05:37:59Z and ran to success.
+   * The host handler's order is `heartbeat.wakeup()` → `logPluginActivity(...)`
+   * → return, so a throw after the first step leaves the run CREATED while the
+   * call rejects, and the `issue.assignment_wakeup_requested` activity row is
+   * absent because it is written after the run.
+   *
+   * ⛔ The discriminator is the CODE, not the message. All seven coded gates
+   * refuse BEFORE the run is created and all seven attach `details.code`,
+   * which `workerHostErrorData` projects onto `data`. So a rejection carrying
+   * a code proves no run exists, and one without a code proves nothing — which
+   * is the whole content of this test. This is the same defect class the suite
+   * above fixed, one tense later: there a false assertion that a wake HAPPENED,
+   * here a false assertion that it did NOT.
+   */
+  it("does NOT assert the negative when a refused wake carries no cause from the host", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => { throw new Error("Timed out waiting for host response"); });
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({
+      disposition: "unattended_rung",
+      wake_outcome: "refused",
+      wake_cause: null,
+    });
+    const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
+    expect(body).not.toContain("waking current owner");
+    // The assertion that was false on PEN-5911.
+    expect(body).not.toContain("no run was queued");
+    expect(body).toContain("could NOT be confirmed");
+    // The rung is still not spent — the retry promise is unchanged.
+    expect(body).toContain("This rung is NOT spent");
+    // `wake_detail` must say the run may exist, so a later reader does not
+    // count this row as a dropped wake.
+    expect(String(store.attendance[0].wake_detail)).toContain("NOT established as a refusal");
+    // Fixed sentences only — never the raw error.
+    expect(body).not.toContain("Timed out waiting");
+    expect(String(store.attendance[0].wake_detail)).not.toContain("Timed out waiting");
   });
 
   /**
