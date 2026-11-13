@@ -1496,18 +1496,52 @@ const GIT_REF_MAX_COMPONENTS = 4;
  *  has 5, `xoxb-…` 4, `sk_live_…` 6, a Kubernetes bootstrap token's
  *  `<6>.<16>` has 0 unless both halves draw no digit.
  *
- *  Set at the KNEE ON RESIDUAL — NOT one below the corpus minimum, which is
- *  the convention this file uses elsewhere and which would put it at 10. Ten
- *  is not free. Over 1192 distinct branch names in Blockcast/paperclip's
- *  history, 847 are refused inside a lease by the shipped detector; a floor of
- *  10 publishes 518 of those 847 and carries 7.25e-3, 14 publishes 511 and
- *  carries 2.33e-3, 16 publishes 502 and carries 2.30e-3. So 14 buys a 3x
- *  reduction in residual for seven real branches out of 518, and 16 buys
- *  nothing further while costing nine more. Full table: PEN-3920 12.3.
+ *  ⛔ THE VALUE STANDS AT 14; THE TWO CLAIMS THAT SELECTED IT ARE MEASURED
+ *  FALSE (PEN-6519). What is withdrawn is the RATIONALE, not the number — a
+ *  constant whose stated justification is false is a trap in both directions:
+ *  the next author either moves it on a reason that does not hold, or declines
+ *  to move it for a reason that was never true. Re-quoted one marked line at a
+ *  time, so a `grep` arrival meets the retraction rather than the claim:
+ *
+ *     WITHDRAWN PEN-6519: "Set at the KNEE ON RESIDUAL"
+ *     WITHDRAWN PEN-6519: "16 buys nothing further while costing nine more."
+ *
+ *  THERE IS NO KNEE AT 14, and floor 16 buys a 1.12x reduction rather than
+ *  nothing. Both claims are artifacts of the blind grid described under
+ *  `isGitRefName` below — three chopped alphabets sampling only two letter
+ *  densities. Once base32 is in the grid and the density axis is swept, the
+ *  worst shape falls MONOTONICALLY through 20: 1.13e-1 / 4.23e-2 / 3.79e-2 /
+ *  2.26e-2 / 8.64e-3 at floors 10 / 14 / 16 / 18 / 20. The real structural
+ *  knee is at 20, where this constant runs out of leverage entirely.
+ *
+ *  WHAT ACTUALLY HOLDS 14 is the CORPUS side plus the THREAT MODEL. Neither is
+ *  a residual argument, which is why a residual table alone never settled it:
+ *
+ *    - CORPUS. Over 938 live branch names (2026-11-11) 629 are refused inside a
+ *      lease; 14 publishes 558 of them, 16 publishes 549, 18 publishes 534 and
+ *      20 publishes 509. Each step up is paid for in 9 / 24 / 49 real branch
+ *      names, at a false-positive rate on ref-shaped names of 1.2% / 2.8% /
+ *      5.5% / 9.9%. The cost lands on the exact operation this exemption exists
+ *      to protect: PEN-4869 mandates the pinned
+ *      `--force-with-lease=<ref>:<oid>`, THAT PIN IS THE COMPARE-AND-SWAP, so
+ *      redacting it destroys the record of which ref was leased to which oid on
+ *      the one git operation that has no other audit trail.
+ *    - THREAT MODEL. The hot cell is reachable only by deliberately slicing a
+ *      secret across separators, which PEN-3920 §4 / §12.4 and PEN-3183 put
+ *      outside this control. Nothing is newly REFUSED at any floor — 0 across
+ *      every cell — so no setting of this constant can open a hole. It only
+ *      chooses how generous a previously-refused set's exemption is.
+ *
+ *  ⚠ THIS DECISION IS VOID IF AND ONLY IF THAT SCOPE RULING MOVES, and nothing
+ *  wakes anyone when it does. Corpus LEVELS drift (+47 at every floor over five
+ *  days); the DELTAS are the stable quantity and both published deltas
+ *  reproduce exactly. A later reader who finds the false-positive rate has
+ *  moved has NOT weakened this decision. Full working, every control and the
+ *  honest bounds: PEN-6519. Table: PEN-3920 12.3a.
  *
  *  DO NOT LOWER THIS TO 10 on the strength of the corpus minimum alone — that
- *  is the 7.25e-3 row above, about 3x the shipped residual. A failing mutation
- *  pins 14. */
+ *  row measures 1.13e-1 density-swept, ~2.7x the shipped residual, and it buys
+ *  only seven more branch names. A failing mutation pins 14. */
 const GIT_REF_MIN_WORD_MASS = 14;
 
 /**
@@ -1607,11 +1641,19 @@ const GIT_REF_MIN_WORD_MASS = 14;
  * three originally-published alphabets put this rule WITHIN MEASUREMENT ERROR
  * of `isLexicalIdentifier` (6.96e-3) and ~2.9x below the Kubernetes rule — 65%
  * headroom, not the ~30% a diluted 9.85e-3 implies — while base32 puts it
- * ~2.2x ABOVE the Kubernetes rule. Whether the floor should move on that
- * evidence is NOT decided here, and no constant moved for it: the corpus half
- * of that trade — what a higher floor costs in real branch names — is
- * unmeasured, and a residual table alone cannot settle a floor. See PEN-5828
- * and PEN-3920 12.3a.
+ * ~2.2x ABOVE the Kubernetes rule. That trade is now SETTLED and the constant
+ * did not move — the whole decision is in the `GIT_REF_MIN_WORD_MASS` comment
+ * above. The deferral that stood here is withdrawn, one marked line at a time:
+ *
+ *     WITHDRAWN PEN-6519: "Whether the floor should move on that evidence is NOT decided
+ *     WITHDRAWN PEN-6519: here, and no constant moved for it: the corpus half of that trade —
+ *     WITHDRAWN PEN-6519: what a higher floor costs in real branch names — is unmeasured,"
+ *
+ * The corpus half IS measured, at 16 / 18 / 20 as well as at 10 / 14. ⚠ The
+ * METHOD note that closed that sentence is NOT withdrawn and is worth keeping
+ * on its own: a residual table alone cannot settle a floor — which is exactly
+ * why what holds 14 is the corpus cost and the threat model. See PEN-6519 and
+ * PEN-3920 12.3a.
  *
  * ⛔ Do NOT write an ORDERING against `isLexicalIdentifier` in either
  * direction, and do NOT write a ratio. The sign is not established and it is

@@ -1122,8 +1122,16 @@ configurations); the shipped row was then re-measured at the full 200,000.
 | **floor 14, 4 components (shipped)** | `letters-mixed` chopped by `/` into ~6-char runs | **2.33e-3** | **511 of 847** |
 | floor 16, 4 components | `letters-mixed` chopped by `/` into ~6-char runs | 2.30e-3 | 502 of 847 |
 
-The knee is at 14: a 3x reduction for seven real branches out of 518, and 16 buys nothing
-further on residual while costing nine more.
+⛔ **The sentence that closed this section is WITHDRAWN (PEN-6519)**, re-quoted one marked
+line at a time so a `grep` arrival meets the retraction rather than the claim:
+
+> WITHDRAWN PEN-6519: "The knee is at 14: a 3x reduction for seven real branches out of 518,
+> WITHDRAWN PEN-6519: and 16 buys nothing further on residual while costing nine more."
+
+There is no knee at 14, and floor 16 buys a 1.12x reduction rather than nothing. Both figures
+are artifacts of the blind grid this section measures — see 12.3a, and 12.3a.1 for the
+decision. **The constant is unchanged at 14**; what holds it is the corpus cost and the threat
+model, not a knee on residual.
 
 ### 12.3a Per shape, and the alphabet the grid was blind to (PEN-5828)
 
@@ -1210,9 +1218,80 @@ choice.**
 14 does not obviously survive the wider grid, and a floor of 18 would return the worst shape
 to roughly the Kubernetes precedent. **This row changes no constant and takes no position on
 that**, for one concrete reason: the other half of the trade is the corpus cost — 14 publishes
-511 real branches of 847 and 16 publishes 502 — and **the corpus cost at 18 and 20 is
-unmeasured.** A residual table alone cannot settle a floor. Tracked as the follow-up to
-PEN-5828.
+511 real branches of 847 and 16 publishes 502 — and **the corpus cost at 18 and 20 is unmeasured.** ⛔ WITHDRAWN PEN-6519 — measured 2026-11-11; see 12.3a.1 below.
+A residual table alone cannot settle a floor. Tracked as the follow-up to PEN-5828 — that
+follow-up is **PEN-6519**, and it is decided in 12.3a.1.
+
+⛔ **One sentence in the paragraph above is WITHDRAWN (PEN-6519)**, re-quoted here as well as
+marked in place, because the two lines it originally spanned each read as a live claim alone:
+
+> WITHDRAWN PEN-6519: "**the corpus cost at 18 and 20 is unmeasured.**"
+
+It was measured on 2026-11-11 and the constant did not move. ⚠ The REST of that paragraph
+stands as accurate HISTORY — PEN-5828 genuinely changed no constant and genuinely took no
+position — and its method note, *a residual table alone cannot settle a floor*, is exactly why
+the decision below rests on the corpus cost and the threat model instead of on a residual.
+
+#### 12.3a.1 Both halves of the trade, and the decision (PEN-6519)
+
+**`GIT_REF_MIN_WORD_MASS` STAYS AT 14.** Measured 2026-11-11 over **938 live
+`Blockcast/paperclip` branch names**, of which **629 are refused inside a lease** by the
+genuine pre-D10 detector (reconstructed at `c8f5f4c2f^`, not a vendored copy). The residual
+column is the worst shape with the **density axis swept** — the correction 12.3a's own 3-point
+grid needs.
+
+| floor | worst shape, density-swept | published of the 629 refused | branches lost vs 14 | FP rate on ref-shaped names |
+|---|---|---|---|---|
+| 10 | 1.13e-1 | 565 | 7 gained | 0.0% |
+| **14 (shipped)** | **4.23e-2** | **558** | — | **1.2%** |
+| 16 | 3.79e-2 (1.12x) | 549 | 9 | 2.8% |
+| 18 | 2.26e-2 (1.87x) | 534 | 24 | 5.5% |
+| 20 | **8.64e-3** (4.9x) | 509 | 49 | 9.9% |
+
+**Validation.** Both deltas published in 12.3 reproduce **exactly** — −7 across 10→14 and −9
+across 14→16, against 12.3's 518 / 511 / 502 — with a constant **+47** level offset from five
+days of corpus drift. ⇒ the LEVELS drift and the **DELTAS are the stable quantity**. ⚠ 12.3's
+1192-branch corpus is **not reconstructible**; this is a different, 938-branch corpus measured
+on 2026-11-11, which is precisely why the deltas rather than the levels carry the argument.
+
+**The density axis, swept.** Holding |Σ| = 32 so per-character entropy is constant, the
+residual **peaks at 81.25% letters** — exactly where `base32` already samples. That sample is
+the maximum of six densities at floors 10 / 14 / 16 / 18, so 12.3a's grid **under-reports by
+1.00x** there. At floor 20 the peak slides to **100%** density (under-report 1.18x), because
+the hot 81.25% family has fallen to 7.30e-3 — *below* the all-letters row.
+
+⭐ **Read the floor-20 cell with its density.** Every other row's worst shape is attained at
+81.25%; at floor 20 it is attained at 100%. The 100%-density row is **flat across every
+floor** — for an all-letters alphabet every character counts toward word mass, so this
+constant has no leverage there at all, and ~8e-3 is an asymptote it cannot cross. That is what
+"the floor has run out of leverage" looks like in a table, and it is why no higher floor buys
+anything. **Floor 20 is the real structural knee, and it costs the bottom decile of real
+branch names.**
+
+**Why 14 stays** — two things hold it, and neither is a residual argument:
+
+1. **Corpus.** The residual a higher floor buys is paid for in 9 / 24 / 49 real branch names
+   at 16 / 18 / 20, and the cost lands on the exact operation this exemption exists to
+   protect. PEN-4869 mandates the pinned `--force-with-lease=<ref>:<oid>`; **that pin IS the
+   compare-and-swap**, so redacting it destroys the record of which ref was leased to which
+   oid on the one git operation that has no other audit trail.
+2. **Threat model.** The hot cell is reachable only by deliberately slicing a secret across
+   separators, which §4 / §12.4 and PEN-3183 put outside this control. **Nothing is newly
+   REFUSED at any floor: 0 across every cell** — so no setting of this constant can open a
+   hole; it only chooses how generous a previously-refused set's exemption is.
+
+⚠ **The cost CURRENCY, pinned at source.** `isGitRefName` is module-private with exactly one
+call site, inside `scrubGitHubEgressText(input: string)` — a pure TEXT function — where
+`isForceWithLeaseBinding(…) && isGitRefName(value)` returns the match unredacted. ⇒ a higher
+floor costs the **legibility of an agent's own REPORT** of a force-push, and does **not** break
+the `git` operation itself. That is the narrower of the two readings, and it still bites.
+
+⛔ **This decision is void if and only if the SCOPE ruling moves — and nothing wakes anyone
+when it does.** The dispositive leg is that the residual measures a *deliberately constructed*
+attack, which §4 / §12.4 and PEN-3183 already place outside this control; `newly-refused` 0
+across every cell is what makes that leg safe to be dispositive. If anyone re-opens *"is
+deliberate construction in scope for this control"*, this constant re-opens with it. Decided by
+the Security Engineer on PEN-6519, concurred by the CTO.
 
 ### 12.3b The comparison, like-for-like
 
