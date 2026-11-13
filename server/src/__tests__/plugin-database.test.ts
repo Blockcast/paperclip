@@ -164,12 +164,16 @@ describe("plugin database SQL validation", () => {
       validatePluginMigrationStatement(
         "-- it's a note\nCOMMENT ON TABLE plugin_test.rows IS 'the attendance note'",
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     expect(() =>
       validatePluginMigrationStatement(
         "-- it's the operator's own 'note\nCOMMENT ON TABLE plugin_test.rows IS 'note'",
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     // The even-apostrophe cases were always fine; they are the control.
@@ -177,6 +181,8 @@ describe("plugin database SQL validation", () => {
       validatePluginMigrationStatement(
         "-- it's the operator's note\nCOMMENT ON TABLE plugin_test.rows IS 'note'",
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
   });
@@ -185,13 +191,13 @@ describe("plugin database SQL validation", () => {
     const bannedFunction =
       "CREATE OR REPLACE FUNCTION plugin_test.f() RETURNS int AS " +
       "'update plugin_test.rows set id = id; select 1' LANGUAGE sql";
-    expect(() => validatePluginMigrationStatement(bannedFunction, "plugin_test")).toThrow(
+    expect(() => validatePluginMigrationStatement(bannedFunction, "plugin_test", [], KNOWN_SCHEMAS)).toThrow(
       /disallowed/i,
     );
     // Same statement, preceded by an allowed keyword and a comment holding one
     // apostrophe. That used to normalise to a bare "create" and be accepted.
     expect(() =>
-      validatePluginMigrationStatement(`CREATE -- it's fine\n${bannedFunction}`, "plugin_test")
+      validatePluginMigrationStatement(`CREATE -- it's fine\n${bannedFunction}`, "plugin_test", [], KNOWN_SCHEMAS)
     ).toThrow(/disallowed/i);
   });
 
@@ -200,12 +206,15 @@ describe("plugin database SQL validation", () => {
       validatePluginRuntimeQuery(
         "-- it's a read\nSELECT id FROM plugin_test.rows WHERE note = 'x'",
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     expect(() =>
       validatePluginRuntimeExecute(
         "-- it's a write\nUPDATE plugin_test.rows SET note = 'x'",
         "plugin_test",
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
   });
@@ -217,6 +226,8 @@ describe("plugin database SQL validation", () => {
       validatePluginMigrationStatement(
         "COMMENT ON TABLE plugin_test.rows IS 'an operator pause -- the one that matters'",
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
   });
@@ -226,10 +237,10 @@ describe("plugin database SQL validation", () => {
     // comment with "" produced the single token `createextension`, which the ban
     // list could not see.
     expect(() =>
-      validatePluginMigrationStatement("CREATE/**/EXTENSION pg_trgm", "plugin_test")
+      validatePluginMigrationStatement("CREATE/**/EXTENSION pg_trgm", "plugin_test", [], KNOWN_SCHEMAS)
     ).toThrow(/disallowed/i);
     expect(() =>
-      validatePluginMigrationStatement("DO/**/$$ BEGIN END $$", "plugin_test")
+      validatePluginMigrationStatement("DO/**/$$ BEGIN END $$", "plugin_test", [], KNOWN_SCHEMAS)
     ).toThrow(/disallowed/i);
   });
 
@@ -1239,18 +1250,21 @@ describe("plugin database SQL validation", () => {
       validatePluginRuntimeExecute(
         "UPDATE/**/public.agents SET name = 'x' FROM plugin_test.rows",
         "plugin_test",
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/inside plugin namespace/i);
     expect(() =>
       validatePluginRuntimeExecute(
         "DELETE FROM/**/other_ns.t WHERE id IN (SELECT id FROM plugin_test.rows)",
         "plugin_test",
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/inside plugin namespace/i);
     expect(() =>
       validatePluginRuntimeExecute(
         "INSERT INTO/**/public.agents (id) SELECT id FROM plugin_test.rows",
         "plugin_test",
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/inside plugin namespace/i);
     // Control: the same statement without the comment was refused before and after.
@@ -1258,11 +1272,12 @@ describe("plugin database SQL validation", () => {
       validatePluginRuntimeExecute(
         "UPDATE public.agents SET name = 'x' FROM plugin_test.rows",
         "plugin_test",
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/inside plugin namespace/i);
     // Control: an in-namespace write is still allowed.
     expect(() =>
-      validatePluginRuntimeExecute("UPDATE plugin_test.rows SET name = 'x'", "plugin_test")
+      validatePluginRuntimeExecute("UPDATE plugin_test.rows SET name = 'x'", "plugin_test", KNOWN_SCHEMAS)
     ).not.toThrow();
   });
 
@@ -1270,10 +1285,10 @@ describe("plugin database SQL validation", () => {
     // Pre-existing on master and closed by the same fix: with no ref extracted at
     // all, the namespace loop ran zero times and a missing ref read as allowed.
     expect(() =>
-      validatePluginRuntimeQuery("SELECT * FROM/**/public.secrets", "plugin_test")
+      validatePluginRuntimeQuery("SELECT * FROM/**/public.secrets", "plugin_test", [], KNOWN_SCHEMAS)
     ).toThrow(/public\.secrets/i);
     expect(() =>
-      validatePluginRuntimeQuery("SELECT * FROM plugin_test.rows", "plugin_test")
+      validatePluginRuntimeQuery("SELECT * FROM plugin_test.rows", "plugin_test", [], KNOWN_SCHEMAS)
     ).not.toThrow();
   });
 
@@ -1284,15 +1299,15 @@ describe("plugin database SQL validation", () => {
     // second statement rides along. Refusing the prefix is the fail-closed answer;
     // no .sql file in this repo uses one.
     expect(() =>
-      validatePluginRuntimeQuery(String.raw`SELECT E'\'' ; DROP SCHEMA public CASCADE; --'`, "plugin_test")
+      validatePluginRuntimeQuery(String.raw`SELECT E'\'' ; DROP SCHEMA public CASCADE; --'`, "plugin_test", [], KNOWN_SCHEMAS)
     ).toThrow(/escape string literal/i);
     expect(() =>
-      validatePluginRuntimeExecute(String.raw`UPDATE plugin_test.rows SET n = e'\n'`, "plugin_test")
+      validatePluginRuntimeExecute(String.raw`UPDATE plugin_test.rows SET n = e'\n'`, "plugin_test", KNOWN_SCHEMAS)
     ).toThrow(/escape string literal/i);
     // Control: the smuggling only works through the escape string. A bare second
     // statement is still caught by the splitter.
     expect(() =>
-      validatePluginRuntimeQuery("SELECT 1; DROP SCHEMA public CASCADE", "plugin_test")
+      validatePluginRuntimeQuery("SELECT 1; DROP SCHEMA public CASCADE", "plugin_test", [], KNOWN_SCHEMAS)
     ).toThrow(/exactly one statement/i);
     // Control: `LIKE'x'` is legal SQL that ends in an E. Only a STANDALONE e/E is a
     // prefix, so this must still pass.
@@ -1300,6 +1315,7 @@ describe("plugin database SQL validation", () => {
       validatePluginRuntimeExecute(
         "UPDATE plugin_test.rows SET n = 'y' WHERE n LIKE'%a%'",
         "plugin_test",
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     // Control: an apostrophe in a line comment is not a literal at all.
@@ -1307,6 +1323,7 @@ describe("plugin database SQL validation", () => {
       validatePluginRuntimeExecute(
         "-- it's a write\nUPDATE plugin_test.rows SET n = 'x'",
         "plugin_test",
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
   });
