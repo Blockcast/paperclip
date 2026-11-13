@@ -120,6 +120,14 @@ jobs:
         with:
           base-ref: ${{ env.PR_BASE_SHA }}
           head-ref: ${{ env.PR_HEAD_SHA }}
+          # Only advisories carrying a live `risk-accept` entry in
+          # scripts/dependency-audit-baseline.json; the scheduled audit lane
+          # still re-fails them at reviewBy. Without this, a PR that moves a
+          # package WITHIN an accepted range (e.g. flooring @hono/node-server
+          # 1.19.13 -> 1.19.19, still inside GHSA-rmxm) is red here while
+          # strictly reducing exposure (BLO-56715). Guarded by
+          # run-quality-gates.test.mjs.
+          allow-ghsas: GHSA-rmxm-3fg6-px4f
 
       # Only the commitperclip bot steps below use Node. Where no App key is
       # provisioned (COMMITPERCLIP_ENABLED=false) those steps are skipped, so

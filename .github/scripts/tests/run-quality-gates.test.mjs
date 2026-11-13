@@ -444,3 +444,22 @@ test('main routes every read through the shared budget, not bare ghFetch', () =>
   assert.equal((main.match(/\bghFetch\b/g) ?? []).length, 0);
   assert.match(main, /checkDependencies\([^)]*, gh\)/);
 });
+
+// BLO-56715: Dependency Review's allow-ghsas must never outlive the audit
+// baseline's risk acceptance, or it silently waives an advisory nobody owns.
+test('commitperclip-review: every allow-ghsas id is a live risk-accept baseline entry', () => {
+  const line = workflow.match(/^\s*allow-ghsas:\s*(.+)$/m);
+  assert.ok(line, 'allow-ghsas line not found');
+  const ids = line[1].split(',').map((s) => s.trim()).filter(Boolean);
+  assert.ok(ids.length > 0);
+  const baseline = JSON.parse(readFileSync(
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../scripts/dependency-audit-baseline.json'),
+    'utf8',
+  ));
+  const today = new Date().toISOString().slice(0, 10);
+  for (const id of ids) {
+    const entry = baseline.entries.find((e) => e.ghsa === id && e.verdict === 'risk-accept');
+    assert.ok(entry, `${id} is allowed in Dependency Review but has no risk-accept baseline entry`);
+    assert.ok(entry.reviewBy >= today, `${id} baseline acceptance expired ${entry.reviewBy}; drop it from allow-ghsas`);
+  }
+});
