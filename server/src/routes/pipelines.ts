@@ -458,11 +458,19 @@ function assertPipelineCompanyAccess(req: Request, companyId: string) {
  * refusal's own remedy ("send `null`") deletes the operator's config rather than clearing a
  * marker.
  *
- * ⇒ whoever closes this: admit an all-sentinel echo and refuse a fresh value, or route the
- * branches through the compound guard only after the restore has run. Do not leave it to be
+ * ⛔ AND THE CARVE-OUT IS PATCH-ONLY. Of this guard's three call sites, only stage PATCH
+ * reaches that restore — `services/pipelines.ts` keys it on `input.patch.config`. Stage CREATE
+ * and pipeline CREATE's `stages[]` have no stored value to restore FROM, so there a masked echo
+ * persists the literal sentinel whatever the guard does, and a plain refusal breaks no
+ * round-trip. Admitting an all-sentinel echo at those two would be a HOLE rather than a
+ * carve-out: it would let `REDACTED_EVENT_VALUE` be written into a fresh stage config.
+ *
+ * ⇒ whoever closes this: refuse OUTRIGHT at stage CREATE and at pipeline CREATE's `stages[]`;
+ * at stage PATCH either admit an all-sentinel echo and refuse a fresh value, or route the
+ * branch through the compound guard only after the restore has run. Do not leave it to be
  * noticed. Measured and carried on PEN-6595, graded Low there because a grant row is the only
  * way an agent reaches these routes at all. (Raised by Ally on `#3701` and accepted; it could
- * not be wired then.)
+ * not be wired then. The PATCH/CREATE split was raised by Ally on `#3745`.)
  */
 function collectStageConfigWorkspaceCommandPaths(config: unknown, prefix: string): string[] {
   if (typeof config !== "object" || config === null || Array.isArray(config)) return [];

@@ -333,9 +333,19 @@ export function assertNoAgentIssueAdapterConfigMutation(req: Request, paths: str
  * `null`. A blanket refusal would therefore fire on that faithful round-trip,
  * because the route guard runs BEFORE the service restore, and the remedy this
  * refusal's own message offers ("send `null`") would DELETE the operator's
- * runtime config rather than clear a marker. A close has to admit an
- * all-sentinel echo and refuse a fresh value, or run after the restore. Carried
- * on PEN-6595 with that shape named.
+ * runtime config rather than clear a marker.
+ *
+ * ⛔ AND THAT IS PATCH-ONLY — the distinction is load-bearing in the opposite
+ * direction. `services/pipelines.ts` keys the restore on `input.patch.config`,
+ * so stage CREATE and pipeline CREATE's `stages[]` have nothing to restore FROM:
+ * there a masked echo would persist the literal sentinel whatever the guard
+ * does, and a plain refusal breaks no round-trip. Admitting an all-sentinel echo
+ * at those two routes would be a HOLE rather than a carve-out — it would let
+ * `REDACTED_EVENT_VALUE` be written into a fresh stage config. ⇒ a close refuses
+ * OUTRIGHT at stage CREATE and pipeline CREATE, and at stage PATCH either admits
+ * an all-sentinel echo and refuses a fresh value, or runs after the restore.
+ * Carried on PEN-6595 with that shape named; the PATCH/CREATE split was raised
+ * by Ally on `#3745`.
  *
  * ⚠ And do NOT route a reader to PEN-3266 for this. That row is `done` and is
  * the READ side of the same schema; it states "Routines are input-only for this
