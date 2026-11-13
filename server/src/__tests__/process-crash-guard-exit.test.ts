@@ -24,6 +24,8 @@
  */
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -61,6 +63,29 @@ const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
  */
 const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
 /**
+ * How far the two bounded breadcrumb waits may stretch before the stalled-exit
+ * assertion calls it a regression rather than a slow runner.
+ *
+ * The fatal path performs exactly two sequential waits, each capped at
+ * MAX_WRITE_WAIT_MS, so a healthy guard spends 2 budgets; this allowance is the
+ * multiple of that a contended runner is permitted. Measured first-party
+ * (BLO-55723) against the guard's own crash-to-exit time inside the child, on a
+ * 4-CPU cgroup, 20 samples per saturated arm:
+ *
+ *     load     spinners   guard crash->exit (med / max)   stretch (max)
+ *     idle            0            207ms /  208ms              1.00x
+ *     ~13           24             224ms /  296ms              1.43x
+ *     ~13           48             300ms /  499ms              2.41x
+ *     ~12          128             402ms /  595ms              2.87x
+ *     ~98          384             490ms /  703ms              3.40x
+ *
+ * 6x clears the worst of those by 1.71x, at a contention level well past the one
+ * that produced the 2206ms report this bound was re-derived for (PEN-3381). It is
+ * also still under the 10x a budget regression produces, so this assertion keeps
+ * the backstop role the pin below is primary for.
+ */
+const STALLED_EXIT_STRETCH_ALLOWANCE = 6;
+/**
  * The behaviour under test: with stderr stalled, the guard must still exit this fast.
  *
  * Derived, not literal, and derived from `MAX_WRITE_WAIT_MS` rather than from the
@@ -71,51 +96,82 @@ const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
  *
  * What does govern it: the fatal path awaits two sequential bounded breadcrumb writes,
  * each capped at MAX_WRITE_WAIT_MS, then exits. Measured on a warm runner, clean tree:
- * 235ms — the 200ms budget plus ~35ms of process teardown, i.e. elapsed ≈ 2·budget + 35.
+ * 207ms of guard time, i.e. the 200ms budget plus ~5ms.
+ *
+ * WHAT IT IS ASSERTED AGAINST CHANGED IN BLO-55723, AND THAT IS THE POINT OF THIS
+ * BLOCK. It used to bound the PARENT's spawn-to-exit wall clock, which spans three
+ * terms: the stdin ack's trip down the pipe, the two bounded waits, and the kernel's
+ * teardown of the child plus the parent's observation of `exit`. Only the middle term
+ * is the guard. The other two are scheduler-bound, and measured on a 4-CPU cgroup they
+ * carry 80-86% of everything contention adds:
+ *
+ *     arm         parent spawn->exit (med / max)   of which teardown+transit (med)
+ *     idle                 234ms /  238ms                       27ms
+ *     24 spinners          441ms /  532ms                      206ms
+ *     48 spinners          796ms / 1000ms                      495ms
+ *     128 spinners        1196ms / 1401ms                      793ms
+ *     384 spinners        1897ms / 3600ms                     1496ms
+ *
+ * At the bottom arm the parent-observed number breached the old 1_800ms bound in 10 of
+ * 20 samples — a false red on a guard that was working perfectly, which is the whole of
+ * PEN-3381 — while the guard's own time never passed 703ms. So the fixture now reports
+ * its own crash-to-exit elapsed through a regular file and this deadline asserts on
+ * that. The parent's number is kept, and printed on failure, as the diagnostic that
+ * separates "this runner is slow" from "the guard grew a third wait".
+ *
+ * Do not re-point this at the parent's elapsed to "measure the whole exit". Teardown
+ * after `process.exit` is the kernel's, not this repo's; bounding it is what could not
+ * be done on a shared pool, and giving it enough headroom to be quiet is what left no
+ * headroom for the regression.
  *
  * The derivation documents where the number comes from; it is deliberately not what
  * catches a change to that budget, and the difference is the point of this block.
  * Because this bound and STALLED_EXIT_WATCHDOG_MS both scale with MAX_WRITE_WAIT_MS,
  * raising that constant moves the bound clear of the very regression it exists to
- * catch: measured at a 10x budget the guard takes 2054ms while this bound becomes
- * 18_000ms, so without the pin below that edit leaves every test in this file
- * green — a coverage loss against the `1_500` literal this replaced, which failed it
- * outright ("expected 2054 to be less than 1500"). The pin asserted in "the stalled-exit
- * deadline is calibrated for the current write budget" below is what restores it, so the
- * two assertions divide the work:
+ * catch: measured at a 10x budget the guard takes 2006ms while this bound becomes
+ * 12_000ms, so without the pin below that edit leaves every test in this file green.
+ * The pin asserted in "the stalled-exit deadline is calibrated for the current write
+ * budget" below is what restores it, so the two assertions divide the work:
  *   - the pin catches any change to the write budget, whatever its size, and fails by
  *     naming the constant that moved;
- *   - this deadline catches what the pin cannot see — teardown or exit-path slowdowns
- *     at an unchanged budget — once they exceed 1_800ms.
+ *   - this deadline catches what the pin cannot see — exit-path slowdowns at an
+ *     unchanged budget — once the two bounded waits take more than
+ *     STALLED_EXIT_STRETCH_ALLOWANCE times their budget.
  *
- * The window is narrow and asymmetric, so do not widen this without re-measuring both
- * ends:
- *   - floor — a loaded runner has been seen at 1547ms (BLO-22985), so anything at or
- *     below the old 1_500 literal flakes; that overshoot is teardown stretching, not
- *     the timer budget, which fires on schedule. 1_800 clears it by 16.4%, and this is
- *     the side resting on a single observed sample.
- *   - ceiling — 1_800 is 11.6% under the ~2_036-2_054ms a 10x budget regression
- *     produces. The tighter margin is this one, not the floor.
- * The ceiling is a choice about the smallest slowdown worth catching, not a hard limit.
- * It is not the watchdog: STALLED_EXIT_WATCHDOG_MS is a multiple of this bound, so a
- * slow-but-working exit always fails this assertion with a measured elapsed rather than
- * degrading into a SIGKILL — that needs >9_000ms at today's values, ~45x the budget.
+ * Both ends are now measured rather than asserted, so do not widen this without
+ * re-running both:
+ *   - floor — 703ms, the worst of 20 samples at 384 spinners on 4 CPUs, i.e. past the
+ *     contention that produced the PEN-3381 report. 1_200 clears it by 1.71x. The old
+ *     1_800 against the parent's clock did not clear its own floor at all.
+ *   - ceiling — 1_200 is 40% under the 2_006ms a 10x budget regression produces on
+ *     this same measurement (measured, not projected), so the backstop survives the
+ *     move: at an unchanged budget this deadline still fires on a 10x path regression.
+ *
+ * It is not the watchdog: STALLED_EXIT_WATCHDOG_MS bounds the parent's clock and is
+ * sized separately, so a slow-but-working exit always fails this assertion with a
+ * measured elapsed rather than degrading into a SIGKILL.
  *
  * Mutation-tested for independent value (BLO-37311), because the previous comment
  * claimed this assertion protects the `timer.unref()` early exit in the guard and that
  * is false: deleting `timer.unref?.()` leaves every test in this file green, since the
  * `if (!onCrash) { finish(); return; }` branch returns before that timer is ever created.
  */
-const STALLED_EXIT_DEADLINE_MS = MAX_WRITE_WAIT_MS * 2 * 9;
+const STALLED_EXIT_DEADLINE_MS = MAX_WRITE_WAIT_MS * 2 * STALLED_EXIT_STRETCH_ALLOWANCE;
 /**
- * Harness backstop, never the thing under test. It must stay well clear of
- * STALLED_EXIT_DEADLINE_MS: a slow-but-working exit has to fail the assertion with a
- * measured elapsed time, not get SIGKILLed into "did not exit" — a claim this harness
- * cannot support, because it killed the child rather than watching it fail to die.
- * The startup watchdog next door needed 5x headroom for loaded runners; a deadline
- * measured on the same runners needs the same, and at 2s it had 500ms.
+ * Harness backstop, never the thing under test, and the one bound here that is still
+ * on the PARENT's spawn-to-exit clock — so it is deliberately NOT a multiple of
+ * STALLED_EXIT_DEADLINE_MS any more. It has to clear the teardown term that deadline
+ * now excludes: measured at 3_600ms on a 4-CPU cgroup at 384 spinners (BLO-55723),
+ * which 9_000 clears by 2.5x. Tying it to the deadline would have shrunk it to 6_000
+ * as a side effect of narrowing a bound on a different quantity.
+ *
+ * It must stay well clear of the deadline in the other direction too: a
+ * slow-but-working exit has to fail the assertion with a measured elapsed time, not get
+ * SIGKILLed into "did not exit" — a claim this harness cannot support, because it
+ * killed the child rather than watching it fail to die. The startup watchdog next door
+ * needed 5x headroom for loaded runners; at 2s this one had 500ms.
  */
-const STALLED_EXIT_WATCHDOG_MS = STALLED_EXIT_DEADLINE_MS * 5;
+const STALLED_EXIT_WATCHDOG_MS = MAX_WRITE_WAIT_MS * 2 * 45;
 /**
  * How long `readRemainingStderr` waits for the dead child's stderr to reach `end`
  * before reporting whatever it has so far.
@@ -135,7 +191,10 @@ interface CrashResult {
 
 interface StalledCrashResult {
   code: number | null;
+  /** The PARENT's spawn-to-exit clock. Diagnostic only — see STALLED_EXIT_DEADLINE_MS. */
   elapsedMs: number;
+  /** The guard's own crash-to-`exit` elapsed, reported by the fixture. The asserted one. */
+  guardElapsedMs: number;
 }
 
 function runFixture(kind: "throw" | "reject", padBytes: number, strictRejections = false): Promise<CrashResult> {
@@ -298,8 +357,25 @@ async function holdEventLoopAfterPoll(ms: number): Promise<void> {
 
 function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<StalledCrashResult> {
   return new Promise((resolve, reject) => {
+    /**
+     * Where the fixture reports its own crash-to-`exit` elapsed. Per-run and in a
+     * fresh directory so concurrent vitest workers cannot read each other's file;
+     * the two diagnostic runs below spawn plain `node`, never write it, and always
+     * take the reject path, so its absence there is expected rather than a failure.
+     */
+    const timingDir = fs.mkdtempSync(path.join(os.tmpdir(), "crash-guard-exit-"));
+    const timingPath = path.join(timingDir, "guard-timing.json");
+    const dropTimingDir = (): void => {
+      try {
+        fs.rmSync(timingDir, { recursive: true, force: true });
+      } catch {
+        /* a leaked temp dir must not mask the verdict */
+      }
+    };
+
     const child = spawn(run.command, run.args, {
       stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, CRASH_GUARD_EXIT_TIMING_PATH: timingPath },
     });
     child.stderr.pause();
 
@@ -354,7 +430,8 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
         reject(
           new Error(
             `crash guard had not exited ${STALLED_EXIT_WATCHDOG_MS}ms after the stall ` +
-              `(harness backstop; the asserted deadline is ${STALLED_EXIT_DEADLINE_MS}ms)`,
+              `(harness backstop on the parent's clock; the asserted deadline is ` +
+              `${STALLED_EXIT_DEADLINE_MS}ms of GUARD time, which is a different quantity)`,
           ),
         );
       }, STALLED_EXIT_WATCHDOG_MS);
@@ -363,6 +440,7 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
 
     child.on("error", (error) => {
       clearTimeout(startupWatchdog);
+      dropTimingDir();
       reject(error);
     });
     child.on("exit", (code, signal) => {
@@ -377,6 +455,7 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
         const lateAtExit = lateBackpressureIgnored;
         void readRemainingStderr(child.stderr)
           .then((stderr) => {
+            dropTimingDir();
             reject(
               new Error(
                 `${
@@ -391,11 +470,45 @@ function runFixtureWithStalledStderr(run: StalledRun = PREFILL_RUN): Promise<Sta
               ),
             );
           })
-          .catch(reject);
+          .catch((error) => {
+            dropTimingDir();
+            reject(error);
+          });
         return;
       }
       child.stderr.destroy();
-      resolve({ code, elapsedMs: Date.now() - startedAt });
+      const elapsedMs = Date.now() - startedAt;
+      /**
+       * A PRESENT, finite number is the only reading that passes. A missing or
+       * unparseable file means the child never reached its `exit` handler — which is
+       * exactly the failure this suite exists to catch — so it must not default to
+       * anything the deadline below can clear.
+       */
+      let reported: unknown;
+      try {
+        reported = (JSON.parse(fs.readFileSync(timingPath, "utf8")) as { guardElapsedMs?: unknown }).guardElapsedMs;
+      } catch (error) {
+        dropTimingDir();
+        reject(
+          new Error(
+            `crash guard exited (code=${code}, signal=${signal}) without reporting its own elapsed time: ` +
+              `${error instanceof Error ? error.message : String(error)} ` +
+              `(parent-observed spawn-to-exit was ${elapsedMs}ms)`,
+          ),
+        );
+        return;
+      }
+      dropTimingDir();
+      if (typeof reported !== "number" || !Number.isFinite(reported)) {
+        reject(
+          new Error(
+            `crash guard reported a non-numeric elapsed time (${JSON.stringify(reported)}); ` +
+              `parent-observed spawn-to-exit was ${elapsedMs}ms`,
+          ),
+        );
+        return;
+      }
+      resolve({ code, elapsedMs, guardElapsedMs: reported });
     });
   });
 }
@@ -437,22 +550,29 @@ describe("process crash guard — real process exit", () => {
    *
    * Both that deadline and STALLED_EXIT_WATCHDOG_MS are multiples of MAX_WRITE_WAIT_MS,
    * so without this assertion a change to the write budget widens every bound in the
-   * file and the slowdown it causes goes unnoticed — measured at 1_000 the stalled exit
-   * takes 2054ms while every other test in the file still passes. Failing here instead
-   * names the constant that moved; the assertion message carries the remedy.
+   * file and the slowdown it causes goes unnoticed — measured at 1_000 the guard takes
+   * 2006ms against a deadline that has itself become 12_000ms, so every other test in
+   * the file still passes. Failing here instead names the constant that moved; the
+   * assertion message carries the remedy.
    */
   it("the stalled-exit deadline is calibrated for the current write budget", () => {
     expect(
       MAX_WRITE_WAIT_MS,
-      "write budget changed: re-measure the stalled exit, then move this pin and the 9x multiplier in STALLED_EXIT_DEADLINE_MS together",
+      "write budget changed: re-measure the stalled exit, then move this pin and STALLED_EXIT_STRETCH_ALLOWANCE together",
     ).toBe(100);
   });
 
   it("still exits when stderr is not drained", async () => {
-    const { code, elapsedMs } = await runFixtureWithStalledStderr();
+    const { code, elapsedMs, guardElapsedMs } = await runFixtureWithStalledStderr();
 
     expect(code).toBe(1);
-    expect(elapsedMs).toBeLessThan(STALLED_EXIT_DEADLINE_MS);
+    expect(
+      guardElapsedMs,
+      `the guard took ${guardElapsedMs}ms from crash to exit; the parent saw ${elapsedMs}ms spawn-to-exit, of ` +
+        `which ${elapsedMs - guardElapsedMs}ms is stdin transit plus kernel teardown — the terms this bound ` +
+        `deliberately excludes. A guard figure near ${MAX_WRITE_WAIT_MS * 2}ms beside a large parent figure is a ` +
+        `contended runner and not a finding; a large GUARD figure is the regression.`,
+    ).toBeLessThan(STALLED_EXIT_DEADLINE_MS);
   });
 
   /**

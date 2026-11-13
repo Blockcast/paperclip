@@ -92,6 +92,8 @@
     "src/__tests__/pr-comment-review-gate.test.ts",
     "src/__tests__/cgroup-memory-metrics.test.ts",
     "src/__tests__/native-memory-metrics.test.ts",
+    "src/__tests__/process-crash-guard-exit.test.ts",
+    "src/__tests__/fixtures/crash-guard-exit-fixture.ts",
     "src/__tests__/process-mapping-metrics.test.ts",
     "src/__tests__/recovery-chain-pass-timing-wiring.test.ts",
     "src/__tests__/recovery-stranded-attendance-batch.test.ts",
