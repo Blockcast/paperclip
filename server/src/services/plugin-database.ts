@@ -607,7 +607,7 @@ function assertNoUnextractedSchemaRefs(
     if (extracted.has(`${schema.toLowerCase()}.${table.toLowerCase()}`)) continue;
     const schemaLower = schema.toLowerCase();
     // A name that really is a schema is adjudicated unconditionally; only a left side
-    // that is NOT a schema can be exempt, and then only if the statement declared it.
+    // that is NOT a schema can be exempt.
     // The old test was the other way round -- skip unless the left side LOOKED like a
     // schema -- which silently exempted every real schema the pattern did not
     // anticipate, `drizzle` among them (PEN-6604).
