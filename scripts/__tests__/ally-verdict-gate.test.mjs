@@ -1140,6 +1140,93 @@ test("attestationLagFindings: only the Ally APP's review at the LIVE head counts
   }
 });
 
+// The immutable surface. GitHub never rewrites a review BODY, so its
+// `Reviewed head:` marker still names the tree Ally actually read, where
+// `commit.oid` reports only where the review is pinned NOW.
+const markerBody = (sha) => `## Ally — Consolidated PR Review\n\nReviewed head: \`${sha}\`\n\nNo blocking changes.\n`;
+
+// PEN-5569. `review.commit.oid` is a MUTABLE anchor: GitHub re-anchors it
+// FORWARD onto the new head when the branch moves, so it fails OPEN -- it does
+// not reject a stale review, it accepts one that never saw this head. Measured
+// on this repository 2026-11-13 over the 50 most-recently-updated open PRs: of
+// the 65 Ally App reviews carrying `commit.oid === headRefOid`, 16 (24.6%, on
+// #3725/#3727/#3728/#3730) carried a body marker naming a DIFFERENT head.
+test("attestationLagFindings: a re-anchored review is not a review AT this head", () => {
+  const base = { head: lagHead.stranded, runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")] };
+  const pinned = allyReview(lagHead.stranded, "2026-11-04T10:41:24Z");
+
+  assert.equal(
+    findLag([{ ...base, reviews: [{ ...pinned, body: markerBody(lagHead.stranded) }] }]).length,
+    1,
+    "control: the marker agrees with the head, so the review is genuine",
+  );
+  // Identical `commit.oid`, and the body says it read a different tree.
+  assert.deepEqual(
+    findLag([{ ...base, reviews: [{ ...pinned, body: markerBody(lagHead.healthy1) }] }]),
+    [],
+    "a marker naming another head is not a review at this one",
+  );
+});
+
+test("attestationLagFindings: a review with no marker falls back to commit.oid, never to silence", () => {
+  // The same asymmetry the `lock` clause carries: a detector whose whole
+  // purpose is to catch a LOST signal must not go quiet on absent evidence.
+  // Requiring a marker outright would make a markerless Ally review invisible
+  // and drop a genuinely stranded head out of the report. Marker coverage was
+  // 160/160 on the sample above, so this is unreachable today -- it is here so
+  // a future markerless review degrades to the old reading, not to nothing.
+  const node = {
+    head: lagHead.stranded,
+    reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+    runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")],
+  };
+  assert.equal(findLag([node]).length, 1, "no body field at all");
+  assert.equal(
+    findLag([{ ...node, reviews: [{ ...node.reviews[0], body: "A review body carrying no marker." }] }]).length,
+    1,
+    "a body with no marker in it",
+  );
+});
+
+test("attestationLagFindings: a genuine review beside re-anchored ones still dates the finding", () => {
+  // The live shape on 2026-11-13: each of those four PRs carried FOUR
+  // re-anchored reviews plus one genuine at-head review, and `newestEpoch`
+  // already picked the genuine one. So this change moves no live finding. What
+  // it removes is the compound case above -- the genuine review absent and only
+  // a re-anchored one left to be mis-attributed, where the detector would have
+  // named a review of a tree Ally never read as its reason.
+  const reviews = [
+    { ...allyReview(lagHead.stranded, "2026-11-04T09:00:00Z"), body: markerBody(lagHead.healthy1) },
+    { ...allyReview(lagHead.stranded, "2026-11-04T10:41:24Z"), body: markerBody(lagHead.stranded) },
+  ];
+  const found = findLag([{ head: lagHead.stranded, reviews, runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")] }]);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].reviewedAt, "2026-11-04T10:41:24.000Z", "dated from the genuine review, not the re-anchored one");
+});
+
+test("attestationLagFindings: the marker is read case-insensitively and survives several markers", () => {
+  const base = { head: lagHead.stranded, runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")] };
+  const pinned = allyReview(lagHead.stranded, "2026-11-04T10:41:24Z");
+  const body = (s) => ({ ...base, reviews: [{ ...pinned, body: s }] });
+  assert.equal(findLag([body(markerBody(lagHead.stranded.toUpperCase()))]).length, 1, "an upper-case marker");
+  // A review quoting an earlier one carries two markers. Count it as read when
+  // ANY names this head, erring toward REPORTING rather than silence.
+  assert.equal(
+    findLag([body(`${markerBody(lagHead.healthy1)}\n${markerBody(lagHead.stranded)}`)]).length,
+    1,
+    "several markers, one of which names this head",
+  );
+});
+
+test("'/test' is still refused to every App seat, which is what makes the warning's second remedy load-bearing", () => {
+  // The premise of the attestation-lag warning's App-seat remedy (PEN-5569).
+  // If someone later makes `/test` reachable to the App, this fails and sends
+  // them back to re-read that warning rather than leaving it overstated.
+  const source = read("scripts/pr-test-request.mjs");
+  assert.match(source, /type === 'User'/, "a Bot comment is refused");
+  assert.match(source, /login !== 'allyblockcast'/, "the same-named User seat is refused too");
+});
+
 test("attestationLagFindings: drafts, forks, other bases and stale head reads are out of scope", () => {
   const live = {
     head: lagHead.stranded,
@@ -1284,12 +1371,37 @@ test("attestation-lag: its own read-only job on the hourly sweep", () => {
   assert.match(sweepYml, /- cron: '9 \* \* \* \*'/);
 });
 
+test("the attestation-lag warning names a remedy the PR's own author can take", () => {
+  // This is the ALARMING site: past ATTESTATION_LAG_ALARM_SECONDS it turns the
+  // Actions tab red. It used to name `/test` and nothing else, and `/test` is
+  // refused to every App seat -- the author of the great majority of PRs here.
+  // A standing red with no reachable exit named earns exactly the alarm fatigue
+  // it got. PEN-5569.
+  const source = read("scripts/ally-verdict-ci.mjs");
+  const start = source.indexOf("::warning title=ally attestation lag");
+  assert.ok(start > 0, "the attestation-lag warning is still printed");
+  const warning = source.slice(start, source.indexOf("    );", start));
+  assert.match(warning, /requested_reviewers/, "names the native review request");
+  assert.match(warning, /DELETE/, "a bare POST against an outstanding request emits no event");
+  assert.match(warning, /attempt 1/, "names the bound on the hand re-run");
+  // Scope the re-fire to the USER array. Cycling a TEAM reviewer is asymmetric in the
+  // direction that destroys state: the DELETE needs only that the team be requested, while the
+  // re-ADD must additionally resolve the team to a node id, and that leg has been measured to
+  // 422 -- which on a code-owner team strands the gate it was meant to re-fire.
+  assert.match(warning, /never team_reviewers/, "cycling a code-owner TEAM must stay forbidden");
+  assert.match(warning, /'\/test'/, "the human remedy is still named, because it is still correct for a human");
+});
+
+
 test("the attestation-lag query reads the two planes the detector compares", () => {
   // It must read reviews WITH their head, and the Ally check-runs WITH
   // timestamps -- `conclusion` alone cannot answer "which came first".
   assert.match(ATTESTATION_LAG_QUERY, /reviews\(last: 20\)/);
   assert.match(ATTESTATION_LAG_QUERY, /author \{ login __typename \}/, "the User seat must be distinguishable");
   assert.match(ATTESTATION_LAG_QUERY, /submittedAt/);
+  // ...and the review BODY, which is the only immutable record of which head a
+  // review actually read: GitHub re-anchors `commit.oid` forward (PEN-5569).
+  assert.match(ATTESTATION_LAG_QUERY, /commit \{ oid \} body/);
   assert.match(ATTESTATION_LAG_QUERY, /startedAt completedAt/);
   assert.match(ATTESTATION_LAG_QUERY, /filterBy: \{appId: 3966421\}/);
   assert.match(ATTESTATION_LAG_QUERY, /states: OPEN/);
