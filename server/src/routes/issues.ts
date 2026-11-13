@@ -17717,29 +17717,57 @@ export function issueRoutes(
           // concurrent-same-key case cannot arise here — but `censorUsernameInLogs`
           // still makes the stored body `redactCurrentUserText(body)`, and the
           // builder has always asked about the PERSISTED body.
-          const mentionContext = await resolveCommentMentionContext({
-            issue: currentIssue,
-            body: req.body.body,
-            actor: persistedCommentActor(actor),
-          });
-          comment = await db.transaction(async (tx) => {
-            const inserted = await svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
-            const effects = await buildKeyedCommentEffectIntents({
+          //
+          // A mention lookup failure must NOT cost the caller their comment.
+          // `resolveCommentMentionContext` lets `findMentionedAgents` throw
+          // (only the membership lookup inside it is caught), and the inline
+          // tail has always degraded here rather than refusing the write: it
+          // still answers 201 and still reports the names it could not bind, on
+          // the stated grounds that "a false 'this may not have reached anyone'
+          // costs a re-send, a false silence costs a day". Routing the write
+          // through a hoist that runs BEFORE the insert turns that degradation
+          // into a 500 and loses the comment outright, so the failure falls
+          // back to the inline path — which resolves mentions itself, inside
+          // its own catch — instead of propagating. Deliberately NOT a retry
+          // and not an empty-context substitution: an empty context would let
+          // the write land while silently dropping the mention wakes it owed,
+          // which is the false silence this is avoiding.
+          let mentionContext: CommentMentionContext | null = null;
+          try {
+            mentionContext = await resolveCommentMentionContext({
               issue: currentIssue,
-              comment: inserted,
-              actor,
-              referenceSummaryBefore: commentReferenceSummaryBefore,
-              mentions: inserted.body === req.body.body ? mentionContext : undefined,
+              body: req.body.body,
+              actor: persistedCommentActor(actor),
             });
-            await enqueueCommentEffects(tx as unknown as Db, {
-              companyId: currentIssue.companyId,
-              issueId: currentIssue.id,
-              commentId: inserted.id,
-              effects,
+          } catch (err) {
+            logger.warn(
+              { err, issueId: currentIssue.id },
+              "unkeyed comment mention resolution failed; falling back to the inline comment path",
+            );
+          }
+          if (mentionContext) {
+            const resolvedMentions = mentionContext;
+            comment = await db.transaction(async (tx) => {
+              const inserted = await svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
+              const effects = await buildKeyedCommentEffectIntents({
+                issue: currentIssue,
+                comment: inserted,
+                actor,
+                referenceSummaryBefore: commentReferenceSummaryBefore,
+                mentions: inserted.body === req.body.body ? resolvedMentions : undefined,
+              });
+              await enqueueCommentEffects(tx as unknown as Db, {
+                companyId: currentIssue.companyId,
+                issueId: currentIssue.id,
+                commentId: inserted.id,
+                effects,
+              });
+              return inserted;
             });
-            return inserted;
-          });
-          unkeyedCommentRoutedToOutbox = true;
+            unkeyedCommentRoutedToOutbox = true;
+          } else {
+            comment = await svc.addComment(id, req.body.body, commentActor, commentOptions);
+          }
         } else {
           comment = await svc.addComment(id, req.body.body, commentActor, commentOptions);
         }
@@ -17764,11 +17792,29 @@ export function issueRoutes(
     // `comment` is re-read into a const so the closures below keep the
     // not-null narrowing, and the resolution is memoized.
     //
-    // That memo spans the UNKEYED path only, where the wake (below) and the
-    // response share one lookup. The idempotency-keyed path resolves separately
-    // via `resolveCommentMentionContext` before its transaction, and then again
-    // here via `commentResponseBody()`, so a keyed first write makes two
-    // queries. (A keyed replay whose effects already exist makes one.) The two sites are
+    // PEN-6645: the split that matters is ELIGIBLE-vs-INELIGIBLE, not
+    // keyed-vs-unkeyed, and it stopped being the latter when PEN-5682 routed the
+    // eligible unkeyed write onto the outbox. Two lookups are the DESIGN on
+    // every path that resolves mentions before its insert transaction, and one
+    // lookup is what a path with no such transaction needs — so meeting the
+    // second lookup on an unkeyed write is not a regression.
+    //
+    //  - INELIGIBLE unkeyed (no transaction): this memo is shared by the inline
+    //    mention-wake loop further down and by `commentResponseBody()`. ONE
+    //    lookup, which is the case the paragraph above was written for.
+    //  - KEYED, and ELIGIBLE UNKEYED (both open a transaction): mentions are
+    //    resolved by `resolveCommentMentionContext` BEFORE the transaction, and
+    //    again here. TWO queries on a first write. (A keyed replay whose effects
+    //    already exist makes one.)
+    //
+    // ⚠ On the ELIGIBLE unkeyed path there is no wake below to share with: the
+    // handler returns early at `if (unkeyedCommentRoutedToOutbox)`, which sits
+    // ABOVE the inline mention-wake loop, because the wake was enqueued into the
+    // outbox inside the transaction. This memo has exactly one consumer there,
+    // `commentResponseBody()`. Do not re-derive the sharing claim from the
+    // keyed/unkeyed shape; read which branch set `unkeyedCommentRoutedToOutbox`.
+    //
+    // The two sites are
     // deliberately NOT merged: the pre-insert resolution asks about
     // `req.body.body`, while this one asks about `persistedComment.body`. Those
     // usually coincide on a first write, but not always — `censorUsernameInLogs`
