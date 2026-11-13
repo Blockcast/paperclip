@@ -1909,14 +1909,65 @@ async function findActiveRuntimeServiceBlockingDirtyQuarantine(input: {
   return service ?? null;
 }
 
+// BLO-55723: an issue whose executionWorkspaceId was unbound (the standard
+// recovery recipe) used to refuse here forever. Without an id, scope the check
+// by the worktree PATH instead: every persisted workspace rooted at it, plus any
+// service whose cwd is at or under it. Still fail-closed on any live service.
+async function findActiveRuntimeServiceOnWorktreePath(input: {
+  db: Db;
+  companyId: string;
+  worktreePath: string;
+}) {
+  const workspaces = await input.db
+    .select()
+    .from(executionWorkspaces)
+    .where(and(eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.cwd, input.worktreePath)));
+  for (const workspace of workspaces) {
+    const service = await findActiveRuntimeServiceBlockingDirtyQuarantine({ db: input.db, workspace });
+    if (service) return service;
+  }
+  const [service] = await input.db
+    .select({
+      id: workspaceRuntimeServices.id,
+      serviceName: workspaceRuntimeServices.serviceName,
+      status: workspaceRuntimeServices.status,
+      scopeType: workspaceRuntimeServices.scopeType,
+    })
+    .from(workspaceRuntimeServices)
+    .where(and(
+      eq(workspaceRuntimeServices.companyId, input.companyId),
+      ne(workspaceRuntimeServices.status, "stopped"),
+      or(
+        eq(workspaceRuntimeServices.cwd, input.worktreePath),
+        sql`starts_with(${workspaceRuntimeServices.cwd}, ${`${input.worktreePath.replace(/\/+$/, "")}/`})`,
+      ),
+    ))
+    .limit(1);
+  return service ?? null;
+}
+
 async function assertDirtyQuarantineRuntimeServicesStopped(input: {
   db: Db;
   executionWorkspaceId: string | null;
+  worktreePath: string;
   evidence: GitWorktreeBranchIncoherenceEvidence;
 }) {
   if (!input.executionWorkspaceId) {
+    const companyId = await readIssueCompanyId(input.db, input.evidence.sourceIssueId);
+    if (!companyId) {
+      input.evidence.safeRepair.eligible = false;
+      input.evidence.safeRepair.reason = "dirty quarantine repair requires an execution workspace id or a source issue company for runtime-service checks";
+      throw branchIncoherenceValidationFailure(input.evidence);
+    }
+    const pathService = await findActiveRuntimeServiceOnWorktreePath({
+      db: input.db,
+      companyId,
+      worktreePath: input.worktreePath,
+    });
+    if (!pathService) return;
     input.evidence.safeRepair.eligible = false;
-    input.evidence.safeRepair.reason = "dirty quarantine repair requires an execution workspace id for runtime-service checks";
+    input.evidence.safeRepair.reason =
+      `dirty quarantine repair requires runtime service "${pathService.serviceName}" (${pathService.id}) to be stopped; current status is ${pathService.status}`;
     throw branchIncoherenceValidationFailure(input.evidence);
   }
 
@@ -3199,6 +3250,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     await assertDirtyQuarantineRuntimeServicesStopped({
       db: input.db,
       executionWorkspaceId: input.executionWorkspaceId ?? null,
+      worktreePath: input.worktreePath,
       evidence,
     });
     // BLO-55723: a recorded branch that no longer exists (deleted, or never
