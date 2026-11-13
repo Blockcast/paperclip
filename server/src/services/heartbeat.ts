@@ -381,6 +381,7 @@ import {
   ISSUE_PARK_EXPIRED_WAKE_REASON,
   ISSUE_PARK_EXPIRY_WAKE_STATUSES,
   buildIssueParkExpiredWakeIdempotencyKey,
+  issueParkOwesDestroyedHandoff,
   issueParkOwesReleaseWake,
 } from "./issue-park-expiry.js";
 import {
@@ -34907,6 +34908,372 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { scanned, recovered, cleared, skipped, unowned, autoDischarged, failed, pages, oldestClearedAt };
   }
 
+  /**
+   * PEN-6556: hand back the obligation a `cancelled` row's park cannot deliver.
+   *
+   * The park half of the asymmetry `reconcileCancelledIssueMonitorRecoveries` closes for
+   * the monitor. Both are destroyed by the same cancel, on the same rows, for the same
+   * reason — but only the monitor is detected, recorded, recovered and documented.
+   * PEN-4729 carries the whole gap on one row from one cancel: its monitor was handed to
+   * PEN-6538 and worked, while its park is still unfired 16.9 days later.
+   *
+   * ⛔ This pass deliberately does NOT mirror the monitor half's TRIGGER, and three
+   * earlier runs on PEN-6556 recorded "mirror it" before the asymmetry was measured:
+   *
+   *  - A cancelled MONITOR is destroyed at CLEAR time. The clear nulls the column and the
+   *    plugin's reopen restores the row to `todo` with no monitor at all, so nothing can
+   *    ever deliver it and the obligation is owed the moment it is cleared.
+   *  - A cancelled PARK is NOT destroyed. All four park columns survive intact, so a row
+   *    the plugin reopens BEFORE `parkedUntil` fires its park normally — measured on
+   *    PEN-4881, which fired 15 s after its restore. What is broken is that the wait is
+   *    UNBOUNDED, not that the park is erased.
+   *
+   * ⇒ emitting at cancel time would be a FALSE carrier for a still-deliverable
+   * obligation. The park is owed a handoff only once its deadline passes with the row
+   * still cancelled, which is what `issueParkOwesDestroyedHandoff` states.
+   *
+   * It also carries NO handoff horizon, unlike the monitor half. That horizon exists to
+   * bound a backfill measured at >= 21 rows of unknown age; this population is 7, five of
+   * them overdue, measured 2026-11-12 across all 5982 company rows. A horizon on seven
+   * rows would be apparatus with nothing to bound, and its exemption test
+   * (`sourceOwnsOpenWorkProduct`) captures 3 of those 7 — missing PEN-4881, the row that
+   * prompted the filing, whose whole obligation was prose in `parkedReason`.
+   */
+  async function reconcileDestroyedIssueParkRecoveries(opts?: {
+    companyId?: string;
+    limit?: number;
+    maxPages?: number;
+    now?: Date;
+    /** Test seam: runs between candidate selection and the carrier emit. */
+    beforeRecover?: () => Promise<void>;
+  }) {
+    // Same emission budget as the monitor half and for the same reason: this pass CREATES
+    // ROWS and ENQUEUES WAKES, and its first run against a deployed fleet is the backfill.
+    // The measured backlog is 5, so 25 drains it in a single pass while still spreading an
+    // unmeasured fleet's backlog over minutes rather than landing it as one burst.
+    const limit = opts?.limit ?? 25;
+    // Bounds the walk PAST candidates that emit nothing. Selection is `asc(updatedAt)` and
+    // a row this pass cannot discharge keeps its `updatedAt`, so an unowned source sits at
+    // the head of every page forever and `limit` of them would starve every healthy row
+    // behind them with a `warn` line as the only symptom.
+    const maxPages = opts?.maxPages ?? 8;
+    const now = opts?.now ?? new Date();
+    const nowMs = now.getTime();
+
+    // Sound over-approximation of `issueParkOwesDestroyedHandoff`. The function is the
+    // decision; this only narrows the scan, which is what keeps the two from drifting the
+    // way two hand-written copies of a predicate eventually do.
+    //
+    // ⛔ `status = 'cancelled'` and nothing wider. Of the 84 parks measured sitting on a
+    // status that cannot wake them, 55 are `done` — benign, the work finished before the
+    // deadline, and waking it is the BLO-23206 shape — and 22 are `blocked`, where the
+    // park is DORMANT rather than dead because the stranded-blocked reconciler drains such
+    // a row to `todo` and the release sweep then covers it there. Selecting either would
+    // emit roughly ten false carriers per real one.
+    const parkHandoffOwed = sql`(
+      ${issues.status} = 'cancelled'
+      and ${issues.parkedUntil} is not null
+      and ${issues.parkedUntil} <= ${now.toISOString()}::timestamptz
+      and ${issues.parkedAt} is not null
+      and (
+        ${issues.parkedRecoveryEmittedAt} is null
+        or ${issues.parkedRecoveryEmittedAt} < ${issues.parkedAt}
+      )
+    )`;
+
+    // Sources selected with an obligation still owed and nobody to hand it to. Collected
+    // rather than logged per row: a `warn` per unowned row per tick is noise, and the
+    // population is the actionable number.
+    const unownedIssueIds: string[] = [];
+
+    /**
+     * Find a carrier this pass already built for the same source.
+     *
+     * Keyed on `(companyId, originKind, originId, not terminal)` exactly as
+     * `findOpenIssueMonitorRecoveryIssue` is, so a crash between the emit and the stamp
+     * re-drives into a reuse rather than into a duplicate.
+     *
+     * ⚠️ NOT narrowed by `originFingerprint`. The monitor half and this one share
+     * `originId`, so a source whose monitor AND park were both destroyed by one cancel
+     * gets ONE carrier carrying both obligations rather than two rows pointing at the same
+     * work. That is the right trade — PEN-4729 is exactly that row — and it is why the
+     * carrier body states which edge it is carrying rather than assuming.
+     */
+    async function findOpenParkRecoveryIssue(row: {
+      companyId: string;
+      id: string;
+    }) {
+      return db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, row.companyId),
+            eq(issues.originKind, RECOVERY_ORIGIN_KINDS.strandedIssueRecovery),
+            eq(issues.originId, row.id),
+            visibleIssueCondition(),
+            notInArray(issues.status, ["done", "cancelled"]),
+          ),
+        )
+        .orderBy(desc(issues.createdAt))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+    }
+
+    /**
+     * Stamp the handoff, guarded on the exact park it discharges.
+     *
+     * A column rather than a `jsonb_set` on `executionState`, which is the one design
+     * decision here reached by refutation rather than by preference — see migration 0280's
+     * header for why every `executionState` siting fails. The CAS is on `parkedAt`: if the
+     * row was re-parked or un-parked between selection and here, the guard fails, the
+     * stamp is skipped, and the next pass handles the new park on its own terms.
+     */
+    async function stampParkHandoff(input: { id: string; parkedAtIso: string }): Promise<boolean> {
+      const updated = await db
+        .update(issues)
+        .set({ parkedRecoveryEmittedAt: now })
+        .where(
+          and(
+            eq(issues.id, input.id),
+            eq(issues.status, "cancelled"),
+            sql`${issues.parkedAt} = ${input.parkedAtIso}::timestamptz`,
+            sql`(
+              ${issues.parkedRecoveryEmittedAt} is null
+              or ${issues.parkedRecoveryEmittedAt} < ${issues.parkedAt}
+            )`,
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+      return Boolean(updated);
+    }
+
+    function parkRecoveryBody(row: {
+      identifier: string | null;
+      title: string;
+      parkedUntil: Date | null;
+      parkedReason: string | null;
+    }): string {
+      const label = row.identifier ?? row.title;
+      return [
+        `Paperclip is carrying forward a deliberate park destroyed on ${label}.`,
+        "",
+        `That row was cancelled while parked, and a park on a cancelled row cannot fire its`,
+        `expiry wake — \`ISSUE_PARK_EXPIRY_WAKE_STATUSES\` excludes terminal statuses. The park's`,
+        `columns survived the cancel intact, so nothing was cleared and nothing reported it:`,
+        `the deadline simply passed with no wake behind it.`,
+        "",
+        `- Park deadline: ${row.parkedUntil ? row.parkedUntil.toISOString() : "unknown"}`,
+        `- Park reason, verbatim from the destroyed park:`,
+        "",
+        row.parkedReason ? `> ${row.parkedReason.split("\n").join("\n> ")}` : "> (none recorded)",
+        "",
+        `Next action: read the park reason above, decide whether the obligation it records is`,
+        `still owed, and either discharge it here or re-establish an explicit waiting path on`,
+        `${label}. ⛔ Do not simply re-park the source — the park reason is the whole record of`,
+        `what was owed, and a re-park without reading it discards the obligation silently.`,
+      ].join("\n");
+    }
+
+    let scanned = 0;
+    let recovered = 0;
+    let skipped = 0;
+    // Split out of `skipped` because the cause is different and actionable: these rows keep
+    // their park, so the obligation is still owed and will be selected again as soon as
+    // somebody owns it. Folding it into `skipped` would hide the one outcome with nobody
+    // named.
+    let unowned = 0;
+    let failed = 0;
+    let pages = 0;
+    let emitted = 0;
+    // The oldest deadline this pass touched. The first deployed run IS the backfill, and
+    // its blast radius is as much a question about AGE as about volume — this answers it
+    // from the pass's own log line rather than from a query nobody runs.
+    let oldestParkedUntil: string | null = null;
+    let cursor: { updatedAt: Date; id: string } | null = null;
+    // Paging walks a table this pass MUTATES, and the stamp moves `updatedAt` forward past
+    // the cursor into a later page. Rows are handled once per pass; anything genuinely
+    // still owed is picked up by the next one.
+    const seen = new Set<string>();
+
+    while (pages < maxPages && emitted < limit) {
+      pages += 1;
+      const candidates: Array<{
+        id: string;
+        identifier: string | null;
+        companyId: string;
+        title: string;
+        status: string;
+        parkedUntil: Date | null;
+        parkedReason: string | null;
+        parkedAt: Date | null;
+        parkedByAgentId: string | null;
+        parkedRecoveryEmittedAt: Date | null;
+        assigneeAgentId: string | null;
+        projectId: string | null;
+        goalId: string | null;
+        billingCode: string | null;
+        updatedAt: Date;
+      }> = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          companyId: issues.companyId,
+          title: issues.title,
+          status: issues.status,
+          parkedUntil: issues.parkedUntil,
+          parkedReason: issues.parkedReason,
+          parkedAt: issues.parkedAt,
+          parkedByAgentId: issues.parkedByAgentId,
+          parkedRecoveryEmittedAt: issues.parkedRecoveryEmittedAt,
+          assigneeAgentId: issues.assigneeAgentId,
+          projectId: issues.projectId,
+          goalId: issues.goalId,
+          billingCode: issues.billingCode,
+          updatedAt: issues.updatedAt,
+        })
+        .from(issues)
+        .innerJoin(companies, eq(companies.id, issues.companyId))
+        .where(
+          and(
+            eq(companies.status, "active"),
+            opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+            visibleIssueCondition(),
+            parkHandoffOwed,
+            // Keyset, not OFFSET: this pass MUTATES the column it orders by, so an offset
+            // would skip rows as the ones ahead of it move. `toISOString()` rather than the
+            // Date: a raw `sql` template binds through postgres.js's serializer, which
+            // rejects a Date outright.
+            cursor
+              ? sql`(${issues.updatedAt}, ${issues.id}) > (${cursor.updatedAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+              : undefined,
+          ),
+        )
+        .orderBy(asc(issues.updatedAt), asc(issues.id))
+        .limit(limit);
+
+      if (candidates.length === 0) break;
+      const lastOfPage = candidates[candidates.length - 1]!;
+      cursor = { updatedAt: lastOfPage.updatedAt, id: lastOfPage.id };
+
+      for (const candidate of candidates) {
+        if (emitted >= limit) break;
+        if (seen.has(candidate.id)) continue;
+        seen.add(candidate.id);
+        scanned += 1;
+        try {
+          // The SQL narrowed the scan; THIS is the decision.
+          if (!issueParkOwesDestroyedHandoff(candidate, nowMs)) {
+            skipped += 1;
+            continue;
+          }
+
+          // The park records who wrote the obligation, which the monitor half never had:
+          // its only candidate is the source's assignee. Prefer the assignee when there is
+          // one — the row may have changed hands since the park — and fall back to the
+          // parker, who is the one person known to have wanted this wake.
+          const ownerAgentId = candidate.assigneeAgentId ?? candidate.parkedByAgentId;
+          if (!ownerAgentId) {
+            // Selected deliberately rather than excluded in SQL. The carrier inherits this
+            // owner, so stamping an ownerless source would mint a `high` `todo` that no
+            // inbox returns and no wake reaches — the same strand this pass exists to
+            // remove. Selecting it is what makes it COUNTABLE: the obligation stays owed,
+            // it is reported here, and it is handed back for real the moment it has an
+            // owner.
+            unownedIssueIds.push(candidate.identifier ?? candidate.id);
+            unowned += 1;
+            continue;
+          }
+
+          const parkedAtIso = candidate.parkedAt!.toISOString();
+
+          if (opts?.beforeRecover) await opts.beforeRecover();
+
+          let carrier = await findOpenParkRecoveryIssue(candidate);
+          if (!carrier) {
+            carrier = await issuesSvc.create(candidate.companyId, {
+              // Name the act, not the subsystem. This row is frequently the only thing left
+              // pointing at the obligation.
+              title: `Carry forward the park destroyed on ${candidate.identifier ?? candidate.title}`,
+              description: parkRecoveryBody(candidate),
+              status: "todo",
+              priority: "high",
+              parentId: candidate.id,
+              projectId: candidate.projectId,
+              goalId: candidate.goalId,
+              assigneeAgentId: ownerAgentId,
+              assigneeAdapterOverrides: recoveryAssigneeAdapterOverrides("status_only"),
+              originKind: RECOVERY_ORIGIN_KINDS.strandedIssueRecovery,
+              originId: candidate.id,
+              originFingerprint: "issue_park:cancelled",
+              billingCode: candidate.billingCode,
+            });
+          }
+
+          // Emit first, stamp second. A crash in between re-emits next tick and the reuse
+          // lookup above dedupes it; the reverse order marks an obligation discharged that
+          // nothing carried, which is this row's own defect one layer up.
+          const stamped = await stampParkHandoff({ id: candidate.id, parkedAtIso });
+          if (!stamped) {
+            // The carrier landed; only the bookkeeping lost a race. Harmless and
+            // self-correcting, but worth a line — a stamp that never lands would make this
+            // pass re-emit on every tick.
+            logger.info(
+              { issueId: candidate.id, identifier: candidate.identifier, carrierId: carrier.id },
+              "destroyed-park handoff emitted but the stamp lost a CAS (will re-evaluate next pass)",
+            );
+          }
+
+          recovered += 1;
+          emitted += 1;
+          const parkedUntilIso = candidate.parkedUntil?.toISOString() ?? null;
+          if (parkedUntilIso && (!oldestParkedUntil || parkedUntilIso < oldestParkedUntil)) {
+            oldestParkedUntil = parkedUntilIso;
+          }
+        } catch (err) {
+          failed += 1;
+          logger.warn(
+            { err, issueId: candidate.id, outcome: "failed" },
+            "reconcileDestroyedIssueParkRecoveries recovery failed",
+          );
+        }
+      }
+
+      // A short page is the last page.
+      if (candidates.length < limit) break;
+    }
+
+    if (unownedIssueIds.length > 0) {
+      // Not an error and not silence either: the obligation is intact and still selectable,
+      // it just has nobody named to carry it. Assigning the source is the whole remedy,
+      // which is why the identifiers are the payload.
+      logger.warn(
+        { unowned: unownedIssueIds.length, issues: unownedIssueIds.slice(0, 20) },
+        "destroyed-park handoffs left owed: the source has no agent and no parker to hand the obligation to (PEN-6556)",
+      );
+    }
+
+    // An INERT pass must not read as a drained one — the defect PEN-5346 §4 measured on the
+    // monitor half, reintroduced here if this is left out. Both call sites log only when
+    // `recovered`/`unowned`/`failed` is non-zero, so a pass that selected candidates and
+    // skipped all of them would be byte-identical in the logs to a pass that selected
+    // nothing, which is itself byte-identical to the healthy drained steady state.
+    //
+    // The outcomes are mutually exclusive — every scanned candidate increments exactly one
+    // of `recovered`/`unowned`/`skipped`/`failed` — so `skipped === scanned` already implies
+    // the others are zero. If a future outcome stops being exclusive, this is the line that
+    // breaks.
+    if (scanned > 0 && skipped === scanned) {
+      logger.warn(
+        { scanned, skipped, pages },
+        "destroyed-park handoff pass selected candidates and discharged none (PEN-6556)",
+      );
+    }
+
+    return { scanned, recovered, skipped, unowned, failed, pages, oldestParkedUntil };
+  }
+
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {
     return taskWatchdogs.reconcileTaskWatchdogs({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -48980,6 +49347,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reapUnclaimableQueuedRuns,
     reconcileUndeliverableIssueMonitors,
     reconcileCancelledIssueMonitorRecoveries,
+    reconcileDestroyedIssueParkRecoveries,
     reconcileTaskWatchdogs,
 
     buildRunOutputSilence,

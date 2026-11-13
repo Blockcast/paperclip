@@ -1387,6 +1387,11 @@ export async function startServer(): Promise<StartedServer> {
   // branches AND a swallowed throw all satisfied, so it could not tell which
   // mechanism it was exercising — which is the whole of what this comment says.
   let cancelledMonitorRecoveryInFlight = false;
+  // PEN-6556: the park half of the same cancel. Latched separately rather than sharing
+  // the monitor half's flag: the two passes select on different columns and neither
+  // blocks the other, so one slow pass must not skip the sibling that had nothing to do
+  // with it.
+  let destroyedParkRecoveryInFlight = false;
   // 10 scheduler intervals. Above the normal case (a sweep routinely outlives
   // one interval — that is what the latch is for) and far below the hours a
   // wedged chain would otherwise sit silent. Deliberately scaled to the
@@ -1857,6 +1862,30 @@ export async function startServer(): Promise<StartedServer> {
               logger.error({ err }, "startup cancelled-monitor recovery reconciliation failed");
             } finally {
               cancelledMonitorRecoveryInFlight = false;
+            }
+          }
+
+          // PEN-6556: hand back the obligation a `cancelled` row's PARK cannot deliver.
+          // Ordered after the monitor half so a source whose cancel destroyed both edges
+          // reuses the carrier that pass just built, rather than racing it for one.
+          if (heartbeatSchedulerStopped) return;
+          if (!destroyedParkRecoveryInFlight) {
+            destroyedParkRecoveryInFlight = true;
+            try {
+              const parksHandedBack = await heartbeat.reconcileDestroyedIssueParkRecoveries();
+              if (
+                parksHandedBack.recovered > 0 || parksHandedBack.unowned > 0
+                || parksHandedBack.failed > 0
+              ) {
+                logger.warn(
+                  { ...parksHandedBack },
+                  "startup destroyed-park recovery handed back parks a cancel made undeliverable (PEN-6556)",
+                );
+              }
+            } catch (err) {
+              logger.error({ err }, "startup destroyed-park recovery reconciliation failed");
+            } finally {
+              destroyedParkRecoveryInFlight = false;
             }
           }
 
@@ -2547,6 +2576,37 @@ export async function startServer(): Promise<StartedServer> {
                   logger.error({ err }, "periodic cancelled-monitor recovery reconciliation failed");
                 } finally {
                   cancelledMonitorRecoveryInFlight = false;
+                }
+              })(),
+            );
+          }
+
+          // PEN-6556: the park half, single-flighted on its own latch. Ordered after the
+          // monitor half for the same reason the startup pass is: a source whose cancel
+          // destroyed both edges reuses the carrier that pass just built.
+          if (!destroyedParkRecoveryInFlight) {
+            destroyedParkRecoveryInFlight = true;
+            // The latch is released in a `finally` INSIDE the async body, never in a
+            // `.finally()` chained off the call expression — see the sibling pass above
+            // for the synchronous-throw failure that convention exists to survive.
+            trackHeartbeatSchedulerWork(
+              (async () => {
+                try {
+                  const parksHandedBack = await heartbeat.reconcileDestroyedIssueParkRecoveries();
+                  if (
+                    parksHandedBack.recovered > 0 ||
+                    parksHandedBack.unowned > 0 ||
+                    parksHandedBack.failed > 0
+                  ) {
+                    logger.warn(
+                      { ...parksHandedBack },
+                      "periodic destroyed-park recovery handed back parks a cancel made undeliverable",
+                    );
+                  }
+                } catch (err) {
+                  logger.error({ err }, "periodic destroyed-park recovery reconciliation failed");
+                } finally {
+                  destroyedParkRecoveryInFlight = false;
                 }
               })(),
             );

@@ -508,3 +508,84 @@ export function issueParkOwesReleaseWake(
   if (parkedAtMs === null) return false;
   return firedAtMs < parkedAtMs;
 }
+
+/**
+ * PEN-6556: the handoff edge's input. A superset of `IssueParkReleaseInput` only by
+ * accident of sharing four columns — the two predicates ask opposite questions of the
+ * same park, so they are stated apart rather than one through the other.
+ */
+export interface IssueParkHandoffInput {
+  status: string | null | undefined;
+  parkedUntil: Date | string | null | undefined;
+  parkedAt: Date | string | null | undefined;
+  parkedRecoveryEmittedAt: Date | string | null | undefined;
+}
+
+/**
+ * Does this row's park owe a HANDOFF right now?
+ *
+ * The authoritative statement of `reconcileDestroyedIssueParkRecoveries`'s predicate,
+ * standing to it exactly as `issueParkOwesReleaseWake` stands to `tickExpiredIssueParks`:
+ * the SQL narrows the scan with a sound over-approximation and THIS is the decision, so
+ * the two cannot drift into disagreement the way two hand-written copies eventually do.
+ *
+ * The release edge and this one are mutually exclusive by construction — the status
+ * conjuncts are disjoint — which is what makes this additive rather than a second wake on
+ * the same park.
+ *
+ * Every conjunct is load-bearing:
+ *
+ *  - **the status is `cancelled`.** NOT merely "outside `ISSUE_PARK_EXPIRY_WAKE_STATUSES`",
+ *    which is the widening that measurement refused. Of the 84 dead parks measured
+ *    2026-11-12 across 5982 rows, 55 are `done` — benign, the work finished before its
+ *    deadline and waking it is the BLO-23206 shape — and 22 are `blocked`, where the park
+ *    is DORMANT rather than dead: `issue-park-expiry.ts` states that exclusion as
+ *    deliberate, because the stranded-blocked reconciler drains such a row to `todo` and
+ *    the release sweep then covers it. Selecting either would emit ~10 false carriers per
+ *    real one.
+ *  - **the deadline has passed.** This is the conjunct that distinguishes the park half
+ *    from the monitor half and must not be copied from it. A cancelled monitor is
+ *    destroyed AT CLEAR TIME and can never be delivered, so the monitor half emits on the
+ *    clear. A cancelled park is NOT destroyed — all four columns survive — so a row the
+ *    plugin reopens before `parkedUntil` fires its park normally. Measured on PEN-4881:
+ *    the restore path works and fired 15 s after the reopen. Emitting at cancel time
+ *    would therefore hand off an obligation that is still perfectly deliverable. What is
+ *    broken is that the wait is UNBOUNDED, not that the park is erased, so the obligation
+ *    is owed only once the deadline passes with the row still cancelled.
+ *  - **no handoff has been emitted for THIS park.** `parkedRecoveryEmittedAt` is the
+ *    fire-once marker, with the same `< parkedAt` backstop and the same per-PARK scoping
+ *    as `parkedWakeFiredAt`.
+ *
+ * ⛔ Deliberately NOT narrowed by `originKind`. The alertmanager plugin is 7 of 7 of
+ * today's population, so an origin filter is inert now and would silently exclude a
+ * future canceller — and the monitor half measured two of its own cancelled rows coming
+ * from `stale_active_run_evaluation` rather than from any plugin, which is independent
+ * evidence that the defect lives at the status transition and not in one canceller.
+ *
+ * ⛔ Deliberately NOT narrowed by assignee either, for the reason the monitor half gives:
+ * selecting an unowned row is what makes it COUNTABLE. The pass refuses to stamp it,
+ * reports it in `unowned`, and hands it back for real the moment it has an owner.
+ */
+export function issueParkOwesDestroyedHandoff(
+  issue: IssueParkHandoffInput,
+  nowMs: number,
+): boolean {
+  if (issue.status !== "cancelled") return false;
+
+  // Written through `isDeliberateParkActive` rather than beside it, so the "a live park
+  // and a lapsed one cannot both hold" claim is enforced by construction here too. The
+  // `=== null` arm is the separate "no park at all" case.
+  if (readMs(issue.parkedUntil) === null) return false;
+  if (isDeliberateParkActive(issue.parkedUntil, nowMs)) return false;
+
+  const emittedAtMs = readMs(issue.parkedRecoveryEmittedAt);
+  if (emittedAtMs === null) return true;
+
+  const parkedAtMs = readMs(issue.parkedAt);
+  // A marker with no `parkedAt` to compare against is treated as emitted — the same
+  // reading `issueParkOwesReleaseWake` takes, and for the same reason: the four park
+  // columns move together, so this shape means there is no park whose deadline could have
+  // lapsed, and handing off would be a carrier with nothing behind it.
+  if (parkedAtMs === null) return false;
+  return emittedAtMs < parkedAtMs;
+}
