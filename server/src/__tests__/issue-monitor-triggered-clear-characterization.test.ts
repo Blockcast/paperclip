@@ -148,7 +148,7 @@ describe("BLO-27586 AC1 — clearing a `triggered` monitor", () => {
 });
 
 /**
- * PEN-6202 — the SERVICE-LAYER twin of `buildIssueMonitorEligibilityPatch`.
+ * PEN-6202 — the SERVICE-LAYER twin of `buildIssueMonitorEligibilityClear`.
  *
  * The block above pins what a monitor write does to a FIRED monitor. This one
  * pins what an ORDINARY write does — one that moves status or assignee and
