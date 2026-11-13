@@ -591,6 +591,61 @@ describe("githubGetPullRequestGate not-found disambiguation", () => {
     },
   );
 
+  it.each([
+    { name: "a FORBIDDEN field", errors: [{ type: "FORBIDDEN", message: "Resource not accessible" }] },
+    { name: "a RATE_LIMITED read", errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] },
+    {
+      name: "a type-less query timeout",
+      errors: [{ message: "Something went wrong while executing your query." }],
+    },
+    {
+      name: "a NOT_FOUND mixed with anything else",
+      errors: [{ type: "NOT_FOUND" }, { type: "FORBIDDEN" }],
+    },
+  ])("never sets notFound for $name, even with a readable repository", async ({ errors }) => {
+    // ⛔ THE FAIL-OPEN THIS GUARD EXISTS FOR. `ghGraphQlQuery` folds EVERY
+    // `errors` entry into one `graphql_errors` reason, and the repo probe can
+    // separate out only an INVISIBLE REPOSITORY -- so routing a FORBIDDEN, a
+    // RATE_LIMITED or a timeout to it would hand back `notFound: true` for a
+    // pull request that exists and is merely unreadable right now, off a probe
+    // on a DIFFERENT budget that typically answers 200. `notFound` is the one
+    // result that reaches a file-time refusal, and before this reader moved to
+    // GraphQL it required a real REST 404.
+    setCreds();
+    const fetchMock = stubGateFetch({ node: null, errors, repoStatus: 200 });
+
+    const result = await githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    });
+
+    expect(result).not.toHaveProperty("notFound");
+    expect(result).toEqual({ error: "pull_request_graphql_errors" });
+    // And it must not spend the probe call either: there is nothing for it to
+    // disambiguate when the error says nothing about existence.
+    expect(repoProbeCalls(fetchMock)).toHaveLength(0);
+  });
+
+  it.each([
+    { name: "an unrecognised __typename", node: { __typename: "Repository" } },
+    { name: "a missing __typename", node: { state: "OPEN", merged: false } },
+  ])("reports $name as unreadable rather than as notFound", async ({ node }) => {
+    // `__typename` is tested POSITIVELY against "Issue". The negated form
+    // (`!== "PullRequest"`) would hand `notFound` to a payload this reader could
+    // not understand, and `notFound` must rest on positive evidence only.
+    setCreds();
+    const fetchMock = stubGateFetch({ node });
+
+    const result = await githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    });
+
+    expect(result).not.toHaveProperty("notFound");
+    expect(result).toEqual({ error: "pull_request_state_missing" });
+    expect(repoProbeCalls(fetchMock)).toHaveLength(0);
+  });
+
   it("threads the caller's signal into the repo probe as well as the GraphQL read", async () => {
     setCreds();
     const signals: Array<AbortSignal | null | undefined> = [];
