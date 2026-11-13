@@ -116,6 +116,24 @@ export const issues = pgTable(
     // `runbooks/deliberate-park-release-edge.md`, which also covers the bounds of the
     // endpoint that serves it.
     parkedWakeFiredAt: timestamp("parked_wake_fired_at", { withTimezone: true }),
+    // PEN-6556: the fire-once marker for the park's HANDOFF edge, as
+    // `parkedWakeFiredAt` is for its RELEASE edge. Same scoping and the same two guards:
+    // the park writer resets it on every `parkedDisposition` write, and the sweep treats
+    // `parkedRecoveryEmittedAt < parkedAt` as unstamped.
+    //
+    // The release edge fires a wake at the deadline and is gated on
+    // `ISSUE_PARK_EXPIRY_WAKE_STATUSES`, so a park on a `cancelled` row can never fire
+    // one. That exclusion is right for an ordinary cancel -- a closed row's deadline
+    // passing is not a reason to wake it -- and wrong for a RECYCLE: the alertmanager
+    // plugin cancels an origin row when its alert resolves and reopens it when the alert
+    // re-fires, and the park's four columns survive that cancel intact, so the obligation
+    // is still owed and nothing can deliver it. `reconcileDestroyedIssueParkRecoveries`
+    // hands it to a carrier instead; this column is what makes that handoff fire once.
+    //
+    // ⚠️ Per-PARK, never per-row, and not an audit log -- the same bound PEN-4894 records
+    // on `parkedWakeFiredAt` directly above. A `NULL` here means only "no handoff is owed
+    // for this row's current park".
+    parkedRecoveryEmittedAt: timestamp("parked_recovery_emitted_at", { withTimezone: true }),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),
