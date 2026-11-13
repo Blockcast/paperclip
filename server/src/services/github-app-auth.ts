@@ -426,9 +426,17 @@ export async function githubHasCommitEvidence(input: {
 }
 
 /**
- * Disambiguate a 404 on a pull-request lookup (PEN-5254).
+ * Disambiguate an unresolvable pull-request lookup (PEN-5254).
  *
- * `/repos/{owner}/{repo}/pulls/{n}` 404s for two opposite reasons, exactly as the
+ * ⚠ PEN-6341 item 2 MOVED THE READER ONTO GRAPHQL AND THIS PROBE SURVIVED THAT,
+ * narrower than before. The lookup is no longer a REST 404: `issueOrPullRequest`
+ * resolves an ISSUE number by itself, on `__typename`, so that case never reaches
+ * here. What does reach here is the one answer GraphQL collapses -- a null node
+ * plus a NOT_FOUND error, which is byte-identical to a FORBIDDEN field or an
+ * invisible repository once `ghGraphQlQuery` has folded every `errors` entry into
+ * one reason.
+ *
+ * The underlying ambiguity is the same one the REST 404 had, exactly as the
  * Actions arm's does: the pull request genuinely does not exist, or the repository
  * is invisible to this installation. Only the first is a caller error, and only the
  * first may ever reach the file-time refusal — telling an agent its PR number is
@@ -466,70 +474,174 @@ export async function githubGetPullRequestGate(input: {
   const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
-  const apiBase = gitHubApiBase(GITHUB_HOST);
-  let res: Response;
-  try {
-    res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
-      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
-      signal: input.signal,
-    });
-  } catch {
-    return { error: "pull_request_fetch_failed" };
+  const node = await ghGraphQlPullRequestGateNode({
+    token: tokenResult.token,
+    repoFullName: input.repoFullName,
+    prNumber: input.prNumber,
+    signal: input.signal,
+  });
+
+  if (!node.ok) {
+    // `graphql_errors` is where a NOT_FOUND arrives: GraphQL answers HTTP 200
+    // with the node nulled and an error entry beside it, and `ghGraphQlQuery`
+    // folds every `errors` entry into this one reason by design. So this branch
+    // is ambiguous in exactly the way the REST 404 was -- an absent number, an
+    // invisible repository, or a FORBIDDEN field -- and it is handed to the same
+    // repo probe that disambiguated the 404. The probe is the ONLY path that can
+    // set `notFound`, which is what keeps that flag positive evidence.
+    if (node.reason === "graphql_errors" || node.reason === "pull_request_absent") {
+      return await classifyPullRequestNotFound({
+        apiBase: gitHubApiBase(GITHUB_HOST),
+        repoFullName: input.repoFullName,
+        token: tokenResult.token,
+        signal: input.signal,
+      });
+    }
+    // Everything else -- transport, a non-2xx (including the synthetic 403
+    // `ghFetch` serves from its own rate-limit hold), an unreadable body, a null
+    // `data` -- is NOT a statement about whether the pull request exists, so it
+    // must never reach the probe and must never carry `notFound`.
+    return { error: graphQlGateFailureReason(node.reason) };
   }
-  if (res.status === 404) {
-    return await classifyPullRequestNotFound({
-      apiBase,
-      repoFullName: input.repoFullName,
-      token: tokenResult.token,
-      signal: input.signal,
-    });
+
+  // A number that resolves to something OTHER than a pull request is an ISSUE
+  // number, which is the likeliest way this fires in practice. GraphQL answers
+  // that in the SAME call -- `__typename` discriminates issue / pull request /
+  // absent where REST needed a second repo probe to tell the first two apart --
+  // and reaching here at all means `repository` resolved, so the repository is
+  // demonstrably readable and the absence is positive evidence.
+  if (node.data.__typename !== "PullRequest") {
+    return { error: "pull_request_not_found", notFound: true };
   }
-  if (!res.ok) {
-    const classified = await classifyGithubHttpFailure("pull_request", res);
-    return { error: classified.reason };
-  }
-  const body = (await res.json().catch(() => null)) as {
-    state?: string;
-    merged?: boolean;
-    closed_at?: string | null;
-    merged_by?: unknown;
-  } | null;
-  if (body?.state !== "open" && body?.state !== "closed") {
-    return { error: "pull_request_state_missing" };
-  }
-  // `closed_at` is surfaced ONLY so the closed-unmerged retirement can tell a durable
-  // close from a close/reopen transient (PEN-5662). It is optional on the type for the
-  // reason in the docblock above: every other caller ignores it and no test double has
-  // to grow a field to keep compiling. Pass it through verbatim rather than parsing —
-  // the one consumer parses it, and a value this reader cannot parse is not this
-  // reader's to discard.
-  const closedAt = typeof body.closed_at === "string" ? body.closed_at : null;
-  // `merged_by` rides along for the same reason and on the same terms (PEN-6055): the
-  // reconciler already pays for this GET to learn `merged`, and the actor is in the
-  // response it gets back. Reading it here costs nothing and is the only moment the
-  // answer is cheaply available — reconstructing it later means a second GitHub call
-  // against a card that has already been closed.
-  const mergedBy = readPullRequestMerger(body.merged_by);
-  return { state: body.state, merged: body.merged === true, closedAt, mergedBy };
+
+  const state = readGraphQlPullRequestState(node.data);
+  // Unreadable, or incoherent across the two fields -- see the helper. Reported
+  // as the same reason the REST reader used for a state it could not read, so no
+  // consumer gains a new string to handle.
+  if (!state) return { error: "pull_request_state_missing" };
+  // `closedAt` is surfaced ONLY so the closed-unmerged retirement can tell a
+  // durable close from a close/reopen transient (PEN-5662). Passed through
+  // verbatim rather than parsed -- the one consumer parses it, and a value this
+  // reader cannot parse is not this reader's to discard.
+  const closedAt = typeof node.data.closedAt === "string" ? node.data.closedAt : null;
+  // `mergedBy` rides along for the same reason and on the same terms (PEN-6055).
+  const mergedBy = readGraphQlPullRequestMerger(node.data.mergedBy);
+  return { ...state, closedAt, mergedBy };
 }
 
 /**
- * Narrow GitHub's `merged_by` into a `PullRequestMerger`, or `null` (PEN-6055).
+ * Map a `ghGraphQlQuery` failure reason onto this reader's `pull_request_*`
+ * namespace (PEN-6341 item 2).
  *
- * Total over anything the API can return. `merged_by` is `null` on every unmerged
- * pull request, and GitHub substitutes a `ghost` account for a deleted user, so an
- * absent or partial actor is an ordinary outcome rather than a fault — it must not
- * fail the lookup, because the gate verdict does not depend on it.
+ * `http_<n>` keeps the `pull_request_http_<n>` form the REST classifier emitted,
+ * so the strings a deferred gate records stay recognisable across the migration.
+ *
+ * ⚠ ONE DISTINCTION IS GENUINELY LOST AND IS NOT WORTH FAKING: the REST reader
+ * separated a rate-limited 403 (`pull_request_rate_limited`) from any other 403
+ * by reading the response headers, and `ghGraphQlQuery` does not hand back the
+ * `Response`. A rate limit now records `pull_request_http_403`. No consumer
+ * matches on either string -- every one of them defers on ANY `error` and the
+ * reason is carried for telemetry and the retirement note -- so this costs
+ * legibility, not behaviour. Inventing `rate_limited` from a bare 403 would be a
+ * guess, and the synthetic 403 `ghFetch` serves from its own local hold is
+ * byte-identical to GitHub's at this layer.
  */
-function readPullRequestMerger(raw: unknown): PullRequestMerger | null {
+function graphQlGateFailureReason(reason: string): string {
+  if (reason === "transport") return "pull_request_fetch_failed";
+  return `pull_request_${reason}`;
+}
+
+/**
+ * Fold GraphQL's `PullRequestState` back into the REST-shaped `{ state, merged }`
+ * pair every consumer of this reader was written against (PEN-6341 item 2).
+ *
+ * ## Why this is not a positional mapping
+ *
+ * REST reports `state` ∈ {`open`, `closed`} with `merged` as a SEPARATE boolean.
+ * GraphQL FOLDS them: `PullRequestState` ∈ {`OPEN`, `CLOSED`, `MERGED`}, and
+ * `MERGED` is a member REST has no equivalent of. Measured on this PR's own
+ * repository, both surfaces, one pull request, 2026-11-13: REST
+ * `{state: "closed", merged: true}` against GraphQL `{state: "MERGED", merged: true}`.
+ * So lower-casing the GraphQL value and handing it on would make this function
+ * bail on exactly the merged pull requests it exists to classify -- its caller
+ * rejects anything that is neither `open` nor `closed`.
+ *
+ * ## Why the two fields are checked AGAINST each other
+ *
+ * `merged` is read from its own field rather than derived from the state, and
+ * the two must agree: GitHub sets `MERGED` if and only if `merged` is true, so a
+ * payload where they disagree is one this reader could not understand rather
+ * than one describing an exotic pull request. Both directions of that
+ * disagreement are harmful and NEITHER is merely conservative -- reporting
+ * merged when it is not retires an approval card against a merge that never
+ * happened, and reporting closed-unmerged when it IS merged routes it into the
+ * closed-unmerged retirement, which is a different wrong disposition rather than
+ * a safe wait. So an incoherent pair fails CLOSED, onto the same
+ * `pull_request_state_missing` an unreadable REST body produced.
+ */
+function readGraphQlPullRequestState(pr: {
+  state?: unknown;
+  merged?: unknown;
+}): { state: "open" | "closed"; merged: boolean } | null {
+  const raw = typeof pr.state === "string" ? pr.state : null;
+  const merged = pr.merged === true;
+  if (raw === "OPEN") return merged ? null : { state: "open", merged: false };
+  if (raw === "CLOSED") return merged ? null : { state: "closed", merged: false };
+  if (raw === "MERGED") return merged ? { state: "closed", merged: true } : null;
+  return null;
+}
+
+/**
+ * Narrow GraphQL's `mergedBy` actor into the same `PullRequestMerger` the REST
+ * reader produced (PEN-6055, PEN-6341 item 2).
+ *
+ * Three field-level differences, every one of them measured first-party on ONE
+ * pull request across BOTH surfaces rather than read off documentation:
+ *
+ * | REST `merged_by` | GraphQL `mergedBy` |
+ * |---|---|
+ * | `id` (number) | `databaseId`, which lives on the CONCRETE types and not on the `Actor` interface, hence the inline fragments in the query |
+ * | `type` (`User` / `Bot` / `Organization`) | `__typename`, identical for all three |
+ * | `login` | the BARE slug for an App |
+ *
+ * ⛔ THE LOGIN IS THE ONE THAT BITES, AND IT IS THE SAME TRAP ALLY CAUGHT IN THE
+ * PREVIOUS SLICE OF THIS MIGRATION. Measured on `Blockcast/paperclip#3694`,
+ * 2026-11-13: REST `merged_by.login` is `allyblockcast[bot]` where GraphQL
+ * `mergedBy.login` is `allyblockcast` with `__typename: "Bot"`. Both surfaces
+ * report `id`/`databaseId` 290875700, so every OTHER field agrees and only the
+ * login differs -- by a five-character suffix, on a value that is a non-empty
+ * string either way, which is why no type, null or truthiness check can see it.
+ * The suffix is re-attached from `__typename`, exactly as `githubFetchPrAuthorLogin`
+ * does for `author`.
+ *
+ * Total over anything the API can return, like the reader it replaces: every
+ * field is independently nullable, an actor with none of them readable is
+ * reported as absence rather than as a row of nulls, and NOTHING here can fail
+ * the lookup -- the gate verdict does not depend on who merged, only on whether
+ * it merged.
+ */
+function readGraphQlPullRequestMerger(raw: unknown): PullRequestMerger | null {
   if (raw === null || typeof raw !== "object") return null;
-  const actor = raw as { login?: unknown; id?: unknown; type?: unknown };
-  const login = typeof actor.login === "string" ? actor.login : null;
-  const id = typeof actor.id === "number" && Number.isFinite(actor.id) ? actor.id : null;
-  const type = typeof actor.type === "string" ? actor.type : null;
-  // An object with none of the three fields readable carries no more information than
-  // its absence, so it is reported as absence rather than as a row of `unknown`s.
+  const actor = raw as { login?: unknown; databaseId?: unknown; __typename?: unknown };
+  const type = typeof actor.__typename === "string" ? actor.__typename : null;
+  const bare = typeof actor.login === "string" ? actor.login : null;
+  const login = bare === null ? null : type === "Bot" ? withBotLoginSuffix(bare) : bare;
+  const id =
+    typeof actor.databaseId === "number" && Number.isFinite(actor.databaseId)
+      ? actor.databaseId
+      : null;
   return login === null && id === null && type === null ? null : { login, id, type };
+}
+
+/**
+ * Re-attach GitHub's `[bot]` login suffix, idempotently (PEN-6341).
+ *
+ * GraphQL types an App actor as a `Bot` and returns the BARE slug where REST
+ * returns `<slug>[bot]`. Shared by every reader migrated off REST so the
+ * re-attachment rule has one home rather than one copy per call site.
+ */
+function withBotLoginSuffix(login: string): string {
+  return login.endsWith("[bot]") ? login : `${login}[bot]`;
 }
 
 export type OpenPullRequestOnBase = {
@@ -1448,7 +1560,7 @@ export async function githubFetchPrAuthorLogin(input: {
   const login = author?.login;
   if (typeof login !== "string" || login.trim().length === 0) return null;
   if (author?.__typename !== "Bot") return login;
-  return login.endsWith("[bot]") ? login : `${login}[bot]`;
+  return withBotLoginSuffix(login);
 }
 
 /**
@@ -2669,17 +2781,21 @@ export async function ghGraphQlQuery<T>(input: {
  * disambiguated their 404s, so folding every unreadable response into one
  * failure loses nothing they were using.
  *
- * ⛔ It is deliberately NOT for `githubGetPullRequestGate`, which does two
- * things this cannot reproduce. It reads `state` and `merged` as SEPARATE
- * fields, where GraphQL folds them into one `PullRequestState` whose `MERGED`
- * member REST has no equivalent of -- so a positional mapping makes that
- * function bail on exactly the merged PRs it exists to classify. And it tells a
- * missing PR apart from an ISSUE number by probing the repo, a distinction
- * GraphQL reports identically here: `pullRequest(number:)` answers `null` plus
- * a NOT_FOUND error for both, with the same message modulo the number. That
- * site needs `issueOrPullRequest`, whose `__typename` discriminates in one
- * call, plus a `merged`/`closedAt` read -- a separate change with its own
- * argument, not a mechanical swap.
+ * ⛔ It is deliberately NOT for `githubGetPullRequestGate`, for two reasons this
+ * query cannot reproduce. That reader needs `state` and `merged` folded back
+ * apart -- GraphQL merges them into one `PullRequestState` whose `MERGED` member
+ * REST has no equivalent of, so a positional mapping makes it bail on exactly
+ * the merged pull requests it exists to classify. And it must tell a missing
+ * pull request apart from an ISSUE number, which `pullRequest(number:)` reports
+ * identically: `null` plus a NOT_FOUND error for both, same message modulo the
+ * number.
+ *
+ * ✅ That site now has its own query, `PULL_REQUEST_GATE_QUERY`, which does both
+ * -- `issueOrPullRequest` discriminates on `__typename` in one call, and the
+ * fold is undone in `readGraphQlPullRequestState`. It is a SEPARATE query rather
+ * than a widening of this one on purpose: the readers here want one or two
+ * scalars and already answer a safe value when the pull request cannot be read,
+ * so they neither need the discrimination nor should pay for it.
  *
  * ## Polarity
  *
@@ -2734,6 +2850,97 @@ export async function ghGraphQlPullRequestFields(input: {
   const pr = result.data.repository?.pullRequest;
   if (!pr || typeof pr !== "object") return { ok: false, reason: "pull_request_absent" };
   return { ok: true, data: pr };
+}
+
+/**
+ * PEN-6341 item 2: the GraphQL replacement for `githubGetPullRequestGate`'s
+ * `GET /repos/{o}/{r}/pulls/{n}`.
+ *
+ * ## Why `issueOrPullRequest` and not `pullRequest`
+ *
+ * `pullRequest(number:)` reproduces the REST ambiguity EXACTLY -- `null` plus a
+ * NOT_FOUND error both for a number that does not exist and for a number that is
+ * an ISSUE, with identical messages modulo the number -- so a reader that asked
+ * for it would lose the disambiguation SILENTLY. `issueOrPullRequest` answers
+ * both cases apart on a server-stamped `__typename`, in ONE call, which is
+ * strictly better than the REST form: that needed a second `GET /repos/{o}/{r}`
+ * probe and inferred the answer from two statuses. Verified first-party
+ * 2026-11-13 -- a real issue number answers `__typename: "Issue"`, a real pull
+ * request `"PullRequest"`, an absent number `null` + NOT_FOUND.
+ *
+ * ## What the caller must still do
+ *
+ * `null` + NOT_FOUND arrives through `ghGraphQlQuery` as `graphql_errors`, the
+ * same reason a FORBIDDEN or an invisible repository produces, so this helper
+ * CANNOT tell the caller which it was. That branch is still ambiguous and the
+ * caller still hands it to the repo probe. Only the `Issue` answer is resolved
+ * here, and it is the likeliest way the gate's `notFound` fires in practice: an
+ * agent files a card with the issue number it has to hand.
+ *
+ * ## `databaseId` lives on the concrete types
+ *
+ * `mergedBy` is an `Actor`, which carries `login` but NOT `databaseId`, so the
+ * numeric id REST reports as `merged_by.id` is reachable only through inline
+ * fragments. A merger of some other actor type simply reads `id: null`, which
+ * the merger reader already treats as an ordinary partial actor.
+ */
+const PULL_REQUEST_GATE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issueOrPullRequest(number: $number) {
+      __typename
+      ... on PullRequest {
+        state
+        merged
+        closedAt
+        mergedBy {
+          __typename
+          login
+          ... on User { databaseId }
+          ... on Bot { databaseId }
+          ... on Organization { databaseId }
+          ... on Mannequin { databaseId }
+        }
+      }
+    }
+  }
+}`;
+
+export type GraphQlPullRequestGateNode = {
+  __typename?: string | null;
+  state?: string | null;
+  merged?: boolean | null;
+  closedAt?: string | null;
+  mergedBy?: unknown;
+};
+
+type PullRequestGateNodeResponse = {
+  repository?: { issueOrPullRequest?: GraphQlPullRequestGateNode | null } | null;
+};
+
+export async function ghGraphQlPullRequestGateNode(input: {
+  token: string;
+  repoFullName: string;
+  prNumber: number;
+  signal?: AbortSignal;
+}): Promise<GhGraphQlResult<GraphQlPullRequestGateNode>> {
+  const [owner, name, ...rest] = input.repoFullName.split("/");
+  if (!owner || !name || rest.length > 0) {
+    return { ok: false, reason: "repo_full_name_invalid" };
+  }
+  const result = await ghGraphQlQuery<PullRequestGateNodeResponse>({
+    token: input.token,
+    query: PULL_REQUEST_GATE_QUERY,
+    variables: { owner, name, number: input.prNumber },
+    signal: input.signal,
+  });
+  if (!result.ok) return result;
+  const node = result.data.repository?.issueOrPullRequest;
+  // Reaching here with no node and no `errors` entry is not an expected GitHub
+  // answer, but it must not read as "this is not a pull request": that verdict
+  // sets `notFound`, and `notFound` is the one result that reaches a file-time
+  // refusal. Reported as the ambiguous reason so the caller probes the repo.
+  if (!node || typeof node !== "object") return { ok: false, reason: "pull_request_absent" };
+  return { ok: true, data: node };
 }
 
 /**
