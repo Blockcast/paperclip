@@ -13245,6 +13245,9 @@ export function recoveryService(
           eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
           visibleIssueCondition(),
           inArray(issues.status, ["done", "cancelled"]),
+          // Only recoveries still blocking something can prune; without this the
+          // pass re-walks every closed recovery ever minted, 2 queries each (BLO-56185).
+          sql`exists (select 1 from ${issueRelations} where ${issueRelations.companyId} = ${issues.companyId} and ${issueRelations.issueId} = ${issues.id} and ${issueRelations.type} = 'blocks')`,
         ),
       );
 
