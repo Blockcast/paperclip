@@ -4052,6 +4052,60 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     );
   });
 
+  // PEN-5802 arm 3. The bullet above closes the ENFORCEMENT half -- the second redeemer
+  // fails closed -- and its own comment recorded the ENUMERATION half as open: no run
+  // could ask whether a sibling of its seat was live on the same ARTIFACT, only on the
+  // same ROW. Closed by composing two surfaces that already existed.
+  //
+  // Anchored on the ROUTE PATH, the field names and the caveat clauses, never on a
+  // heading: this rule is also paraphrased into per-seat instruction roots under several
+  // headings with a licence to re-word, so a heading anchor is dissolved by exactly the
+  // seats that complied and reports ABSENT on text that is already correct.
+  it("names the artifact-scoped sibling check and its union / lower-bound / race caveats (PEN-5802 arm 3)", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    // The distinction the bullet exists for. `activeRun` is not wrong, it answers a
+    // different question, and until now nothing said which.
+    expect(markdown).toContain("That `activeRun` check is ROW-scoped");
+    expect(markdown).toContain("never whether one holds the ARTIFACT");
+
+    // The route, and the one surface that hydrates `activeRun`. Pinned together because
+    // reading the route and then taking `activeRun` off a list row or a write response
+    // is the failure that returns a confident "no sibling" from an ABSENT key.
+    expect(markdown).toContain("work-products/by-external-id");
+    expect(markdown).toContain("`paperclipGetIssue`");
+    expect(markdown).toContain("the key is ABSENT and absent reads as");
+
+    // The URL form. A bare `#` is truncated as a URL fragment, and a directive citing a
+    // form that comes back empty teaches a run the lookup is broken -- the exact reason
+    // PEN-5340 held this lookup back until #3310 landed.
+    expect(markdown).toContain("truncated as a URL fragment unless sent as `%23`");
+
+    // The UNION clause: the assertion most likely to be deleted as over-caution, because
+    // `owner` reads as the precise relation and `mention` reads as noise. Measured the
+    // other way on #3322 -- owner row done with no run, live sibling on a mentioning row.
+    expect(markdown).toContain("never owners alone");
+    expect(markdown).toContain("held a MENTIONING row");
+
+    // The completeness gate. Without it an authorization-withheld or unverifiable owner
+    // list renders as an empty contention set -- the fail-open direction.
+    expect(markdown).toContain("LOWER BOUND");
+    expect(markdown).toContain("`ownerListComplete`");
+    expect(markdown).toContain("`withheldForAuthorizationCount`");
+
+    // The honest bound. A reader who takes this for a lock skips the redemption, which is
+    // the only step that fails closed, and the race window is where the measured
+    // double-spend actually lived. Trim this and the bullet over-promises.
+    expect(markdown).toContain("DETECTOR WITH A RACE, not a lock");
+    expect(markdown).toContain("never replaces redeeming the receipt key");
+
+    // Ordering: the artifact check is an ADDITION to the row check, not a replacement.
+    // Reversing them would read as licence to skip the row check.
+    expect(markdown.indexOf("Your row's `activeRun`")).toBeLessThan(
+      markdown.indexOf("That `activeRun` check is ROW-scoped"),
+    );
+  });
+
   it("renders on an issue-only wake, with no wake comment and no PR", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
@@ -4264,7 +4318,16 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
     const constraintHeading = markdown.indexOf("Recording a constraint:");
-    const lookup = markdown.indexOf("work-products/by-external-id");
+    // PEN-5802 arm 3 re-anchored this from the bare route path to the author-side
+    // sentence's own opening words. The route now appears TWICE, for two different
+    // actors: here, to enumerate an artifact's owning rows so a constraint can be
+    // recorded on each, and in the pre-write list, to ask whether a sibling run of
+    // this seat is live on any row bound to the artifact. The bare path could not
+    // tell them apart, so it reported this guard broken on a second use it was never
+    // written about. "Look the owner up" is unique to the sentence this guard is for,
+    // and the guard keeps its full force: moving THAT sentence into the pre-write
+    // list still fails here.
+    const lookup = markdown.indexOf("Look the owner up");
 
     expect(constraintHeading).toBeGreaterThan(-1);
     expect(lookup).toBeGreaterThan(constraintHeading);

@@ -14429,6 +14429,43 @@ export function buildPaperclipTaskMarkdown(input: {
     // call signature survives the re-wording this text is licensed to receive, where a heading
     // or a block hash does not.
     "- That head check is PUSH-scoped: only push, force-push and rebase move `headRefOid`, so for every other verb above it is not a weak gate but a NON-gate -- an unmoved head shows only that no push landed, never that an authorisation you were handed is still unspent. A non-force push is refused by a server-side compare-and-swap and `--force-with-lease` restores one, but a plain force-push and `PATCH /pulls/:n` have none; `updatedAt` is measured to bump with no mutation on any readable surface, so it cannot substitute. If what authorises this write is SINGLE-USE, redeem its receipt key BEFORE writing -- `paperclipAddComment` ON THE ISSUE THE GRANT WAS POSTED ON, not whichever row you happen to hold, with the key the grant names, passed as the `idempotencyKey` field -- and treat `deduplicated: true` as \"a sibling run already spent this; abort, do not write\". \"BEFORE writing\" is relative to the WRITE and never to the precondition check: establish LIVE, in the run that writes, that the write is still warranted; THEN redeem; THEN write, with nothing in between. If a precondition has lapsed, STOP and do NOT redeem -- a key burned over a write you then decline is refused to your seat forever, so redeeming before you have established that the write is warranted DESTROYS the grant on the COMPLIANT path, where a run that reads the world and correctly declines has spent a key it can never recover. That hazard concentrates wherever the wake is fired by a TIMER rather than by the authorising event: there the precondition is false at most scheduled wakes, so redeeming first punishes every well-behaved run. The key is scoped `(issue, agent, key)` and the issue is part of it, so redeeming on the wrong row only inserts a second receipt that refuses nothing -- one PR can have several owning rows, and your sibling may hold a different one. Redeemed on the granting row it fails closed against sibling runs of your own seat: the collision the bullet above cannot see, because `activeRun` is per-ROW while a single-use grant is per-ARTIFACT. A grant that names no receipt issue and key cannot be checked at all -- ask for a keyed one rather than writing.",
+    // PEN-5802 arm 3: the bullet above makes the SECOND redeemer fail closed and, as its own
+    // comment records, gives no run a way to ENUMERATE what its siblings already hold. That
+    // is closed below by composition rather than by a new primitive -- the artifact-to-rows
+    // edge already exists on the work-products lookup and `activeRun` is already hydrated per
+    // row, so "is a run of my seat live on ANY row bound to this artifact?" is two existing
+    // reads that were never written down together.
+    //
+    // THE PLACEMENT QUESTION WAS ALREADY DECIDED THE OTHER WAY, AND THIS DOES NOT REOPEN IT.
+    // The same lookup is sited author-side under "Recording a constraint" (PEN-5340), whose
+    // comment argues it must NOT sit in the pre-write list because, for the use IT governs --
+    // find the artifact's owning row so a constraint can be recorded on it -- a pre-write read
+    // provably would not have fired on the motivating instance: #3205's owning row was
+    // PEN-5181, which the writing run already held. That argument is sound and is scoped to
+    // that use. It does not reach this one, which differs by the `activeRun` hop and is what
+    // makes the read fire: measured on Blockcast/paperclip#3322, eight rows bound, the OWNER
+    // row (PEN-5350) `done` with no run, and the live sibling holding PEN-5119 -- a row the
+    // writing run did NOT hold. Two uses of one route, sited where each use's actor stands.
+    //
+    // The UNION clause is the load-bearing half and the one an implementer trims as
+    // over-caution, because `relation: "owner"` reads as the precise answer and `mention`
+    // reads as noise. #3322 is the counter-example: owner-only returns "no contention" at the
+    // exact moment there is some -- the fail-open direction. A row is bound to a PR because it
+    // can write to it, which is the contention question; which row OWNS it is bookkeeping.
+    //
+    // It reads the rows the ARTIFACT names rather than filtering the seat's own lane on
+    // purpose: bounded by the rows bound to the artifact (1-8 on the four probed), so it needs
+    // no paging, where a lane filter meets the row cap and a missing row reads as no sibling.
+    //
+    // The PR URL form is prescribed, not `owner/repo#123`, for the reason the author-side
+    // sentence gives: a bare `#` is truncated as a URL fragment unless sent as `%23`, and a
+    // directive citing a form that comes back empty teaches a run the lookup is broken.
+    //
+    // Stated as a DETECTOR WITH A RACE on purpose -- strictly stronger than the per-row lock,
+    // strictly weaker than serialisation. A reader who takes it for a lock skips the
+    // redemption, which is the only step that fails closed, and the race window is exactly
+    // where the measured double-spend lived.
+    "- That `activeRun` check is ROW-scoped: it answers whether a sibling holds THAT ROW, never whether one holds the ARTIFACT, and one pull request is routinely bound to several rows. To ask the artifact question, read `GET /api/companies/<companyId>/work-products/by-external-id?externalId=<the PR's URL>` -- the same lookup spelled out under \"Recording a constraint\" below, whose completeness rules apply here unchanged -- then read `activeRun` on each returned `issueId` with `paperclipGetIssue`, which is the only surface that hydrates it; on a list row or a write response the key is ABSENT and absent reads as \"no sibling\". Pass the full pull-request URL: a bare `#` in `owner/repo#123` is truncated as a URL fragment unless sent as `%23`. Take the UNION of `relation: \"owner\"` and `relation: \"mention\"`, never owners alone -- measured on Blockcast/paperclip#3322, the owner row was `done` with no run while a live sibling of the same seat held a MENTIONING row, so an owner-only read reports no contention at the moment there is some. Treat the answer as a LOWER BOUND: score it UNKNOWN unless `ownerListComplete` is `true` and `withheldForAuthorizationCount` is `0`, and a successor row that inherited the work is bound to nothing and cannot appear at all. This is a DETECTOR WITH A RACE, not a lock -- a sibling can start between your read and your write, so it never replaces redeeming the receipt key, which is the only step that fails closed.",
     // PEN-5876: the directive above is scoped to PULL REQUEST write verbs, and the gap it
     // leaves is a row FIELD write. Measured twice on one row inside 16 minutes, same field,
     // both times by two runs of ONE seat: first a run claimed edits in the past tense that
