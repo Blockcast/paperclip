@@ -7880,6 +7880,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         previousOwnerAgentId: fixture.coderId,
         cause: "stranded_assigned_issue",
         fingerprint: `source_scoped_recovery:${fixture.companyId}:${fixture.sourceIssueId}:stranded_assigned_issue`,
+        // PEN-5714: deliberately the PRE-PEN-5707 bare form -- see the note in
+        // heartbeat-process-recovery.test.ts. This is legacy-shaped data, not a
+        // carrier of the defect.
         nextAction:
           "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
         maxAttempts: 5,
