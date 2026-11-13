@@ -184,16 +184,39 @@ const ALLOWLIST = [
     file: "scripts/github-publish-broker-soak-queries.test.mjs",
     reason:
       "Registration for this file is the sole unique residue of PR #3205. " +
+      "That is measured, not inherited: the three files #3205 adds already " +
+      "exist on master in longer form, and master's pr.yml carries no " +
+      "reference to github-publish-broker-soak-queries at all, so the " +
+      "23-line registration step is the only content of that PR not already " +
+      "landed -- and is also why the PR is CONFLICTING. " +
       "That PR's operative hold is the `do-not-merge` label, NOT the " +
       "code-owner review request this entry named until 2026-11-11: " +
-      "`land-clean-prs.mjs` opts out on `SKIP_LABELS` before it reaches any " +
-      "code-owner handling, so no CODEOWNERS ruling releases it and clearing " +
-      "the review request would achieve nothing. Measured live 2026-11-11: " +
-      "#3205 OPEN, CONFLICTING/DIRTY, labels ['do-not-merge'], " +
-      "reviewDecision null, head eb2dc737 unmoved since 2026-11-03. " +
-      "Removing that label is the CEO's to authorise and is ALREADY asked on " +
-      "board card c4bfaa88 (annotation c5350051) -- a second ask is a " +
-      "duplicate, not an escalation. PEN-5272 forbids routing around the " +
+      "`land-clean-prs.mjs` returns on its `SKIP_LABELS` opt-out before the " +
+      "sole `unsatisfiedOwners` call, so no CODEOWNERS ruling releases it " +
+      "and clearing the review request would achieve nothing. " +
+      "Measured live 2026-11-13: #3205 OPEN, CONFLICTING/DIRTY, " +
+      "labels ['do-not-merge'], head eb2dc737 unmoved since the " +
+      "2026-11-02T14:09:36Z force-push, and its only owning Paperclip row " +
+      "PEN-5181 closed `done` on 2026-11-05 -- so no agent wake loads it. " +
+      "WITHDRAWN 2026-11-13, and stated here because this entry is where a " +
+      "reader meets the question: until today this reason said removing the " +
+      "label was 'ALREADY asked on board card c4bfaa88 (annotation " +
+      "c5350051) -- a second ask is a duplicate, not an escalation'. Both " +
+      "halves are false. Card c4bfaa88 was WITHDRAWN 2026-11-06T16:04:19Z, " +
+      "five days BEFORE this entry was written; its live successor card " +
+      "c69b1a65 (pending, payloadRevision 4) names neither #3205 nor the " +
+      "label anywhere in its body; and annotation c5350051 says the " +
+      "OPPOSITE of what was attributed to it -- that the label and the " +
+      "DIRTY state are 'not touched by any of' that card's four options. " +
+      "As of 2026-11-13 no ask for this label's removal is pending on any " +
+      "board card, so filing one is NOT a duplicate. Do not read a " +
+      "deterrent out of this entry; re-read the cards before relying on " +
+      "either sentence. The release condition actually on record is the " +
+      "CEO ruling in #3205's own thread at 2026-11-03T03:57Z -- the label " +
+      "comes off when @kkroo reviews -- and that review request, restored " +
+      "2026-11-03T03:57:12Z, is still outstanding with zero @kkroo reviews " +
+      "of any state on the PR. " +
+      "PEN-5272 forbids routing around the " +
       "hold, so the step is NOT duplicated here and this entry stands in for " +
       "it. DELETE THIS ENTRY when #3205 lands (arm 4 will print a notice " +
       "telling you to); if #3205 is closed unmerged, re-land its 23-line " +
