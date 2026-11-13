@@ -109,11 +109,17 @@ const SCHEMA_SHAPED_RE = /^(?:public|information_schema|pg_[a-z0-9_]*|plugin_[a-
  * a relation alias, a CTE name, or one of SQL's own correlation names.
  *
  * These anchors are deliberately OVER-generous -- they capture keywords and column
- * aliases too -- because the direction of the error matters. An over-collected name
- * is skipped, which is what the old `SCHEMA_SHAPED_RE` test did for EVERY name
- * outside its allowlist; an under-collected one is refused, which breaks a live
- * plugin. So this is strictly narrower than what it replaces, never wider, and the
- * clause above keeps every real schema name out of the exemption regardless.
+ * aliases too -- and that is safe ONLY because they are consulted after the left
+ * side has been checked against the schemas that actually exist. They decide whether
+ * a name that is NOT a schema gets refused, never whether a name that IS a schema
+ * gets adjudicated, so over-collecting costs nothing and under-collecting would cost
+ * a false refusal on a live plugin.
+ *
+ * Reviewed and reproduced on #3739: without that ordering, one extra word reopens
+ * what this closes -- `FROM plugin_ns.rows drizzle, drizzle.__drizzle_migrations`
+ * and `WITH drizzle AS (SELECT 1) ... , drizzle.__drizzle_migrations` both declare
+ * `drizzle` as a correlation name, and a relation alias cannot shadow a schema in a
+ * FROM list, so Postgres still reads the real schema.
  */
 const CORRELATION_ANCHORS: readonly RegExp[] = [
   // FROM/JOIN/UPDATE/INTO <relation> [AS] alias
@@ -588,8 +594,11 @@ function assertNoUnextractedSchemaRefsInAll(
   texts: readonly string[],
   refs: readonly SqlRef[],
   namespace: string,
+  knownSchemas?: ReadonlySet<string>,
 ): void {
-  for (const text of texts) assertNoUnextractedSchemaRefs(text, refs, namespace);
+  for (const text of texts) {
+    assertNoUnextractedSchemaRefs(text, refs, namespace, knownSchemas);
+  }
 }
 
 /**
@@ -634,6 +643,7 @@ function assertNoUnextractedSchemaRefs(
   statement: string,
   refs: readonly SqlRef[],
   namespace: string,
+  knownSchemas?: ReadonlySet<string>,
 ): void {
   const extracted = new Set(
     refs.map((ref) => `${ref.schema.toLowerCase()}.${ref.table.toLowerCase()}`),
@@ -646,12 +656,23 @@ function assertNoUnextractedSchemaRefs(
     const table = match[2]!;
     if (extracted.has(`${schema.toLowerCase()}.${table.toLowerCase()}`)) continue;
     const schemaLower = schema.toLowerCase();
-    // A name this database really does use as a schema is adjudicated unconditionally;
-    // only a left side that is NEITHER a known schema NOR a name the statement declared
-    // for itself is exempt. The old test was the other way round -- skip unless the
-    // left side LOOKED like a schema -- which silently exempted every real schema the
-    // pattern did not anticipate, `drizzle` among them (PEN-6604).
-    if (schemaLower !== namespace.toLowerCase() && !SCHEMA_SHAPED_RE.test(schemaLower)) {
+    // A name that really is a schema is adjudicated unconditionally; only a left side
+    // that is NOT a schema can be exempt, and then only if the statement declared it.
+    // The old test was the other way round -- skip unless the left side LOOKED like a
+    // schema -- which silently exempted every real schema the pattern did not
+    // anticipate, `drizzle` among them (PEN-6604).
+    //
+    // `knownSchemas` is what makes the exemption SOUND rather than a guess: if a name
+    // is not a schema in this database, `name.table` cannot be a relation reference at
+    // all, so skipping it cannot hide one. Without it the exemption is only as good as
+    // `SCHEMA_SHAPED_RE`, and a statement buys itself an exemption by declaring an
+    // alias or CTE named after the schema it wants (reproduced on #3739). Every
+    // runtime and migration call site passes it.
+    const namesAnExistingSchema =
+      schemaLower === namespace.toLowerCase() ||
+      SCHEMA_SHAPED_RE.test(schemaLower) ||
+      knownSchemas?.has(schemaLower) === true;
+    if (!namesAnExistingSchema) {
       correlations ??= collectCorrelationNames(statement);
       if (correlations.has(schemaLower)) continue;
     }
@@ -851,6 +872,7 @@ export function validatePluginMigrationStatement(
   statement: string,
   namespace: string,
   coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
+  knownSchemas?: ReadonlySet<string>,
 ): void {
   assertIdentifier(namespace, "namespace");
   assertNoBannedSql(statement);
@@ -883,7 +905,7 @@ export function validatePluginMigrationStatement(
   // which would disagree with it. Measured: without this, five shipped
   // `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements change verdict.
   if (!normalized.startsWith("comment ")) {
-    assertNoUnextractedSchemaRefsInAll(texts, refs, namespace);
+    assertNoUnextractedSchemaRefsInAll(texts, refs, namespace, knownSchemas);
   }
 
   const objectRefKeywords = new Set([
@@ -916,6 +938,7 @@ export function validatePluginRuntimeQuery(
   query: string,
   namespace: string,
   coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
+  knownSchemas?: ReadonlySet<string>,
 ): void {
   // BEFORE the split, deliberately. The whole reason this prefix is banned is that a
   // backslash escape can hide a statement boundary, so the splitter must not be the
@@ -959,7 +982,7 @@ export function validatePluginRuntimeQuery(
   if (refs.length === 0) {
     throw new Error("ctx.db.query must name every relation it reads as schema.table");
   }
-  assertNoUnextractedSchemaRefsInAll(texts, refs, namespace);
+  assertNoUnextractedSchemaRefsInAll(texts, refs, namespace, knownSchemas);
   for (const ref of refs) {
     if (ref.schema === namespace) continue;
     if (ref.schema === "public") {
@@ -970,7 +993,11 @@ export function validatePluginRuntimeQuery(
   }
 }
 
-export function validatePluginRuntimeExecute(query: string, namespace: string): void {
+export function validatePluginRuntimeExecute(
+  query: string,
+  namespace: string,
+  knownSchemas?: ReadonlySet<string>,
+): void {
   // BEFORE the split, deliberately. The whole reason this prefix is banned is that a
   // backslash escape can hide a statement boundary, so the splitter must not be the
   // first thing to adjudicate input that carries one. `assertNoBannedSql` also calls
@@ -994,7 +1021,7 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
   // Before the target is chosen, not after: a write target the extractor could not
   // read used to promote some other in-namespace ref into its place, so the namespace
   // check adjudicated the wrong object.
-  assertNoUnextractedSchemaRefsInAll(texts, refs, namespace);
+  assertNoUnextractedSchemaRefsInAll(texts, refs, namespace, knownSchemas);
   // Read from the leading keyword, so an unqualified target is REFUSED rather than
   // replaced by a later in-namespace ref. See `extractLeadingWriteTarget`.
   //
@@ -1135,6 +1162,43 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
   }
 
   /**
+   * The schemas that exist in this database, lowercased.
+   *
+   * `assertNoUnextractedSchemaRefs` needs this to tell a schema name from a relation
+   * alias: if a left side is not a schema here, `name.table` cannot be a relation
+   * reference, so exempting it cannot hide one. Without it the exemption is only as
+   * strong as `SCHEMA_SHAPED_RE`, and a statement buys an exemption for `drizzle` by
+   * declaring an alias or a CTE of that name (#3739 review).
+   *
+   * Memoised for the life of the service and deliberately never invalidated. It is a
+   * SUPPLEMENT to `SCHEMA_SHAPED_RE`, never a replacement: every schema this system
+   * creates after startup is a plugin namespace, which `derivePluginDatabaseNamespace`
+   * always prefixes `plugin_`, so the regex already covers it and a stale set cannot
+   * open a gap. What the read adds is the schemas created by core migrations --
+   * `drizzle` today -- which exist before any plugin runs.
+   *
+   * It fails CLOSED: a failed read rejects the statement rather than falling back to
+   * the shape guess this exists to replace.
+   */
+  let knownSchemaNames: ReadonlySet<string> | null = null;
+  async function loadKnownSchemaNames(
+    client: PluginDatabaseClient,
+  ): Promise<ReadonlySet<string>> {
+    if (knownSchemaNames) return knownSchemaNames;
+    const rows = await client.execute(sql`SELECT nspname FROM pg_catalog.pg_namespace`);
+    const names = new Set(
+      Array.from(rows as Iterable<{ nspname?: unknown }>)
+        .map((row) => String(row.nspname ?? "").toLowerCase())
+        .filter((name) => name.length > 0),
+    );
+    if (names.size === 0) {
+      throw new Error("Could not read the database schema list to validate plugin SQL");
+    }
+    knownSchemaNames = names;
+    return knownSchemaNames;
+  }
+
+  /**
    * Runs one already-validated plugin statement with `search_path` pinned to the
    * plugin's own namespace, inside its own transaction.
    *
@@ -1152,16 +1216,35 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
    * positive control in `plugin-database.test.ts`). A false refusal here breaks a
    * live plugin at request time, which is worse than the residual it would close.
    * Pinning `search_path` needs no parse and cannot false-refuse: an unqualified name
-   * now resolves inside the namespace or does not resolve at all.
+   * now resolves inside the namespace, or does not resolve at all.
+   *
+   * ONE EXCEPTION, and it is not closed here: `pg_catalog` is searched implicitly and
+   * BEFORE anything this sets, so an unqualified catalog relation --
+   * `FROM plugin_ns.anchor, pg_stat_activity` -- still resolves outside the namespace,
+   * even though the qualified `pg_catalog.pg_stat_activity` form is refused. Postgres
+   * offers no way to take `pg_catalog` out of the path, so closing it would need the
+   * lexical refusal of bare `pg_*` relation names this comment's own argument rejects
+   * -- `pg_typeof(...)`, `pg_size_pretty(...)` and friends are legitimate, so the rule
+   * would have to tell a function call from a relation. Raised on #3739 and left open
+   * deliberately; it is a read of cluster metadata, not of tenant data.
    *
    * `pg_catalog` stays implicitly searched whatever this sets, so `now()`, `count()`,
    * `EXTRACT`, `gen_random_uuid()` (core since PG 13) and every built-in type keep
-   * resolving. `public` is deliberately NOT in the path: a plugin that wants a
-   * core-schema object must name it `public.x`, which is exactly what the validators
-   * adjudicate against `coreReadTables`. Measured on this repo's plugin corpus: no
-   * plugin SQL calls a function or uses an operator class that lives in `public`
-   * (`pg_trgm`, `btree_gin` and `fuzzystrmatch` ARE installed there by the core
-   * migrations -- nothing in a plugin reaches for them).
+   * resolving. `public` is deliberately NOT in the path.
+   *
+   * For a core TABLE that costs nothing: `FROM public.issues` is qualified, and the
+   * validators adjudicate it against `coreReadTables` as they always did.
+   *
+   * For a core FUNCTION it is a real narrowing, and the honest statement is stronger
+   * than "qualify it": a `public` function becomes unreachable from plugin SQL
+   * altogether. Unqualified it no longer resolves; qualified, `public.f(...)` is
+   * refused by `assertNoUnextractedSchemaRefs`, because no ref pattern is anchored on
+   * a function call and `public` is a schema it must adjudicate. That second refusal
+   * predates this change. Measured on this repo's plugin corpus: no plugin SQL calls
+   * a function or uses an operator class living in `public` -- `pg_trgm`, `btree_gin`
+   * and `fuzzystrmatch` ARE installed there by the core migrations and nothing in a
+   * plugin reaches for them -- so nothing breaks today. A plugin that needs one will
+   * need this validator changed, not just a qualification.
    *
    * `SET LOCAL` and not `SET`: `db` is the shared pool, so a session-level `SET`
    * would leak this plugin's namespace onto every later user of that connection.
@@ -1269,12 +1352,18 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
           }
 
           const statements = splitSqlStatements(content);
+          const knownSchemas = await loadKnownSchemaNames(client);
           try {
             if (statements.length === 0) {
               throw new Error(`Plugin migration ${migrationKey} is empty`);
             }
             for (const statement of statements) {
-              validatePluginMigrationStatement(statement, namespace.namespaceName, coreReadTables);
+              validatePluginMigrationStatement(
+                statement,
+                namespace.namespaceName,
+                coreReadTables,
+                knownSchemas,
+              );
               await client.execute(sql.raw(statement));
             }
             await client
@@ -1331,14 +1420,19 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
     async query<T = Record<string, unknown>>(pluginId: string, statement: string, params?: unknown[]): Promise<T[]> {
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
-      validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
+      validatePluginRuntimeQuery(
+        statement,
+        namespace,
+        plugin.manifestJson.database?.coreReadTables ?? [],
+        await loadKnownSchemaNames(db),
+      );
       const result = await runWithPinnedSearchPath(namespace, bindSql(statement, params));
       return Array.from(result as Iterable<T>);
     },
 
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
       const namespace = await getRuntimeNamespace(pluginId);
-      validatePluginRuntimeExecute(statement, namespace);
+      validatePluginRuntimeExecute(statement, namespace, await loadKnownSchemaNames(db));
       const result = await runWithPinnedSearchPath(namespace, bindSql(statement, params));
       return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
     },

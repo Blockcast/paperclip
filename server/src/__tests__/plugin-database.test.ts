@@ -1047,6 +1047,53 @@ describe("plugin database SQL validation", () => {
       ).not.toThrow();
     });
 
+    it("does not let a declared name buy an exemption for a schema that exists", () => {
+      // Reproduced in review on #3739: the exemption is only as strong as what it
+      // consults BEFORE it. One extra word -- an alias or a CTE named after the target
+      // schema -- used to put `drizzle` in the correlation set and skip the real
+      // reference. A relation alias cannot shadow a schema in a FROM list, so Postgres
+      // still read `drizzle.__drizzle_migrations`.
+      const schemas = new Set(["public", "information_schema", "drizzle", "plugin_test"]);
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows drizzle, drizzle.__drizzle_migrations",
+          "plugin_test",
+          [],
+          schemas,
+        )
+      ).toThrow(/cannot adjudicate/i);
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "WITH drizzle AS (SELECT 1) SELECT * FROM plugin_test.rows, drizzle.__drizzle_migrations",
+          "plugin_test",
+          [],
+          schemas,
+        )
+      ).toThrow(/cannot adjudicate/i);
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO plugin_test.rows SELECT * FROM plugin_test.src drizzle, drizzle.__drizzle_migrations",
+          "plugin_test",
+          schemas,
+        )
+      ).toThrow(/cannot adjudicate/i);
+    });
+
+    it("still exempts a declared name that is not a schema in this database", () => {
+      // The control for the test above, and the reason the schema set is a set rather
+      // than a refusal of every declared name: `s` and `sub` are not schemas, so
+      // exempting them cannot hide a relation reference.
+      const schemas = new Set(["public", "information_schema", "drizzle", "plugin_test"]);
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT s.id, sub.n FROM plugin_test.rows s, (SELECT count(*) AS n FROM plugin_test.rows) sub",
+          "plugin_test",
+          [],
+          schemas,
+        )
+      ).not.toThrow();
+    });
+
     it("does not let an alias buy an exemption for a real schema name", () => {
       // The exemption is consulted ONLY for a left side that is neither the namespace
       // nor schema-shaped, so aliasing a relation `public` cannot make `public.secrets`
@@ -1650,6 +1697,55 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
 
       const after = await db.execute(sql.raw("SELECT label FROM shadow_rows"));
       expect(Array.from(after as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+    });
+
+    it("puts a public function out of reach, both ways", async () => {
+      // Asked for in review on #3739, and it pins a stronger contract than the one an
+      // earlier draft of this module's comment claimed. UNQUALIFIED, a `public`
+      // function no longer resolves, because `public` is out of the path. QUALIFIED,
+      // it is refused by the validator -- no ref pattern is anchored on a function
+      // call, so `public.f` reaches `assertNoUnextractedSchemaRefs` as a name it must
+      // adjudicate. That second half predates this change.
+      const { pluginId, namespace, pluginDb } = await installShadowFixture();
+      await db.execute(
+        sql.raw("CREATE FUNCTION public.pen6604_marker() RETURNS text AS $$ SELECT 'public-fn' $$ LANGUAGE sql"),
+      );
+      try {
+        // Control: the function is really there and really callable.
+        const present = await db.execute(sql.raw("SELECT public.pen6604_marker() AS v"));
+        expect(Array.from(present as Iterable<{ v: string }>)).toEqual([{ v: "public-fn" }]);
+
+        await expect(
+          pluginDb.query(pluginId, `SELECT pen6604_marker() AS v FROM ${namespace}.anchor`),
+        ).rejects.toThrow(/pen6604_marker/i);
+
+        await expect(
+          pluginDb.query(pluginId, `SELECT public.pen6604_marker() AS v FROM ${namespace}.anchor`),
+        ).rejects.toThrow(/cannot adjudicate/i);
+      } finally {
+        await db.execute(sql.raw("DROP FUNCTION IF EXISTS public.pen6604_marker()"));
+      }
+    });
+
+    it("reads the real schema list, so a declared name cannot exempt one", async () => {
+      // End to end: `drizzle` exists in this database because the core migrations
+      // created it, so the alias cannot buy an exemption even though `SCHEMA_SHAPED_RE`
+      // does not match the name.
+      const { pluginId, namespace, pluginDb } = await installShadowFixture();
+
+      // Control: the schema really is there, so the rejection is adjudication and not
+      // a missing relation.
+      const schemas = await db.execute(
+        sql.raw("SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = 'drizzle'"),
+      );
+      expect(Array.from(schemas as Iterable<{ nspname: string }>)).toEqual([{ nspname: "drizzle" }]);
+
+      await expect(
+        pluginDb.query(
+          pluginId,
+          `SELECT * FROM ${namespace}.anchor drizzle, drizzle.__drizzle_migrations`,
+        ),
+      ).rejects.toThrow(/cannot adjudicate/i);
     });
 
     it("refuses to run plugin SQL on a client it cannot pin", async () => {
