@@ -174,10 +174,11 @@ import { fileURLToPath } from "node:url";
  *
  *   - A `reason` MAY cite an external identifier (a PR, a row, a card) as
  *     CONTEXT. It must never rest its VALIDITY on one, and must never carry a
- *     PROHIBITION whose premise is external state. The entry above is the
- *     worked form: it names PEN-5277 and #3278 and then immunises itself
- *     against both -- "that repair does NOT make it registerable... do not
- *     read PEN-5277 closing as a cue to delete this entry."
+ *     PROHIBITION whose premise is external state. The
+ *     `security-audit-overrides` entry is the worked form: it names PEN-5277
+ *     and #3278 and then immunises itself against both -- "that repair does
+ *     NOT make it registerable... do not read PEN-5277 closing as a cue to
+ *     delete this entry."
  *   - The write-time test is one question: WOULD THIS SENTENCE STILL BE TRUE
  *     IF EVERY EXTERNAL SYSTEM CHANGED STATE TOMORROW? If no, it does not go
  *     in the file. Put it on the owning row, where a correction can be filed
@@ -198,8 +199,9 @@ import { fileURLToPath } from "node:url";
  * the objects they rested on, and penalising the citation selects for reasons
  * that assert without citing, which is strictly less falsifiable; and an arm
  * that instead RESOLVED the identifier against live state would reproduce,
- * inside this guard, the very failure the entry above is allowlisted for --
- * a terminal assertion that can turn red with no change to this repository.
+ * inside this guard, the very failure the `security-audit-overrides` entry is
+ * allowlisted for -- a terminal assertion that can turn red with no change to
+ * this repository.
  * That ruling is cited as history, not as live state: it does not matter to
  * any sentence here whether that row is still open.
  */
