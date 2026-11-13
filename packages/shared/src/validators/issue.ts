@@ -475,7 +475,14 @@ export function issueRecoveryActionResolvePath(issueId: string): string {
  *     nothing about its status;
  *   - the outcome vocabulary, because today you discover it by sending a
  *     deliberately-invalid body and reading the 400 (PEN-3991: an agent that cannot
- *     see the enum reaches for the verb in the prose, which is "restore").
+ *     see the enum reaches for the verb in the prose, which is "restore");
+ *   - `"sourceIssueStatus":"todo"` named as the VERIFIED hand-back (PEN-5714). The
+ *     clause above it is truthful about the downgrade but stops at disclosing it, so
+ *     a reader who wants a verified `restored` on an already-`blocked` row still has
+ *     to derive the operative field. `todo` is the cheapest status that clears
+ *     `RESTORED_CONTRADICTING_ISSUE_STATUSES` while the schema still accepts it
+ *     alongside `restored`, so naming it closes the same class of gap PEN-5707 did:
+ *     accurate prose that leaves the reader to work out the field.
  *
  * The outcome list is derived from `RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES` rather
  * than retyped, so a new outcome cannot land without this text moving with it.
@@ -484,8 +491,8 @@ export function buildManualResolutionGuidance(issueId: string): string {
   const outcomes = RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES.join(" | ");
   return (
     "record an intentional manual resolution: " +
-    `POST ${issueRecoveryActionResolvePath(issueId)} ` +
-    'with body {"outcome":"restored","resolutionNote":"<why>"} ' +
+    `\`POST ${issueRecoveryActionResolvePath(issueId)}\` ` +
+    'with body `{"outcome":"restored","resolutionNote":"<why>"}` ' +
     `(outcomes: ${outcomes}. ` +
     '"actionId" is OPTIONAL and belongs in the BODY, never in the path — omitted, ' +
     "it resolves this issue's active action. " +
@@ -495,7 +502,8 @@ export function buildManualResolutionGuidance(issueId: string): string {
     'unresolved first-class blocker; "false_positive" and "cancelled" are board-only ' +
     'and require "sourceIssueStatus" of done or in_review. On an issue left blocked ' +
     'or cancelled, "restored" is still accepted but is recorded as ' +
-    '"restored_unverified".)'
+    '"restored_unverified" — to hand such a row back as a VERIFIED "restored", ' +
+    'send `"sourceIssueStatus":"todo"` with it.)'
   );
 }
 

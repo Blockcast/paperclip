@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE,
   RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES,
+  RESTORED_CONTRADICTING_ISSUE_STATUSES,
   buildManualResolutionGuidance,
+  isContradictedRestoredClaim,
   issueRecoveryActionResolvePath,
+  resolveIssueRecoveryActionSchema,
 } from "./validators/issue.js";
 
 /**
@@ -67,5 +70,44 @@ describe("buildManualResolutionGuidance", () => {
     expect(guidance).toContain("board-only");
     expect(guidance).toContain("unresolved first-class blocker");
     expect(guidance).toContain("restored_unverified");
+  });
+
+  // PEN-5714 Part B.1: the route and the example body are the two fragments a
+  // reader copy-pastes. Unspanned, they render proportional and the {"..."}
+  // quoting blends into the surrounding prose quotes.
+  it("renders the route and the example body as code spans", () => {
+    expect(guidance).toContain(`\`POST ${issueRecoveryActionResolvePath(ISSUE_ID)}\``);
+    expect(guidance).toContain('`{"outcome":"restored","resolutionNote":"<why>"}`');
+  });
+
+  // PEN-5714 Part B.2: disclosing the downgrade is not the same as naming the
+  // way out of it. The copy-paste example omits `sourceIssueStatus`, and on an
+  // already-`blocked` row that records `restored_unverified` -- truthfully, but
+  // a reader who wants a verified `restored` was left to derive the field.
+  it("names the verified hand-back path, not just the downgrade", () => {
+    expect(guidance).toContain('`"sourceIssueStatus":"todo"`');
+    expect(guidance).toContain("VERIFIED");
+  });
+
+  it("names a hand-back status the schema actually accepts for `restored`", () => {
+    // The sentence above is only worth adding if it is true: `todo` has to pass
+    // the schema AND clear the contradiction check. Derived from the exported
+    // constant, so widening the contradicting set fails here rather than
+    // leaving the prose quietly wrong.
+    expect(resolveIssueRecoveryActionSchema.safeParse({
+      outcome: "restored",
+      sourceIssueStatus: "todo",
+    }).success).toBe(true);
+    expect(RESTORED_CONTRADICTING_ISSUE_STATUSES as readonly string[]).not.toContain("todo");
+    expect(isContradictedRestoredClaim({
+      requestedSourceIssueStatus: "todo",
+      currentIssueStatus: "blocked",
+    })).toBe(false);
+    // Control: the same call WITHOUT the field is the downgrade the prose warns
+    // about, so this pair shows the sentence changes the outcome.
+    expect(isContradictedRestoredClaim({
+      requestedSourceIssueStatus: null,
+      currentIssueStatus: "blocked",
+    })).toBe(true);
   });
 });

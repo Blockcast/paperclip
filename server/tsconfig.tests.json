@@ -7,6 +7,7 @@
     "noEmit": true
   },
   "include": [
+    "src/__tests__/recovery-manual-resolution-guidance-sites.test.ts",
     "src/__tests__/activity-log-lone-surrogate.test.ts",
     "src/__tests__/git-origin-config-reader.test.ts",
     "src/__tests__/github-fetch-rate-limit-hold.test.ts",
