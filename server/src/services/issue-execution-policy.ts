@@ -1768,7 +1768,7 @@ function applyMonitorTransition(
     // monitor's `recoveryPolicy`, trading a visible no-op for a silent
     // cancellation. Only a caller who explicitly wrote the monitor clears it.
     (input.monitorExplicitlyUpdated && currentMonitorState && currentMonitorState.status !== "cleared") ||
-    // PEN-6202 — the service-layer twin of `buildIssueMonitorEligibilityPatch`.
+    // PEN-6202 — the service-layer twin of `buildIssueMonitorEligibilityClear`.
     //
     // A monitor that has FIRED survives only in `executionState`, so neither
     // disjunct above sees it on an ordinary transition: `previousPolicy.monitor`
@@ -1784,7 +1784,7 @@ function applyMonitorTransition(
     // had already merged.
     //
     // BLO-28900 fixed this for the raw set-based writes (checkout-restore,
-    // release) via `buildIssueMonitorEligibilityPatch`; PEN-6202 extended that
+    // release) via `buildIssueMonitorEligibilityClear`; PEN-6202 extended that
     // helper to fired monitors. This is the same reconciliation for writes routed
     // through `issuesSvc.update`, which that helper does not reach.
     //
