@@ -45,7 +45,14 @@ export const MAX_PR_PAGES = 4;
 //
 // The missed publication itself is app 3966421's bug and is NOT fixable here:
 // PEN-5545 carries it upstream. This detector is the compensating control
-// named there, and it only reports -- releasing the hold is still '/test'.
+// named there, and it only reports -- releasing the hold is somebody's manual
+// act. WHOSE act depends on who they are, and this file used to name only the
+// human one (PEN-5569): '/test' requires a User login that is not
+// allyblockcast (pr-test-request.mjs trustedTestComment), so it is refused to
+// every App seat -- which is the author of the great majority of PRs here. An
+// App-seat author re-fires the review natively instead, DELETE then POST on
+// /pulls/:n/requested_reviewers, and re-runs the failed jobs by hand when the
+// run is past attempt 1. See the `::warning` in attestationLag() for both.
 //
 // GRACE is the margin above that observed 12s before a head is called stranded:
 // 50x the healthy figure, and two orders of magnitude under the strand. ALARM
@@ -276,6 +283,43 @@ function isAllyAppReview(review, logins) {
   return review?.author?.__typename === "Bot";
 }
 
+// Did this review actually READ `head`? (PEN-5569)
+//
+// `review.commit.oid` alone cannot answer that. GitHub RE-ANCHORS a review's
+// commit FORWARD onto the new head when the branch moves, so the field reports
+// where the review is pinned NOW, not what it read -- and it fails OPEN: it
+// does not reject a stale review, it accepts one that never saw this head.
+//
+// Measured on this repository 2026-11-13, over the 50 most-recently-updated
+// open PRs: 160 Ally App reviews, of which 65 carried `commit.oid ===
+// headRefOid` -- and 16 of those 65 (24.6%, on #3725, #3727, #3728, #3730)
+// carried a body marker naming a DIFFERENT head. A quarter of the reviews this
+// filter counted at a head had never been taken at it.
+//
+// The review BODY is the immutable surface -- GitHub never rewrites one -- so
+// its `Reviewed head:` marker still names the tree Ally actually read. That is
+// the same surface penstock-llm-proxy-core's CLAUDE.md already names as
+// authoritative for this exact mutability, so this follows the house rule
+// rather than inventing one.
+//
+// Deliberately ASYMMETRIC, for the reason the `lock` clause below is: a review
+// with NO marker falls back to `commit.oid`, i.e. to the previous reading.
+// Requiring a marker outright would make a markerless Ally review invisible and
+// drop its head out of the report entirely -- and a detector whose whole purpose
+// is to catch a LOST signal must not go quiet on absent evidence. Marker
+// coverage is 160/160 on the sample above, so that fallback is unreachable
+// today; it is here so a future markerless review degrades to the old reading
+// instead of to silence. Several markers (a review quoting an earlier one)
+// count as read when ANY names this head, erring the same way.
+function reviewReadHead(review, head) {
+  const wanted = String(head ?? "").toLowerCase();
+  const markers = [...String(review?.body ?? "").matchAll(/Reviewed head:\s*`?([0-9a-f]{40})\b/gi)].map(
+    ([, sha]) => sha.toLowerCase(),
+  );
+  if (markers.length === 0) return review?.commit?.oid === head;
+  return markers.includes(wanted);
+}
+
 const newestEpoch = (nodes, pick) =>
   nodes.reduce((best, node) => {
     const ms = epochMs(pick(node));
@@ -305,20 +349,26 @@ const newestEpoch = (nodes, pick) =>
 //             `pull_request` run of pr.yml at the head concluded SUCCESS.
 //
 // That third clause is what makes the alarm clearable, and it is not optional.
-// The `::warning` this detector prints tells the reader to comment `/test`, and
-// `/test` releases the hold through a plane this function does not otherwise
-// read: it posts the trusted `ci/manual-test-request` COMMIT STATUS
-// (pr-test-request.mjs), which pr.yml's lock honours BEFORE the predicate, and
-// the dispatcher's manual arm then re-runs the failed jobs at any attempt. The
-// App's check-runs never move, so without this clause a head that had been
-// released by the documented remedy stayed a finding for good -- an hourly
-// exit 1 the operator could not clear short of pushing or closing the PR, which
-// is precisely the un-actionable red the AC4 escalation exists to avoid.
+// The `::warning` this detector prints names two remedies, and this clause has
+// to clear the head whichever one was taken. `/test` releases the hold through
+// a plane this function does not otherwise read: it posts the trusted
+// `ci/manual-test-request` COMMIT STATUS (pr-test-request.mjs), which pr.yml's
+// lock honours BEFORE the predicate, and the dispatcher's manual arm then
+// re-runs the failed jobs at any attempt. A native review request releases it
+// through a third plane again -- it re-fires the reviewer, whose verdict the
+// dispatcher's automatic arm then acts on. The App's check-runs never move, so
+// without this clause a head that had been released by EITHER documented remedy
+// stayed a finding for good -- an hourly exit 1 the operator could not clear
+// short of pushing or closing the PR, which is precisely the un-actionable red
+// the AC4 escalation exists to avoid. Reading the lock is what makes the clause
+// indifferent to which plane did it; see the next paragraph.
 //
 // Reading the lock rather than the `ci/manual-test-request` status is the
 // choice recorded here: the lock IS the hold, so it answers the question
-// directly and covers every release path at once -- `/test`, a late verdict,
-// `ALLY_GATED_CI_BYPASS`, the fork exemption, and the self-authored exemption
+// directly and covers every release path at once -- `/test`, a late verdict
+// (including one re-fired by a native review request, which is the remedy the
+// PR's own App-seat author can actually take), `ALLY_GATED_CI_BYPASS`, the fork
+// exemption, and the self-authored exemption
 // (`ALLY_GATED_CI_HOLD_SELF_AUTHORED` unset, where pr.yml exits the lock job
 // green at its mode step, so an App-authored head is correctly never called
 // held). The status plane would additionally catch the minutes between a
@@ -333,13 +383,32 @@ const newestEpoch = (nodes, pick) =>
 // a LOST signal must not go quiet on absent evidence. `lock` rides on the
 // finding so that state is legible rather than silent.
 //
-// Deliberately mirrors selectBackstopCandidates' predicate rather than
-// re-deriving one, so "positive signal" means the same thing in the detector
-// and in the thing it detects the absence of. Like that predicate it reads the
-// CHECK-RUN plane only and does not consult the `review/ally-complete` commit
-// status: review-gate-sweep.yml records that this repo has no producer for it
-// (0 of 100 open PRs carried it, measured 2026-08-20), so consulting it here
-// would add a request per PR to read a column that is empty by construction.
+// Reads the same two check NAMES selectBackstopCandidates does, so "positive
+// signal" is drawn from the same plane in the detector and in the thing it
+// detects the absence of. It is NOT an exact mirror of that predicate, and
+// claiming one here was an overstatement (PEN-5569). The two differ twice:
+// WHICH run is read -- the backstop takes the NEWEST findings/attestation run,
+// the two lines below read `.some(SUCCESS)` across every run at the head -- and
+// what a FAILURE findings run MEANS, which makes the backstop skip and does
+// nothing here.
+//
+// ✅ TAKEN: keep `.some` and narrow this comment to what the code does.
+// `.some` is the conservative reading for a DETECTOR: it goes quiet on any
+// historical SUCCESS at the head, so a head whose signal did arrive and was
+// later superseded is not re-reported.
+// ⛔ NOT TAKEN: switching to `newestByDatabaseId` so the code matches the old
+// claim. It is tidier -- "positive signal" would mean one thing in both places
+// -- and it makes this detector LOUDER on exactly the heads where a signal
+// demonstrably did land once. Ally's review of #3384 and this file's own §5.3
+// note agree the two readings differ only in how quiet the detector is and
+// never in whether a strand is missed, so the tie breaks toward the quieter
+// one and the mirror claim is withdrawn rather than engineered to.
+//
+// Like the backstop it reads the CHECK-RUN plane only and does not consult the
+// `review/ally-complete` commit status: review-gate-sweep.yml records that this
+// repo has no producer for it (0 of 100 open PRs carried it, measured
+// 2026-08-20), so consulting it here would add a request per PR to read a
+// column that is empty by construction.
 //
 // Pure: every bound arrives as an argument so the thresholds and `now` are
 // fixed by the caller and testable without a clock.
@@ -361,7 +430,7 @@ export function attestationLagFindings(
 
     const reviewedAt = newestEpoch(
       (pr?.reviews?.nodes ?? []).filter(
-        (review) => review?.commit?.oid === pr.headRefOid && isAllyAppReview(review, reviewerLogins),
+        (review) => reviewReadHead(review, pr.headRefOid) && isAllyAppReview(review, reviewerLogins),
       ),
       (review) => review?.submittedAt,
     );
@@ -427,7 +496,7 @@ export const ATTESTATION_LAG_QUERY = `query($owner: String!, $name: String!, $cu
       nodes {
         number isDraft headRefOid baseRefName
         headRepository { nameWithOwner }
-        reviews(last: 20) { nodes { submittedAt author { login __typename } commit { oid } } }
+        reviews(last: 20) { nodes { submittedAt author { login __typename } commit { oid } body } }
         commits(last: 1) { nodes { commit {
           oid
           ally: checkSuites(first: 5, filterBy: {appId: ${ALLY_APP_ID}}) {
@@ -672,8 +741,16 @@ async function attestationLag() {
     console.log(
       `::warning title=ally attestation lag::PR #${f.number} head ${f.head.slice(0, 9)}: Ally reviewed at ` +
         `${f.reviewedAt}, ${published}. Stranded ${f.strandedSeconds}s; ${hold}. The heavy lanes stay held at this ` +
-        `head and no verdict event is coming -- comment '/test' on the PR to release them, which clears this ` +
-        `warning once the re-run lands.`,
+        `head and no verdict event is coming. TO RELEASE THEM -- a human comments '/test' on the PR; the PR's own ` +
+        `author cannot ('/test' requires a User who is not allyblockcast, so every App seat is refused) and ` +
+        `instead re-fires the review natively: DELETE then POST ` +
+        `/repos/${repository}/pulls/${f.number}/requested_reviewers {"reviewers":["allyblockcast"]} -- the USER ` +
+        `array ONLY, never team_reviewers, because a team re-add can 422 on its node id and strand the ` +
+        `code-owner gate. The DELETE is REQUIRED -- a bare POST against an already-outstanding request returns 200 and emits no ` +
+        `review_requested event, so it delivers nothing: read requested_reviewers first and DELETE only when the ` +
+        `login is already there. If that ` +
+        `run is already past attempt 1, re-run its failed jobs by hand as well: the automatic unlock fires only ` +
+        `on attempt 1. Either path clears this warning once the lanes go green.`,
     );
   }
   const worst = findings[0];
