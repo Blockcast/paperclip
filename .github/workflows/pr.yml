@@ -1946,7 +1946,7 @@ jobs:
         # 2026-09-09, v3.22.0 2026-09-10, v4.2.4, v3.21.4 ...), and paginating
         # re-applies the filter per page, so later pages emit 2018-era tags.
         # Read the newest tag of EACH major, not just the newest tag.
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.16.3
 
