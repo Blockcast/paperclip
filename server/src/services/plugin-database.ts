@@ -100,58 +100,11 @@ const OVERLAPPING_QUALIFIED_NAME = new RegExp(
  * which made the set an allowlist of schemas to CHECK and left every other real schema
  * unchecked -- `drizzle.__drizzle_migrations` in a non-first position was ignored,
  * while the same name in first position was correctly refused (PEN-6604). The skip is
- * now `assertNoUnextractedSchemaRefs`'s correlation-name exemption instead.
+ * now `assertNoUnextractedSchemaRefs`'s known-schema test instead: a left side that is
+ * not a schema in this database is exempt there, which is what the correlation-name
+ * exemption used to do and does not need a name list to get right.
  */
 const SCHEMA_SHAPED_RE = /^(?:public|information_schema|pg_[a-z0-9_]*|plugin_[a-z0-9_]*)$/;
-
-/**
- * Names a statement may legally use on the left of a dot WITHOUT naming a schema:
- * a relation alias, a CTE name, or one of SQL's own correlation names.
- *
- * These anchors are deliberately OVER-generous -- they capture keywords and column
- * aliases too -- and that is safe ONLY because they are consulted after the left
- * side has been checked against the schemas that actually exist. They decide whether
- * a name that is NOT a schema gets refused, never whether a name that IS a schema
- * gets adjudicated, so over-collecting costs nothing and under-collecting would cost
- * a false refusal on a live plugin.
- *
- * Reviewed and reproduced on #3739: without that ordering, one extra word reopens
- * what this closes -- `FROM plugin_ns.rows drizzle, drizzle.__drizzle_migrations`
- * and `WITH drizzle AS (SELECT 1) ... , drizzle.__drizzle_migrations` both declare
- * `drizzle` as a correlation name, and a relation alias cannot shadow a schema in a
- * FROM list, so Postgres still reads the real schema.
- */
-const CORRELATION_ANCHORS: readonly RegExp[] = [
-  // FROM/JOIN/UPDATE/INTO <relation> [AS] alias
-  new RegExp(
-    String.raw`\b(?:from|join|update|into)\s+(?:"?[A-Za-z_][A-Za-z0-9_]*"?\s*\.\s*)?"?[A-Za-z_][A-Za-z0-9_]*"?\s+(?:as\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?`,
-    "gi",
-  ),
-  // FROM (SELECT ...) sub, FROM jsonb_array_elements(x) AS e -- the alias follows `)`
-  /\)\s+(?:as\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-  // WITH x AS ( ... ), y (c1, c2) AS ( ... ) -- `AS (` is what makes this unambiguous
-  // against a `SELECT a, b AS c` list, where no open paren follows the alias.
-  /(?:\bwith\s+(?:recursive\s+)?|,)\s*"?([A-Za-z_][A-Za-z0-9_]*)"?\s*(?:\([^()]*\)\s*)?as\s*\(/gi,
-  // A comma-continued relation and its alias: `FROM ns.a x, other_t y`. This one
-  // cannot be told apart from a `SELECT a, b c` output-column alias without knowing
-  // which clause the comma is in, so it collects both. That is deliberate: refusing
-  // `y.col` there would be a false refusal on ordinary in-namespace SQL, and an
-  // over-collected name only ever restores the OLD behaviour for that one word. It
-  // does not reopen the case this closes -- `, drizzle.__drizzle_migrations` is one
-  // dotted token, so there is no second identifier for this to capture.
-  /,\s*"?[A-Za-z_][A-Za-z0-9_]*"?\s+(?:as\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-];
-
-/** Correlation names SQL supplies itself; they are never declared in the statement. */
-const IMPLICIT_CORRELATION_NAMES: ReadonlySet<string> = new Set(["excluded", "new", "old"]);
-
-function collectCorrelationNames(statement: string): ReadonlySet<string> {
-  const names = new Set(IMPLICIT_CORRELATION_NAMES);
-  for (const anchor of CORRELATION_ANCHORS) {
-    for (const match of statement.matchAll(anchor)) names.add(match[1]!.toLowerCase());
-  }
-  return names;
-}
 
 type SqlRef = { schema: string; table: string; keyword: string };
 type QualifiedRefPattern =
@@ -594,7 +547,7 @@ function assertNoUnextractedSchemaRefsInAll(
   texts: readonly string[],
   refs: readonly SqlRef[],
   namespace: string,
-  knownSchemas?: ReadonlySet<string>,
+  knownSchemas: ReadonlySet<string>,
 ): void {
   for (const text of texts) {
     assertNoUnextractedSchemaRefs(text, refs, namespace, knownSchemas);
@@ -648,9 +601,6 @@ function assertNoUnextractedSchemaRefs(
   const extracted = new Set(
     refs.map((ref) => `${ref.schema.toLowerCase()}.${ref.table.toLowerCase()}`),
   );
-  // Collected lazily: the overwhelming majority of statements never reach a name the
-  // extractor missed, and this scan is three more passes over the statement.
-  let correlations: ReadonlySet<string> | undefined;
   for (const match of statement.matchAll(OVERLAPPING_QUALIFIED_NAME)) {
     const schema = match[1]!;
     const table = match[2]!;
@@ -672,10 +622,17 @@ function assertNoUnextractedSchemaRefs(
       schemaLower === namespace.toLowerCase() ||
       SCHEMA_SHAPED_RE.test(schemaLower) ||
       knownSchemas.has(schemaLower);
-    if (!namesAnExistingSchema) {
-      correlations ??= collectCorrelationNames(statement);
-      if (correlations.has(schemaLower)) continue;
-    }
+    // Not a schema in this database ⇒ `name.table` cannot be a relation reference at
+    // all, so exempting it cannot hide one. That also covers a name the statement
+    // declared for itself (an alias, a CTE) and a name that is an artefact of a
+    // comment sitting inside a real name -- `plugin_test--c\n.rows` scans as `c.rows`
+    // in the raw text (PEN-6600). Refusing those would be a false refusal on ordinary
+    // in-namespace SQL, which is what `#3737`'s `xpublic.secrets` and `c.rows` cases
+    // pin. A name that IS a schema is adjudicated unconditionally, so a declared
+    // correlation can no longer buy an exemption for one (PEN-6604, the `drizzle`
+    // bypass) -- consulting the real schema set subsumes the correlation test that
+    // used to guard this, which is why no correlation lookup remains here.
+    if (!namesAnExistingSchema) continue;
     throw new Error(
       `Plugin SQL names ${schema}.${table} in a position this validator cannot adjudicate`,
     );
