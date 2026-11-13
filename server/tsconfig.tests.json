@@ -12,6 +12,7 @@
     "src/__tests__/github-fetch-rate-limit-hold.test.ts",
     "src/__tests__/github-fetch-hold-route-scope.test.ts",
     "src/__tests__/issue-comment-effect-outbox-routes.test.ts",
+    "src/__tests__/issue-comment-mention-fallback-routes.test.ts",
     "src/__tests__/issue-comment-unkeyed-outbox-routes.test.ts",
     "src/__tests__/open-pull-requests-at-head.test.ts",
     "src/__tests__/rss-release-tracker.test.ts",
