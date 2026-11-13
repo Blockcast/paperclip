@@ -476,13 +476,21 @@ export function issueRecoveryActionResolvePath(issueId: string): string {
  *   - the outcome vocabulary, because today you discover it by sending a
  *     deliberately-invalid body and reading the 400 (PEN-3991: an agent that cannot
  *     see the enum reaches for the verb in the prose, which is "restore");
- *   - `"sourceIssueStatus":"todo"` named as the VERIFIED hand-back (PEN-5714). The
- *     clause above it is truthful about the downgrade but stops at disclosing it, so
- *     a reader who wants a verified `restored` on an already-`blocked` row still has
- *     to derive the operative field. `todo` is the cheapest status that clears
- *     `RESTORED_CONTRADICTING_ISSUE_STATUSES` while the schema still accepts it
- *     alongside `restored`, so naming it closes the same class of gap PEN-5707 did:
- *     accurate prose that leaves the reader to work out the field.
+ *   - `"sourceIssueStatus":"todo"` named as the way out of the downgrade, TOGETHER
+ *     WITH WHAT IT COSTS (PEN-5714). The clause above it is truthful about the
+ *     downgrade but stops at disclosing it, so a reader who wants to avoid it on an
+ *     already-`blocked` row still has to derive the operative field. `todo` is the
+ *     cheapest status that clears `RESTORED_CONTRADICTING_ISSUE_STATUSES` while the
+ *     schema still accepts it alongside `restored`.
+ *
+ *     It is NOT a verified `restored` in the common case, and the first version of
+ *     this sentence said it was (Ally, review of #3760). `restored` + `todo` is
+ *     exactly the hand-back arm: where the action records a return owner and no
+ *     human holds the row, the route reassigns the issue to that owner and records
+ *     `handed_back`. Promising a verified `restored` would have been the same
+ *     accurate-sounding, wrong-operative-result gap PEN-5707 exists to close --
+ *     shipped, this time, by the fix for it. See `deriveRecordedResolveOutcome`,
+ *     which this sentence is a description of.
  *
  * The outcome list is derived from `RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES` rather
  * than retyped, so a new outcome cannot land without this text moving with it.
@@ -502,8 +510,10 @@ export function buildManualResolutionGuidance(issueId: string): string {
     'unresolved first-class blocker; "false_positive" and "cancelled" are board-only ' +
     'and require "sourceIssueStatus" of done or in_review. On an issue left blocked ' +
     'or cancelled, "restored" is still accepted but is recorded as ' +
-    '"restored_unverified" — to hand such a row back as a VERIFIED "restored", ' +
-    'send `"sourceIssueStatus":"todo"` with it.)'
+    '"restored_unverified"; send `"sourceIssueStatus":"todo"` with it to avoid that ' +
+    'downgrade. Expect a hand-back rather than a plain "restored": when the action ' +
+    'records a return owner and no human holds the row, that same request also ' +
+    'reassigns this issue to the return owner and the ledger records "handed_back".)'
   );
 }
 
@@ -630,6 +640,61 @@ export function isContradictedRestoredClaim(input: {
 }): boolean {
   const effectiveStatus = input.requestedSourceIssueStatus ?? input.currentIssueStatus;
   return (RESTORED_CONTRADICTING_ISSUE_STATUSES as readonly string[]).includes(effectiveStatus);
+}
+
+/**
+ * The outcome the ledger RECORDS for a resolve request, which is not always the
+ * one the caller sent.
+ *
+ * Three of the four arms are derived, and the PRECEDENCE between them is the whole
+ * content of this function:
+ *
+ *   1. a `restored` claim the write's own evidence contradicts is downgraded to
+ *      `restored_unverified` (PEN-3991);
+ *   2. otherwise a hand-back records `handed_back` -- that request also returns the
+ *      row to the action's return owner, which is an ownership move, so recording
+ *      the caller's `restored` would overstate what happened;
+ *   3. otherwise `restored` + `done` is the owner having finished the work;
+ *   4. otherwise the caller's own outcome stands.
+ *
+ * (1) is checked BEFORE (2) on purpose. A hand-back says nothing about whether
+ * execution was restored, so recording `handed_back` for a contradicted claim would
+ * let the contradiction back in under a different name. In practice the two cannot
+ * both fire today -- hand-back requires `todo`, which is not a contradicting status
+ * -- but the precedence is what keeps that true if either list moves.
+ *
+ * PEN-5714: this lives HERE, beside `buildManualResolutionGuidance`, because the
+ * `nextAction` prose that builder emits promises readers an outcome, and prose that
+ * promises an outcome has to be pinned to the thing that produces it. While this
+ * derivation sat inline in the route handler the prose could only be checked
+ * against `isContradictedRestoredClaim` -- arm (1) of four -- so a sentence that
+ * was wrong about arm (2) passed every test and shipped to nine emitting sites.
+ * Keep the two adjacent.
+ */
+export function deriveRecordedResolveOutcome(input: {
+  /** The outcome as requested in the body. */
+  outcome: (typeof RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES)[number];
+  /** `sourceIssueStatus` as sent. `undefined`/`null` => assert nothing about status. */
+  requestedSourceIssueStatus?: string | null;
+  /** The source issue's status as it stands now, which an omitted request leaves. */
+  currentIssueStatus: string;
+  /**
+   * Is this request ALSO returning the row to the action's return owner? The caller
+   * decides it: the answer needs the action's `returnOwnerAgentId` and the issue's
+   * `assigneeUserId`, neither of which a request body carries.
+   */
+  handingBack: boolean;
+}): (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)[number] {
+  const { outcome, requestedSourceIssueStatus, currentIssueStatus, handingBack } = input;
+  if (
+    outcome === "restored" &&
+    isContradictedRestoredClaim({ requestedSourceIssueStatus, currentIssueStatus })
+  ) {
+    return "restored_unverified";
+  }
+  if (handingBack) return "handed_back";
+  if (outcome === "restored" && requestedSourceIssueStatus === "done") return "owner_completed";
+  return outcome;
 }
 
 export type ResolveIssueRecoveryAction = z.infer<typeof resolveIssueRecoveryActionSchema>;
