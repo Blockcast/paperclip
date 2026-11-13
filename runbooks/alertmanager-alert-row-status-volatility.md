@@ -206,10 +206,13 @@ to see through.
 | of those, lapsed, agent-assigned, and never fired for this park | **6** |
 | oldest | PEN-4729, **16.9 days** overdue |
 
-The 6 apply every conjunct of `issueParkOwesReleaseWake`, so they are blocked
-by the status term alone. PEN-5719 is the discriminating control: lapsed and
-never fired, but `todo`, so it will fire — the count separates "dead" from
-"owed for some other reason" rather than counting all lapsed parks.
+The 6 apply every conjunct of `issueParkOwesReleaseWake` EXCEPT the status one,
+which is the term that blocks them. The 6 is also the OVERDUE subset — it was
+counted with `parkedUntil <= now()` applied, and the predicate below omits that
+term on purpose, so the two numbers answer different questions and are not one
+set. PEN-5719 is the discriminating control: lapsed and never fired, but
+`todo`, so it will fire — the count separates "dead" from "owed for some other
+reason" rather than counting all lapsed parks.
 
 ### To tell a dead park from a healthy one
 
@@ -217,14 +220,37 @@ There is no nested state to read, as there is for a monitor in Rule 3 — the
 columns are all you get, and they look fine. The test is the conjunction:
 
 ```
-status NOT IN (backlog, todo, in_progress, in_review)
+status IN (done, cancelled)
   AND parkedUntil IS NOT NULL
   AND assigneeAgentId IS NOT NULL AND assigneeUserId IS NULL
   AND (parkedWakeFiredAt IS NULL OR parkedWakeFiredAt < parkedAt)
 ```
 
+No lapse term, deliberately: this asks "is this park dead?", and a park
+destroyed before its due time is already dead — PEN-4729's was destroyed
+7 h 34 m *before* it was due. Add `AND parkedUntil <= now()` when you want the
+overdue subset instead, and say which of the two you counted.
+
 `parkedWakeFiredAt` is per-PARK, not per-row, which is why the comparison is
 against `parkedAt` and not a null check alone.
+
+On `done` a dead park is usually benign: the work finished before the deadline,
+which is the case `issue-park-expiry.ts` calls "ordinary" and declines to wake.
+It is the `cancelled` cell that is the defect, because a plugin cancel is a
+RECYCLE rather than a close — the row comes back.
+
+⚠️ `blocked` is NOT a dead-park status, and the broader
+`status NOT IN (backlog, todo, in_progress, in_review)` is the wrong test here.
+`issue-park-expiry.ts` excludes `blocked` deliberately: a blocked row's next
+action belongs to its blocker, and a blocked row with no unresolved blocker is
+drained to `todo` by the stranded-blocked reconciler, after which the sweep
+covers it on `todo`. Such a park is DORMANT, not dead. Measured whole-company
+2026-11-12 over 5 982 rows, 84 parks sit on a non-wake status — `done` 55,
+`blocked` 22 with **zero** overdue, `cancelled` 7 with five overdue — so the
+broad form selects roughly ten rows that owe nothing for every one that does.
+(A row held `blocked` by a `BlockedIssueAutoResumeSuppressionReason` gets
+neither the drain nor the sweep, so its park really is dark; that residual is
+PEN-5291's and is not this rule's.)
 
 ### So: do not use a park as the only observer on an alert row
 
