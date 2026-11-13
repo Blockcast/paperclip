@@ -17160,6 +17160,11 @@ export function issueRoutes(
     let currentIssue = issue;
     let issueBeforeCommentDecision = issue;
     let commentDecisionStageWakeup: ReturnType<typeof buildExecutionStageWakeup> | null = null;
+    // PEN-5682: set when the unkeyed insert below committed its effect intents
+    // in the same transaction, so the tail of this handler must NOT also run
+    // them inline. Declared out here because the decision is made inside the
+    // non-auto-approval arm and read after it.
+    let unkeyedCommentRoutedToOutbox = false;
     const commentReferenceSummaryBefore = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
     let commentReferenceDiff: ReturnType<typeof issueReferencesSvc.diffIssueReferenceSummary> | null = null;
     const persistUserReplyBeforeBlockedReopen =
@@ -17493,6 +17498,69 @@ export function issueRoutes(
           idempotencyKey: req.body.idempotencyKey ?? null,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         };
+        // PEN-5682: route an UNKEYED comment onto the same transactional
+        // outbox the keyed branch uses, so the comment and the intents for its
+        // side effects commit together on every call rather than only when the
+        // caller happened to pass an `idempotencyKey`. Without this the INSERT
+        // autocommits and `syncComment` / `logActivity` / the wakes run bare and
+        // inline, so a failure between them loses work the caller was told
+        // landed — and a failure DURING them 503s a write that had already
+        // committed (the half PEN-5669/#3421 fixed, for the keyed branch only).
+        //
+        // ELIGIBILITY: "the comment is the only durable write in this request".
+        // The outbox intent set is built by `buildKeyedCommentEffectIntents`,
+        // which models a plain comment and nothing else. Every term below
+        // excludes a request class whose inline tail does strictly more than
+        // that builder can express, so an ineligible request keeps the inline
+        // path verbatim. This is deliberately a NARROWING: a term that is
+        // merely redundant costs one request class staying on the old path; a
+        // missing term silently drops a side effect.
+        //
+        //  - `!reopened` / `!scheduledRetrySupersededByComment`: both mean
+        //    `svc.update(id, {status:"todo"})` already ran, and both add
+        //    `reopened`/`scheduledRetry*` keys to the activity details and swap
+        //    the assignee wake for `issue_reopened_via_comment`.
+        //  - `!interruptRequested`: `interruptedRunId` rides the activity row
+        //    and every wake payload; the builder carries neither.
+        //  - `!isClosedIssueStatus(currentIssue.status)`: BEHAVIOUR-PRESERVING
+        //    BY CONSTRUCTION, and load-bearing. ⛔ Do NOT drop this term on the
+        //    grounds that PEN-5846 has since given the builder's mention loop
+        //    the same closed guard the inline loops carry. That ruling is about
+        //    the MENTION WAKE; this term excludes a whole request class, and
+        //    equivalence between the inline tail and the intent set on a closed
+        //    row has never been measured for the other effect kinds
+        //    (`references_sync`, `comment_activity`, `interaction_expiry`,
+        //    `recovery_revalidation`). Routing closed-row comments through the
+        //    outbox is a separate decision nobody has taken. PEN-5682 done-when
+        //    3 pins this term with its own test, and that test is NOT retired by
+        //    PEN-5846 landing.
+        //  - `currentIssue.status === issue.status`: no status moved under us,
+        //    so the `becameDone` dependent wakes, the `becameTerminal` parent
+        //    wake and the sandbox-lease teardown are all unreachable.
+        //  - `!effectiveMoveToTodoRequested` / `!resumeRequested`: MEASURED
+        //    ADDITIONS to the five conjuncts settled on PEN-5669, not a
+        //    re-derivation of them. `reopened` is
+        //    `isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers)`, so a
+        //    `resume: true` comment on an issue that is ALREADY `todo` reopens
+        //    nothing, changes no status, and passes all five — while the inline
+        //    path still writes `resumeIntent`/`followUpRequested` into both the
+        //    activity details and the assignee wake payload, which the builder
+        //    cannot express. `effectiveMoveToTodoRequested` is the exact
+        //    condition for the `svc.update` block, so it covers the implicit
+        //    move-to-todo cases too.
+        //
+        // Not in the predicate because the arm itself excludes them: the
+        // auto-approval transition (this is its `else`), and the blocked-reopen
+        // user reply, which inserts the comment before `if (!comment)` and so
+        // never reaches here.
+        const unkeyedCommentIsOutboxEligible =
+          !reopened &&
+          !scheduledRetrySupersededByComment &&
+          !interruptRequested &&
+          !effectiveMoveToTodoRequested &&
+          !resumeRequested &&
+          !isClosedIssueStatus(currentIssue.status) &&
+          currentIssue.status === issue.status;
         if (req.body.idempotencyKey) {
           // Resolved before the transaction opens: see
           // `resolveCommentMentionContext` for why the lock held by the INSERT's
@@ -17541,6 +17609,41 @@ export function issueRoutes(
             });
             return accepted;
           });
+        } else if (unkeyedCommentIsOutboxEligible) {
+          // Same shape as the keyed branch above, and for the same reasons —
+          // including the mention hoist: `resolveCommentMentionContext` runs
+          // BEFORE the transaction opens because the `issue_comments` INSERT
+          // takes `FOR NO KEY UPDATE` on the parent `issues` row and holds it to
+          // commit, so any read made inside would be made under that lock.
+          //
+          // The `accepted.body === req.body.body` test is kept verbatim rather
+          // than assumed away. An unkeyed insert cannot dedupe, so the
+          // concurrent-same-key case cannot arise here — but `censorUsernameInLogs`
+          // still makes the stored body `redactCurrentUserText(body)`, and the
+          // builder has always asked about the PERSISTED body.
+          const mentionContext = await resolveCommentMentionContext({
+            issue: currentIssue,
+            body: req.body.body,
+            actor: persistedCommentActor(actor),
+          });
+          comment = await db.transaction(async (tx) => {
+            const inserted = await svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
+            const effects = await buildKeyedCommentEffectIntents({
+              issue: currentIssue,
+              comment: inserted,
+              actor,
+              referenceSummaryBefore: commentReferenceSummaryBefore,
+              mentions: inserted.body === req.body.body ? mentionContext : undefined,
+            });
+            await enqueueCommentEffects(tx as unknown as Db, {
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
+              commentId: inserted.id,
+              effects,
+            });
+            return inserted;
+          });
+          unkeyedCommentRoutedToOutbox = true;
         } else {
           comment = await svc.addComment(id, req.body.body, commentActor, commentOptions);
         }
@@ -17725,6 +17828,17 @@ export function issueRoutes(
           });
         }
       }
+      await drainCommentEffectsAfterCommit({ commentId: comment.id, issueId: currentIssue.id });
+      res.status(idempotentReplay ? 200 : 201).json(await commentResponseBody());
+      return;
+    }
+
+    // PEN-5682: the unkeyed insert committed its intents with the comment, so
+    // the inline tail below is now that comment's DUPLICATE and must not run.
+    // Drained inline for latency, and the drain cannot fail the response — the
+    // work is already durable and `startIssueCommentEffectReconciler` owns the
+    // retry. See `drainCommentEffectsAfterCommit`.
+    if (unkeyedCommentRoutedToOutbox) {
       await drainCommentEffectsAfterCommit({ commentId: comment.id, issueId: currentIssue.id });
       res.status(idempotentReplay ? 200 : 201).json(await commentResponseBody());
       return;

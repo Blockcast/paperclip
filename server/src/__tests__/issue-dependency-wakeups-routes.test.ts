@@ -25,7 +25,23 @@ const mockIssueService = vi.hoisted(() => ({
 // The POST /issues/:id/comments auto-approval path persists the comment and the
 // status transition in one `db.transaction`, so that route needs a db that can
 // actually run the executor (the PATCH tests below are happy with `{}`).
-const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+// PEN-5682: an eligible plain comment now inserts its effect intents in the
+// same transaction as the comment, and `enqueueCommentEffects` ends in
+// `.onConflictDoNothing({ target })` where every other `tx.insert().values()`
+// here is awaited directly. Without both shapes the route answers 500.
+// The drain that follows is a no-op in this harness — `processCommentEffects`
+// is unmocked and its reads return `[]` — which is correct for this file: it is
+// about dependent-status recompute, and `drainCommentEffectsAfterCommit`
+// swallows by design. The wake-through-the-outbox behaviour is pinned in
+// `issue-comment-effect-outbox-routes.test.ts`, not here.
+const txInsertValuesResult = vi.hoisted(() => () => {
+  const result = Promise.resolve(undefined) as Promise<undefined> & {
+    onConflictDoNothing: () => Promise<undefined>;
+  };
+  result.onConflictDoNothing = () => Promise.resolve(undefined);
+  return result;
+});
+const mockTxInsertValues = vi.hoisted(() => vi.fn(() => txInsertValuesResult()));
 const mockTx = vi.hoisted(() => ({
   insert: vi.fn(() => ({ values: mockTxInsertValues })),
   execute: vi.fn(async () => undefined),

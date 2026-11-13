@@ -36,22 +36,70 @@ const mockAgentService = vi.hoisted(() => ({
   resolveByReference: vi.fn(),
 }));
 
-const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
-const mockTxInsertValues = vi.hoisted(() => vi.fn(async () => undefined));
+// PEN-5682: the effect path calls `logActivity(tx, payload, { deferPublish:
+// true, enlistPluginOutbox: true })` and then INVOKES what it returns —
+// durable delivery is enlisted in the transaction, the live fan-out happens
+// after commit. A mock resolving `undefined` makes `publish()` a TypeError, so
+// the whole effect chain dies before `run_activity`. Returning a spy also lets
+// a test assert the live fan-out actually ran.
+const mockPublishActivity = vi.hoisted(() => vi.fn(() => undefined));
+const mockLogActivity = vi.hoisted(() => vi.fn(async () => mockPublishActivity));
+// PEN-5682: `tx.insert().values()` now has TWO shapes in this handler. Every
+// pre-existing call awaits the builder directly; `enqueueCommentEffects` ends in
+// `.onConflictDoNothing({ target })`. A plain `async () => undefined` satisfies
+// only the first, so every comment routed onto the effect outbox threw
+// `values(...).onConflictDoNothing is not a function` and the route answered
+// 500. Return a thenable carrying both so one mock serves both call shapes, and
+// so `expect(mockTxInsertValues).toHaveBeenCalledWith(...)` keeps working.
+const txInsertValuesResult = vi.hoisted(() => () => {
+  const result = Promise.resolve(undefined) as Promise<undefined> & {
+    onConflictDoNothing: () => Promise<undefined>;
+  };
+  result.onConflictDoNothing = () => Promise.resolve(undefined);
+  return result;
+});
+const mockTxInsertValues = vi.hoisted(() => vi.fn(() => txInsertValuesResult()));
 const mockTxInsert = vi.hoisted(() => vi.fn(() => ({ values: mockTxInsertValues })));
 const mockTxExecute = vi.hoisted(() => vi.fn(async () => undefined));
-const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(async () => []));
+// PEN-5682: the select mock has to be TABLE-AWARE, and that is not a tidiness
+// preference. `executeKeyedCommentEffect` loads the comment with
+// `select().from(issueComments).where(eq(id)).limit(1)`, and
+// `findWakeIdempotencyReceipt` uses the IDENTICAL `.limit(1)` shape on
+// `agent_wakeup_requests`. A blanket non-empty return therefore makes every
+// wake effect find a receipt and report `wakeSkipped: "already_accepted"` —
+// silently deleting the behaviour under test while every test still passes its
+// status assertion. Keyed on the table, each read answers for itself and an
+// unregistered table still answers `[]`.
+const drizzleTableName = vi.hoisted(() => (table: unknown): string => {
+  const named = table as Record<symbol, unknown> | null | undefined;
+  const name = named?.[Symbol.for("drizzle:Name")];
+  return typeof name === "string" ? name : "";
+});
+// Rows a table answers with. A thunk, not a value, so a test that changes what
+// `addComment` resolves does not have to re-register anything.
+const selectRowsByTable = vi.hoisted(() => new Map<string, () => Promise<unknown[]>>());
+const lastSelectedTable = vi.hoisted(() => ({ name: "" }));
+const selectedRows = vi.hoisted(() => async (): Promise<unknown[]> => {
+  const source = selectRowsByTable.get(lastSelectedTable.name);
+  return source ? await source() : [];
+});
+const mockDbSelectOrderBy = vi.hoisted(() => vi.fn(() => selectedRows()));
 const mockDbSelectLimit = vi.hoisted(() => vi.fn(() => ({
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([]).then(onFulfilled, onRejected),
+    selectedRows().then(onFulfilled, onRejected),
 })));
 const mockDbSelectWhere = vi.hoisted(() => vi.fn(() => ({
   orderBy: mockDbSelectOrderBy,
   limit: mockDbSelectLimit,
   then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-    Promise.resolve([]).then(onFulfilled, onRejected),
+    selectedRows().then(onFulfilled, onRejected),
 })));
-const mockDbSelectFrom = vi.hoisted(() => vi.fn(() => ({ where: mockDbSelectWhere })));
+const mockDbSelectFrom = vi.hoisted(() => vi.fn((table: unknown) => {
+  // Safe to stash on the chain rather than thread it: `select().from().where()
+  // .limit()` is built and consumed with no await in between.
+  lastSelectedTable.name = drizzleTableName(table);
+  return { where: mockDbSelectWhere };
+}));
 const mockDbSelect = vi.hoisted(() => vi.fn(() => ({ from: mockDbSelectFrom })));
 // Denied-write recording enforces its aggregate bound inside `db.transaction`
 // under an advisory lock and fails closed, so the transaction executor has to
@@ -66,6 +114,82 @@ const mockDb = vi.hoisted(() => ({
   select: mockDbSelect,
   transaction: vi.fn(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx)),
 }));
+// PEN-5682: an in-memory stand-in for the `issue_comment_effects` ledger, so
+// the route's own `executeKeyedCommentEffect` actually RUNS in this harness.
+// Without it the intents are enqueued and nothing drains them, and every
+// behavioural assertion in this file (the wake fired, the activity row was
+// written, the references were synced) fails — not because the behaviour
+// regressed, but because the harness stops one layer short of it. Mirrors
+// `issue-comment-effect-outbox-routes.test.ts`, which proved the shape for the
+// keyed path.
+type LedgerRow = {
+  id: string;
+  companyId: string;
+  issueId: string;
+  commentId: string;
+  effectKind: string;
+  effectKey: string;
+  payload: unknown;
+  status: "queued" | "processed";
+  result?: unknown;
+};
+const commentEffectLedger = vi.hoisted(() => new Map<string, unknown[]>());
+const ledgerRows = vi.hoisted(() => (commentId: string) =>
+  (commentEffectLedger.get(commentId) ?? []) as Array<{
+    effectKey: string;
+    status: string;
+    result?: unknown;
+  }>,
+);
+const mockCommentEffects = vi.hoisted(() => ({
+  enqueueCommentEffects: vi.fn(
+    async (
+      _handle: unknown,
+      input: {
+        companyId: string;
+        issueId: string;
+        commentId: string;
+        effects: ReadonlyArray<{ effectKind: string; effectKey: string; payload: unknown }>;
+      },
+    ) => {
+      const rows = (commentEffectLedger.get(input.commentId) ?? []) as Array<Record<string, unknown>>;
+      for (const effect of input.effects) {
+        // The real table conflicts on `(comment_id, effect_key)`; a replay must
+        // not duplicate an intent.
+        if (rows.some((row) => row.effectKey === effect.effectKey)) continue;
+        rows.push({
+          id: `effect-${input.commentId}-${effect.effectKey}`,
+          companyId: input.companyId,
+          issueId: input.issueId,
+          commentId: input.commentId,
+          effectKind: effect.effectKind,
+          effectKey: effect.effectKey,
+          payload: effect.payload,
+          status: "queued",
+        });
+      }
+      commentEffectLedger.set(input.commentId, rows);
+    },
+  ),
+  hasCommentEffects: vi.fn(async (_db: unknown, commentId: string) => ledgerRows(commentId).length > 0),
+  getEffectResult: vi.fn(async (_db: unknown, commentId: string, effectKey: string) =>
+    ledgerRows(commentId).find((row) => row.effectKey === effectKey),
+  ),
+  // Invokes the executor the ROUTE passed in, so what is exercised here is the
+  // real `executeKeyedCommentEffect` and not a re-implementation of it.
+  processCommentEffects: vi.fn(
+    async (_db: unknown, commentId: string, execute: (row: unknown) => Promise<unknown>) => {
+      for (const row of ledgerRows(commentId) as Array<Record<string, unknown>>) {
+        if (row.status === "processed") continue;
+        row.result = await execute(row);
+        row.status = "processed";
+      }
+      return true;
+    },
+  ),
+}));
+vi.mock("../services/issue-comment-effects.js", () => mockCommentEffects);
+
 const mockFeedbackService = vi.hoisted(() => ({
   listIssueVotesForUser: vi.fn(async () => []),
   saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
@@ -253,6 +377,26 @@ function agentActor(agentId = "22222222-2222-4222-8222-222222222222") {
   };
 }
 
+/**
+ * PEN-5682: the tables written inside `db.transaction`, by name.
+ *
+ * `expect(mockDb.transaction).not.toHaveBeenCalled()` used to stand in for "no
+ * auto-approval happened" — sound only while a plain comment opened no
+ * transaction at all. An eligible plain comment now opens one, because the
+ * insert and its effect intents commit together, so that assertion fires on
+ * exactly the traffic it was never about and would have to be deleted rather
+ * than fixed.
+ *
+ * The intent it encoded is "no execution decision was recorded", and that is
+ * what this reads: `issue_execution_decisions` is written by the auto-approval
+ * arm and by nothing else on this route. Discriminating on the TABLE survives
+ * any later change to which writes share a transaction, which is the property
+ * the mechanism assertion lacked.
+ */
+function insertedTableNames(): string[] {
+  return mockTxInsert.mock.calls.map(([table]) => drizzleTableName(table));
+}
+
 async function waitForWakeup(assertion: () => void) {
   await vi.waitFor(assertion);
 }
@@ -299,20 +443,41 @@ describe.sequential("issue comment reopen routes", () => {
     mockDbSelectOrderBy.mockReset();
     mockDbSelectLimit.mockReset();
     mockDb.transaction.mockReset();
-    mockTxInsertValues.mockResolvedValue(undefined);
+    mockTxInsertValues.mockImplementation(() => txInsertValuesResult());
     mockTxInsert.mockImplementation(() => ({ values: mockTxInsertValues }));
-    mockDbSelectOrderBy.mockResolvedValue([]);
+    mockDbSelectOrderBy.mockImplementation(() => selectedRows());
     mockDbSelectLimit.mockImplementation(() => ({
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([]).then(onFulfilled, onRejected),
+        selectedRows().then(onFulfilled, onRejected),
     }));
     mockDbSelectWhere.mockImplementation(() => ({
       orderBy: mockDbSelectOrderBy,
       limit: mockDbSelectLimit,
       then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
-        Promise.resolve([]).then(onFulfilled, onRejected),
+        selectedRows().then(onFulfilled, onRejected),
     }));
-    mockDbSelectFrom.mockImplementation(() => ({ where: mockDbSelectWhere }));
+    mockDbSelectFrom.mockImplementation((table: unknown) => {
+      lastSelectedTable.name = drizzleTableName(table);
+      return { where: mockDbSelectWhere };
+    });
+    // PEN-5682: the effect executor re-reads the comment from the database
+    // rather than trusting the payload, so the one table that must answer is
+    // `issue_comments`. Resolved from whatever `addComment` returned for this
+    // test, so a test that customises the persisted row needs no extra wiring —
+    // and, critically, `agent_wakeup_requests` is NOT registered, so
+    // `findWakeIdempotencyReceipt` still answers `[]` and the wake really runs.
+    commentEffectLedger.clear();
+    selectRowsByTable.clear();
+    selectRowsByTable.set("issue_comments", async () => {
+      const results = mockIssueService.addComment.mock.results;
+      for (let i = results.length - 1; i >= 0; i -= 1) {
+        const settled = results[i];
+        if (settled.type !== "return") continue;
+        const value = await settled.value;
+        if (value) return [value];
+      }
+      return [];
+    });
     mockDbSelect.mockImplementation(() => ({ from: mockDbSelectFrom }));
     mockDb.transaction.mockImplementation(async (fn: (tx: typeof mockTx) => Promise<unknown>) => fn(mockTx));
     mockIssueReferenceService.deleteDocumentSource.mockReset().mockResolvedValue(undefined);
@@ -334,7 +499,9 @@ describe.sequential("issue comment reopen routes", () => {
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
-    mockLogActivity.mockResolvedValue(undefined);
+    mockPublishActivity.mockReset();
+    // Still a publish function after the reset: see `mockPublishActivity`.
+    mockLogActivity.mockResolvedValue(mockPublishActivity as never);
     mockFeedbackService.listIssueVotesForUser.mockResolvedValue([]);
     mockFeedbackService.saveIssueVote.mockResolvedValue({
       vote: null,
@@ -568,6 +735,13 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: "hello" });
 
     expect(res.status).toBe(201);
+    // PEN-5682: the plain comment now rides the effect outbox, so the activity
+    // row is written by the `comment_activity` effect rather than inline. That
+    // changes the ARITY — the effect writes it inside its own transaction and
+    // passes `{ deferPublish: true, enlistPluginOutbox: true }` — and
+    // `toHaveBeenCalledWith` is exact on arity, so the third argument has to be
+    // named. The payload assertion below is unchanged and is the part that
+    // matters: the same event, carrying the same body and author.
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({
@@ -578,7 +752,12 @@ describe.sequential("issue comment reopen routes", () => {
           authorName: "Ally",
         },
       }),
+      { deferPublish: true, enlistPluginOutbox: true },
     );
+    // The durable row and the live fan-out must BOTH happen: the effect treats
+    // the activity row as proof the event was emitted, so a deferred publish
+    // that is never invoked loses `issue.comment.created` permanently.
+    expect(mockPublishActivity).toHaveBeenCalled();
   });
 
   it("rides the full comment body + author on the issue.comment.created event (PATCH comment) — BLO-12216", async () => {
@@ -1616,6 +1795,9 @@ describe.sequential("issue comment reopen routes", () => {
       });
 
     expect(res.status).toBe(201);
+    // PEN-5682: a fifth argument — the transaction handle — because the comment
+    // and its effect intents now commit together. The first four are unchanged,
+    // which is the whole point of asserting them here.
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       "11111111-1111-4111-8111-111111111111",
       "Paperclip needs a disposition before this issue can continue.",
@@ -1627,6 +1809,7 @@ describe.sequential("issue comment reopen routes", () => {
         idempotencyKey: null,
         sourceTrust: null,
       },
+      mockTx,
     );
   });
 
@@ -3110,7 +3293,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
       expect.any(String),
@@ -3175,7 +3358,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -3235,7 +3418,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -3293,7 +3476,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -3352,7 +3535,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -3427,7 +3610,7 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body });
 
       expect(res.status).toBe(201);
-      expect(mockDb.transaction).not.toHaveBeenCalled();
+      expect(insertedTableNames()).not.toContain("issue_execution_decisions");
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
@@ -4045,7 +4228,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
       expect.any(String),
@@ -4110,7 +4293,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -4170,7 +4353,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
@@ -4228,7 +4411,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -4287,7 +4470,7 @@ describe.sequential("issue comment reopen routes", () => {
       .send({ body: reviewBody });
 
     expect(res.status).toBe(201);
-    expect(mockDb.transaction).not.toHaveBeenCalled();
+    expect(insertedTableNames()).not.toContain("issue_execution_decisions");
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
@@ -4362,7 +4545,7 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body });
 
       expect(res.status).toBe(201);
-      expect(mockDb.transaction).not.toHaveBeenCalled();
+      expect(insertedTableNames()).not.toContain("issue_execution_decisions");
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
