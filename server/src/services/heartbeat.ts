@@ -28323,14 +28323,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     incumbentWakeClasses: ReadonlySet<HeartbeatWakeClass>,
   ) {
     const now = new Date();
-    const arrivalWakeReason = readNonEmptyString(parseObject(run.contextSnapshot).wakeReason);
+    const arrivalSnapshot = parseObject(run.contextSnapshot);
+    const arrivalWakeReason = readNonEmptyString(arrivalSnapshot.wakeReason);
     const incumbentDescription =
       incumbentWakeClasses.size > 0 ? [...incumbentWakeClasses].sort().join(", ") : "unclassified";
+    // PEN-6575. Two defects in the string this replaces, both aimed at the one
+    // population the deferral arm does not reach.
+    //
+    // (1) It asserted that the arriving wake had no need of a dispatch of its
+    //     own — DELIBERATELY PARAPHRASED, not quoted, so the retired literal
+    //     survives nowhere in this file and the test below can assert its
+    //     absence over the whole function without matching this comment.
+    //     Reaching this function establishes that a sibling is dispatched and
+    //     NOTHING about whether that sibling carries this wake's event. Measured
+    //     2026-11-13 over a 24h77 window: of 112 cancels, 26 were non-github
+    //     arrivals, and all 10 `issue_commented` ones were created AFTER the
+    //     incumbent had already started — so the incumbent's context was
+    //     assembled before the comment existed and provably cannot carry it.
+    //
+    // (2) Its tail named the github-arrival branch unconditionally, so a
+    //     non-github arrival — which can NEVER satisfy that arm, on either
+    //     side — was pointed at a remedy it fails in both positions. It is now
+    //     computed, and says which branch THIS row missed.
+    //
+    // Reaching here means `contextCarriesGithubWake(arrival) && !incumbent.has("github_webhook")`
+    // was false, so exactly one of these two branches holds and they are exhaustive.
+    const deferralMiss = contextCarriesGithubWake(arrivalSnapshot)
+      ? "the incumbent already carries a github wake, so there is no cross-class delivery to protect"
+      : "it defers only a GITHUB arrival against a non-github incumbent, and this arrival is "
+        + "issue-local — PEN-6575 owns the uncovered population";
     const reason =
-      "Cancelled because a sibling run is already dispatched for this issue and this wake does not "
-      + `require its own dispatch (arrival ${arrivalWakeReason ?? "unclassified"}, in flight `
-      + `${incumbentDescription}). A github wake arriving against a non-github incumbent is `
-      + "deferred instead — see the duplicate_dispatch_cross_reason_deferred refusal arm.";
+      "Cancelled because a sibling run is already dispatched for this issue "
+      + `(arrival ${arrivalWakeReason ?? "unclassified"}, in flight ${incumbentDescription}). `
+      + "That is the ground established — NOT that the surviving run carries this wake's event. "
+      + `The duplicate_dispatch_cross_reason_deferred arm did not apply: ${deferralMiss}.`;
     // BLO-20396: gate on status='queued'. Overlapping dispatch passes used to
     // each report cancelling the same row (the by-id write always "succeeds"),
     // and could stomp a row a concurrent pass had already claimed to `running`.
