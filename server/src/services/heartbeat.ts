@@ -35076,9 +35076,103 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ].join("\n");
     }
 
+    /**
+     * PEN-6556: carry the park onto a carrier this pass did NOT create.
+     *
+     * `findOpenParkRecoveryIssue` matches on `originKind` + `originId` and not on
+     * `originFingerprint`, so the row it returns is frequently the MONITOR half's carrier
+     * for the same source -- whose description is `monitorRecoveryComment(...)` and never
+     * mentions the park. Reusing it is right (two rows for one source is worse than one
+     * carrying both obligations) but reusing it WITHOUT writing the park down discharges an
+     * obligation that nothing carries: this row's own defect, one layer up.
+     *
+     * Written as a system comment, so the unique index that makes it re-drivable is
+     * `issue_comments_issue_system_idempotency_idx` on `(issueId, idempotencyKey)`. The key
+     * is scoped to the exact park being discharged, so a pass that carried the body and then
+     * failed to stamp re-runs into `onConflictDoNothing` instead of a duplicate -- and still
+     * returns true, because the body IS on the carrier.
+     */
+    async function carryParkOntoExistingCarrier(input: {
+      companyId: string;
+      carrierId: string;
+      sourceId: string;
+      parkedAtIso: string;
+      body: string;
+    }): Promise<boolean> {
+      try {
+        await db
+          .insert(issueComments)
+          .values({
+            companyId: input.companyId,
+            issueId: input.carrierId,
+            idempotencyKey: `issue-park-recovery:${input.sourceId}:${input.parkedAtIso}`,
+            body: input.body,
+          })
+          .onConflictDoNothing();
+        return true;
+      } catch (err) {
+        // Not carried => the caller must NOT stamp. The obligation stays owed and the next
+        // pass selects it again, which is the whole point of emit-before-stamp.
+        logger.warn(
+          { err, issueId: input.sourceId, carrierId: input.carrierId },
+          "destroyed-park handoff could not write the park onto the reused carrier (not stamping; will retry)",
+        );
+        return false;
+      }
+    }
+
+    /**
+     * PEN-6556: the monitor half's `enqueueRecoveryWakeOrComment` is declared INSIDE
+     * `performIssueMonitorRecovery` and closes over that recovery's context, so it is not
+     * reachable from this pass. This is the same contract at this pass's scope: a 4xx is the
+     * owner's seat declining the wake, which must not fail a handoff whose durable artifact
+     * has already landed; a 5xx is not this tick's to absorb.
+     *
+     * Keyed on the exact park, so one destroyed park yields at most one wake however many
+     * times this pass re-runs, and whether the carrier was created or reused.
+     */
+    async function enqueueParkRecoveryWake(input: {
+      agentId: string;
+      carrierId: string;
+      sourceId: string;
+      parkedAtIso: string;
+    }): Promise<"queued" | "suppressed"> {
+      try {
+        await enqueueWakeup(input.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_park_recovery_issue",
+          idempotencyKey: `issue-park-recovery-issue:${input.sourceId}:${input.parkedAtIso}`,
+          payload: withRecoveryModelProfileHint(
+            { issueId: input.carrierId, sourceIssueId: input.sourceId },
+            "status_only",
+          ),
+          contextSnapshot: withRecoveryModelProfileHint({
+            issueId: input.carrierId,
+            sourceIssueId: input.sourceId,
+            source: "issue.park.recovery_issue",
+            wakeReason: "issue_park_recovery_issue",
+          }, "status_only"),
+        });
+        return "queued";
+      } catch (err) {
+        if (!(err instanceof HttpError) || err.status < 400 || err.status >= 500) throw err;
+        logger.warn(
+          { err, issueId: input.sourceId, carrierId: input.carrierId, agentId: input.agentId },
+          "destroyed-park recovery wake was declined by the owner's seat (carrier still landed)",
+        );
+        return "suppressed";
+      }
+    }
+
     let scanned = 0;
     let recovered = 0;
     let skipped = 0;
+    // PEN-6556: the carrier is the artifact; the wake is what makes it ARRIVE. Counted
+    // separately because a suppressed wake still leaves a sound handoff, while a pass that
+    // queued none on a non-zero `recovered` means every owner was declined.
+    let wakeQueued = 0;
+    let wakeSuppressed = 0;
     // Split out of `skipped` because the cause is different and actionable: these rows keep
     // their park, so the obligation is still owed and will be selected again as soon as
     // somebody owns it. Folding it into `skipped` would hide the one outcome with nobody
@@ -35191,6 +35285,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (opts?.beforeRecover) await opts.beforeRecover();
 
           let carrier = await findOpenParkRecoveryIssue(candidate);
+          const reusedCarrier = Boolean(carrier);
           if (!carrier) {
             carrier = await issuesSvc.create(candidate.companyId, {
               // Name the act, not the subsystem. This row is frequently the only thing left
@@ -35214,6 +35309,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // Emit first, stamp second. A crash in between re-emits next tick and the reuse
           // lookup above dedupes it; the reverse order marks an obligation discharged that
           // nothing carried, which is this row's own defect one layer up.
+          //
+          // PEN-6556: ordering alone was NOT enough, because the branch decided whether
+          // anything was emitted at all. On the create branch the description IS
+          // `parkRecoveryBody`; on the reuse branch the carrier is usually the monitor
+          // half's and says nothing about this park, so the body has to reach it BEFORE the
+          // stamp, and the stamp has to be skipped when it did not.
+          if (reusedCarrier) {
+            const carried = await carryParkOntoExistingCarrier({
+              companyId: candidate.companyId,
+              carrierId: carrier.id,
+              sourceId: candidate.id,
+              parkedAtIso,
+              body: parkRecoveryBody(candidate),
+            });
+            if (!carried) {
+              failed += 1;
+              continue;
+            }
+          }
+
+          // A `high` carrier for an obligation that is ALREADY past its deadline must not
+          // wait for the owner's next unrelated run -- and when the owner is the
+          // `parkedByAgentId` fallback, that wait has no bound at all. The monitor half
+          // wakes on both its create and reuse paths; this now matches it.
+          const wakeOutcome = await enqueueParkRecoveryWake({
+            agentId: ownerAgentId,
+            carrierId: carrier.id,
+            sourceId: candidate.id,
+            parkedAtIso,
+          });
+          if (wakeOutcome === "queued") wakeQueued += 1;
+          else wakeSuppressed += 1;
+
           const stamped = await stampParkHandoff({ id: candidate.id, parkedAtIso });
           if (!stamped) {
             // The carrier landed; only the bookkeeping lost a race. Harmless and
@@ -35271,7 +35399,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
-    return { scanned, recovered, skipped, unowned, failed, pages, oldestParkedUntil };
+    return { scanned, recovered, skipped, unowned, failed, pages, oldestParkedUntil, wakeQueued, wakeSuppressed };
   }
 
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {
