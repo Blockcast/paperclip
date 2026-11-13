@@ -72,6 +72,18 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * line nobody reads, and no other trace. `refused` and `declined` are that
  * missing cell.
  *
+ * ⛔ **PEN-6121 (2026-11-13) — `refused` is an UPPER BOUND, not a count of
+ * dropped wakes, and `wake_cause` is what splits it.** `issues.requestWakeup`
+ * creates the run inside `heartbeat.wakeup()` and only then writes its
+ * `issue.assignment_wakeup_requested` activity row, so a throw after the first
+ * step rejects the call with the run already alive. Every coded gate refuses
+ * BEFORE that point and attaches `details.code`; an UNCODED rejection
+ * therefore comes from downstream and establishes nothing. Measured once on
+ * PEN-5911: the run existed, started and succeeded while this table read
+ * `refused`. The ladder now records a distinct `wake_detail` for that case and
+ * the thread stops asserting the negative — see `wakeDetailFor` and
+ * `wakeSentence` in `escalation.ts`, and migration `014`.
+ *
  * **They are two tokens because the host drops a wake in two different ways,
  * and only one of them throws.** `requestWakeup` rejects on a terminal status,
  * an unresolved blocker or a budget block — that is `refused`. But it also

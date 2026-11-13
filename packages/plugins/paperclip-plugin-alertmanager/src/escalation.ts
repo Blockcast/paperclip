@@ -45,6 +45,32 @@ const MAX_WAKE_DELIVERY_RETRIES = 2;
 interface WakeAttempt {
   outcome: WakeOutcome;
   cause: string | null;
+  /**
+   * PEN-6121 — whether the HOST's own answer was read, as opposed to the call
+   * failing before one arrived.
+   *
+   * `true` for every resolved call (`enqueued`, `declined`) and for a rejection
+   * that carried `PluginRpcError.data.code`, i.e. one of the seven coded gates.
+   * `false` ONLY for a rejection with no code, which is NOT a refusal and must
+   * not be reported as one.
+   *
+   * ⛔ The distinction is load-bearing and was measured, not supposed. The host
+   * handler's order is `heartbeat.wakeup()` → `logPluginActivity(...)` →
+   * return, so a throw anywhere after the first step leaves the RUN CREATED
+   * while this call rejects. Every one of the seven coded gates refuses BEFORE
+   * the run is created, so a coded rejection does prove no run exists — and an
+   * uncoded one proves nothing at all.
+   *
+   * Measured on PEN-5911 2026-11-13T05:36Z: run `651a67f2` was created at
+   * 05:36:25.568Z carrying `contextSnapshot.source = "alertmanager-escalation"`
+   * (one producer in the tree: `requestWakeupBestEffort` below), the ladder
+   * recorded `refused` with a null cause at 05:37:03Z, the comment asserted
+   * "no run was queued for Devops" at 05:36:58Z, and that run started at
+   * 05:37:59Z and ran to success. The `issue.assignment_wakeup_requested`
+   * activity row — written AFTER the run in the same host handler — is absent
+   * for that attempt and present for the retry, which is the signature.
+   */
+  hostAnswered: boolean;
 }
 const COVERS_TABLE = "alert_escalation_covers";
 const MEMBERS_TABLE = "alert_escalation_cover_members";
@@ -1620,7 +1646,7 @@ async function advanceIssueLadder(
     disposition: "unattended_rung",
     alertLiveness: liveness.state,
     wakeOutcome: wake,
-    wakeDetail: wakeDetailFor(wake),
+    wakeDetail: wakeDetailFor(wake, attemptedWake?.hostAnswered ?? true),
     wakeCause: attemptedWake?.cause ?? null,
     escalationAttempt: claimedAttempt,
     subjectAgentId: notified,
@@ -1696,7 +1722,13 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
     case "enqueued":
       return `queued a run for current owner ${name}.`;
     case "refused":
-      return `**no run was queued for ${name}** — the host refused the wake${cause}.${retryClause}`;
+      // PEN-6121 — an uncoded rejection cannot assert the negative. Leads with
+      // the uncertainty for the same reason the other arms lead with the
+      // outcome: the one thing a skimming reader must not take away is a
+      // confident claim the ladder cannot support.
+      return wake.hostAnswered
+        ? `**no run was queued for ${name}** — the host refused the wake${cause}.${retryClause}`
+        : `**a run for ${name} could NOT be confirmed** — the wake call failed before the host's answer was read, so the wake may or may not have reached the queue.${retryClause}`;
     case "declined":
       return `**no run was queued for ${name}** — the host accepted the request and enqueued nothing${cause}.${retryClause}`;
     default:
@@ -1726,10 +1758,17 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
  */
 function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: number): string {
   const cause = wake.cause ? ` (${wake.cause})` : "";
+  const spent = `Retry ${retryNumber} of ${MAX_WAKE_DELIVERY_RETRIES} failed. The retry budget for this rung is spent; the ladder moves on at the next sweep.`;
+  // PEN-6121 — same correction as `wakeSentence`: with no cause from the host
+  // the ladder does not know that nothing was queued, and this sentence is the
+  // one a reader lands on when the rung is about to be abandoned.
+  if (wake.outcome === "refused" && !wake.hostAnswered) {
+    return `**A run for ${name} could NOT be confirmed** — the wake call failed before the host's answer was read, so the wake may or may not have reached the queue. ${spent}`;
+  }
   const how = wake.outcome === "refused"
     ? `the host refused the wake${cause}`
     : `the host accepted the request and enqueued nothing${cause}`;
-  return `**No run was queued for ${name}** — ${how}. Retry ${retryNumber} of ${MAX_WAKE_DELIVERY_RETRIES} failed. The retry budget for this rung is spent; the ladder moves on at the next sweep.`;
+  return `**No run was queued for ${name}** — ${how}. ${spent}`;
 }
 
 /**
@@ -1750,9 +1789,12 @@ function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: 
  * carrying the discriminator. The cause now has its own column; these sentences
  * point at it rather than restating a disjunction.
  */
-function wakeDetailFor(wake: WakeOutcome): string | null {
+function wakeDetailFor(wake: WakeOutcome, hostAnswered: boolean): string | null {
   switch (wake) {
     case "refused":
+      if (!hostAnswered) {
+        return "issues.requestWakeup threw WITHOUT a cause: the host named no gate, so this is NOT established as a refusal. All seven coded gates (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive, agent.not_invokable) throw with details.code attached and refuse BEFORE a run is created; an uncoded rejection comes from the host handler or the RPC transport downstream of heartbeat.wakeup(), where the run may already exist. Measured once (PEN-5911, 2026-11-13T05:36Z): the run existed and ran to success while this column read refused. To settle one of these, look for a run whose contextSnapshot.source is alertmanager-escalation created inside the sweep window; the issue.assignment_wakeup_requested activity row is written after the run, so its ABSENCE does not mean no run.";
+      }
       return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate -- pre-wake in the plugin host (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive) or downstream in enqueueWakeup (budget.blocked, company.inactive, agent.not_invokable). That set GROWS; it is documentation, not a closed list. A null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     case "declined":
       return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run. Read wake_cause for which gate (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral); a null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
@@ -1801,9 +1843,9 @@ async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, co
     if ((result as { queued?: boolean } | null | undefined)?.queued === false) {
       const cause = readWakeCause((result as { undeliveredReason?: unknown } | null | undefined)?.undeliveredReason);
       ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} was declined by the host (queued=false, cause=${cause ?? "unrecorded"})`);
-      return { outcome: "declined", cause };
+      return { outcome: "declined", cause, hostAnswered: true };
     }
-    return { outcome: "enqueued", cause: null };
+    return { outcome: "enqueued", cause: null, hostAnswered: true };
   } catch (err) {
     // PEN-6121 — the cause is lifted off the error BEFORE it is stringified.
     // `String(err)` keeps the message and discards `details`, and the host puts
@@ -1813,7 +1855,14 @@ async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, co
     // plugin log" and the log not containing the discriminator.
     const cause = readWakeCause((err as { data?: { code?: unknown } } | null)?.data?.code);
     ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} failed (cause=${cause ?? "unrecorded"}): ${String(err)}`);
-    return { outcome: "refused", cause };
+    // PEN-6121 — a rejection carrying no `data.code` is NOT evidence that the
+    // wake was refused. None of the seven coded gates can produce one: each
+    // throws an `HttpError` with `details.code`, which `workerHostErrorData`
+    // projects onto `data`. An uncoded rejection therefore comes from
+    // somewhere else in the host handler or from the RPC transport — both of
+    // which sit DOWNSTREAM of `heartbeat.wakeup()`, so the run may already
+    // exist. `hostAnswered: false` keeps the thread from asserting otherwise.
+    return { outcome: "refused", cause, hostAnswered: cause !== null };
   }
 }
 
