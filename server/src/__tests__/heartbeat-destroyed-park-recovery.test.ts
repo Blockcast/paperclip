@@ -18,7 +18,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, issues } from "@paperclipai/db";
+import { agents, companies, createDb, issueComments, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -176,6 +176,18 @@ describeEmbeddedPostgres("heartbeat reconcileDestroyedIssueParkRecoveries", () =
       })
       .from(issues)
       .where(and(eq(issues.originId, issueId), eq(issues.originKind, "stranded_issue_recovery")));
+  }
+
+  /**
+   * PEN-6556: what a REUSED carrier says about the park. The create branch puts
+   * `parkRecoveryBody` in the description; the reuse branch has to put it somewhere the
+   * owner will read, and the carrier it reuses is usually the monitor half's.
+   */
+  function readCarrierComments(carrierId: string) {
+    return db
+      .select({ body: issueComments.body, idempotencyKey: issueComments.idempotencyKey })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, carrierId));
   }
 
   it("hands a destroyed park to a carrier that quotes the park reason verbatim", async () => {
@@ -509,8 +521,68 @@ describeEmbeddedPostgres("heartbeat reconcileDestroyedIssueParkRecoveries", () =
     expect(result.recovered).toBe(1);
     // Reused. Two rows pointing at the same work is worse than one row carrying both
     // obligations — PEN-4729 is exactly that source.
-    expect(await readCarriers(issueId)).toHaveLength(1);
+    const carriers = await readCarriers(issueId);
+    expect(carriers).toHaveLength(1);
     expect((await readPark(issueId)).parkedRecoveryEmittedAt).not.toBeNull();
+
+    // The assertions above pass on the bug this case exists to catch, which is why they
+    // are not the whole test. The carrier that got reused is the MONITOR half's: its
+    // description is `monitorRecoveryComment(...)` and says nothing about the park, and
+    // `findOpenParkRecoveryIssue` matches on `originKind` + `originId` WITHOUT
+    // `originFingerprint`, so this is the expected path rather than an edge — `index.ts`
+    // runs the monitor half first. Stamping here without writing the park down discharges
+    // an obligation that nothing carries, which is this row's own defect one layer up.
+    const reused = carriers[0]!;
+    expect(reused.originFingerprint).toBe("issue_monitor:cancelled");
+    expect(reused.description ?? "").not.toContain(PARK_REASON);
+
+    const comments = await readCarrierComments(reused.id);
+    const carried = comments.filter((c) => c.body.includes(PARK_REASON));
+    expect(carried).toHaveLength(1);
+    // Verbatim, for the same reason the create branch quotes it: on PEN-4881 this prose
+    // WAS the obligation.
+    expect(carried[0]!.body).toContain("Park reason, verbatim from the destroyed park");
+    expect(carried[0]!.body).toContain(PARK_REASON);
+  });
+
+  it("does not re-comment on the reused carrier when the pass runs twice", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedCancelledPark(companyId, agentId);
+    const carrierId = randomUUID();
+    await db.insert(issues).values({
+      id: carrierId,
+      companyId,
+      title: "Carry forward the wake cancelled on T-1",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+      parentId: issueId,
+      originKind: "stranded_issue_recovery",
+      originId: issueId,
+      originFingerprint: "issue_monitor:cancelled",
+    });
+
+    await heartbeat.reconcileDestroyedIssueParkRecoveries({ companyId });
+    // The stamp is what stops re-selection, so a second pass is the re-drivability test:
+    // the comment is keyed on the exact park, so it lands once however often this runs.
+    await heartbeat.reconcileDestroyedIssueParkRecoveries({ companyId });
+
+    const comments = await readCarrierComments(carrierId);
+    expect(comments.filter((c) => c.body.includes(PARK_REASON))).toHaveLength(1);
+  });
+
+  it("reports the recovery wake it queued for the carrier's owner", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await seedCancelledPark(companyId, agentId);
+
+    const result = await heartbeat.reconcileDestroyedIssueParkRecoveries({ companyId });
+
+    // A `high` carrier for an obligation ALREADY past its deadline must not wait for the
+    // owner's next unrelated run; when the owner is the `parkedByAgentId` fallback that
+    // wait has no bound. Counted so a pass that recovered rows while waking nobody is
+    // distinguishable from a healthy one.
+    expect(result.recovered).toBe(1);
+    expect(result.wakeQueued + result.wakeSuppressed).toBe(1);
   });
 
   it("does not select a row whose park was stamped for THIS park", async () => {
