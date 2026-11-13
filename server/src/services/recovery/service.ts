@@ -1715,23 +1715,25 @@ function buildNonRetryableEscalationComment(input: {
   );
 }
 
-function buildExecutionReviewParticipantRecoveryComment(latestRun: LatestIssueRun) {
+function buildExecutionReviewParticipantRecoveryComment(latestRun: LatestIssueRun, issueId: string) {
   const failureSummary = summarizeRunFailureForIssueComment(latestRun);
   return (
     "Paperclip retried the pending execution-review participant once, but the review stage still has no completed decision " +
     `or live reviewer run.${failureSummary ?? ""} ` +
     "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
-    "restore the review stage, or record an intentional manual resolution."
+    "restore the review stage, or " +
+    buildManualResolutionGuidance(issueId)
   );
 }
 
-function buildExecutionReviewParticipantUnavailableComment(latestRun: LatestIssueRun) {
+function buildExecutionReviewParticipantUnavailableComment(latestRun: LatestIssueRun, issueId: string) {
   const failureSummary = summarizeRunFailureForIssueComment(latestRun);
   return (
     "Paperclip cannot continue the pending execution-review participant because the participant is not invokable " +
     `and the review stage has no completed decision or live reviewer run.${failureSummary ?? ""} ` +
     "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
-    "restore the review stage, or record an intentional manual resolution."
+    "restore the review stage, or " +
+    buildManualResolutionGuidance(issueId)
   );
 }
 
@@ -6336,7 +6338,8 @@ export function recoveryService(
     const requiredAction = isReviewParticipantRecovery
       ? [
         "- Inspect the latest reviewer run and the pending execution-review stage.",
-        "- Fix the reviewer runtime, restore the source issue to `in_review` with a live participant, or record an intentional manual resolution.",
+        "- Fix the reviewer runtime, restore the source issue to `in_review` with a live participant, or "
+          + buildManualResolutionGuidance(input.issue.id),
         "- When the source issue has a live review path or has been intentionally resolved, mark this recovery issue done.",
       ]
       : [
@@ -10696,7 +10699,7 @@ export function recoveryService(
               issue,
               previousStatus: "in_review",
               latestRun: participantLatestRun,
-              comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
+              comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun, issue.id),
               recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
               recoveryOwnerAgentId: participantAgentId,
               expectedReviewStage: {
@@ -10852,7 +10855,7 @@ export function recoveryService(
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
-            comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun),
+            comment: buildExecutionReviewParticipantUnavailableComment(participantLatestRun, issue.id),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
             expectedReviewStage: {
@@ -10889,7 +10892,7 @@ export function recoveryService(
             issue,
             previousStatus: "in_review",
             latestRun: participantLatestRun,
-            comment: buildExecutionReviewParticipantRecoveryComment(participantLatestRun),
+            comment: buildExecutionReviewParticipantRecoveryComment(participantLatestRun, issue.id),
             recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
             recoveryOwnerAgentId: participantAgentId,
             expectedReviewStage: {
@@ -14423,7 +14426,8 @@ export function recoveryService(
                 "resolve it.")
           : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
             "the action, so a new owner does not get fresh attempts.",
-        "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
+        "- Next action: discharge or cancel this recovery action, or "
+          + buildManualResolutionGuidance(action.sourceIssueId),
       ].join("\n"),
       {},
       { authorType: "system" },

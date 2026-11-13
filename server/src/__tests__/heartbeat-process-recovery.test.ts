@@ -16813,6 +16813,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           cause: "stranded_assigned_issue",
           fingerprint: `source_scoped_recovery:${companyId}:${issueId}:stranded_assigned_issue:${agentId}`,
           evidence: {},
+          // PEN-5714: deliberately the PRE-PEN-5707 bare form. This fixture stands in
+          // for a row written before the route was named, which is what a real
+          // upgraded database contains. Do not "fix" it to call
+          // buildManualResolutionGuidance -- the guard test scopes its sweep to the
+          // emitting services precisely so legacy data like this can stay realistic.
           nextAction:
             "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
           attemptCount: input.existingAction.attemptCount ?? 1,
