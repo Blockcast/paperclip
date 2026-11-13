@@ -547,6 +547,16 @@ export const EXEMPT_SCHEDULED_WORKFLOWS = [
       "way; the ~72% of wall clock this manifest does not model is where cap pressure comes from.",
   },
   {
+    workflow: "docker-mcp-external.yml",
+    reason:
+      "Not a guard. BLO-54798 added a weekly cron only so base-OS security fixes reach a new " +
+      "paperclip-mcp-external digest; nothing is enforced. If the cron stops, the cost is the " +
+      "pre-BLO-54798 status quo (rebuilds only on pushes under packages/mcp-external), and " +
+      "Harbor's per-digest rows keep reporting the unfixed findings, so the gap stays visible. " +
+      "A weekly cadence would also need a >7-day bar, the same reason refresh-shard-manifest.yml " +
+      "is exempt.",
+  },
+  {
     workflow: "merge-queue-orphan-sweeper.yml",
     reason:
       "Not a guard. BLO-41174 backstop that cancels pr.yml merge_group runs orphaned by a queue " +
