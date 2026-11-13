@@ -120,11 +120,50 @@ const REPO_FREE_PROBES: readonly GithubRateLimitProbe[] = [
  * is fine and is part of why it was chosen: a permission refusal still carries
  * the full `x-ratelimit-*` set, costs nothing to parse, and cannot have side
  * effects. `check-runs` is sampled beside it as the hot-shard witness.
+ *
+ * `pulls/:n/requested_reviewers` is here for a different reason: it is the
+ * only probe that is also a route the local hold actually HOLDS, which is what
+ * makes a victim count computable at all (PEN-6619). The other three are
+ * witnesses to a shard; this one is a witness to the mechanism.
+ *
+ * Until it was added, the sampled route set and the set of routes appearing in
+ * `paperclip_github_api_held_total` were DISJOINT -- measured 2026-11-13,
+ * sampled {rate_limit, repos/actions/permissions, repos/commits/check-runs}
+ * against 12 held routes, intersection empty. So the question "was this call
+ * held while its OWN shard had headroom?" had no route it could be asked
+ * about: the hold counter named routes nothing sampled, and the sampler named
+ * routes nothing held. Note that the near-miss is close enough to trap a
+ * reader -- sampled `repos/commits/check-runs` and held `repos/check-runs` are
+ * different routes under `classifyGithubApiRoute`, differing by one path
+ * segment.
+ *
+ * Why THIS held route and not the higher-volume ones. Measured first-party
+ * 2026-11-13T07:43-07:47Z, three interleaved windows against both anchors:
+ * `pulls/:n/requested_reviewers` reports anchor A's `reset` (1794556530) and
+ * decrements monotonically with it, while `pulls/:n/reviews`, `pulls/:n`,
+ * `pulls/:n/files`, `issues/:n/comments` and the rest of the held set all
+ * report anchor B's (1794557018). It is therefore the one held route observed
+ * on the shard with headroom -- so it is both the only one that can witness
+ * the defect FIRING rather than merely its precondition, and the one whose
+ * probe spends a budget nothing else can reach (shard A sat at 8,758 of 9,750
+ * while shard B was at 417 and draining). Adding a hot-shard held route such
+ * as `pulls/:n/reviews` would cost the exhausted counter instead, which is why
+ * only one held route is sampled rather than the top of the volume table.
+ *
+ * That observation is ONE INSTANT, and this module's doc above records the
+ * route-to-shard mapping moving within about seven hours. That is not a
+ * caveat on this probe, it is the reason the probe is the remedy: a sampled
+ * route reports its own `remaining` at the moment it is read, so the join
+ * never has to assume the mapping held.
  */
 function repoProbes(repoFullName: string): readonly GithubRateLimitProbe[] {
   return [
     { route: "repos/actions/permissions", path: `/repos/${repoFullName}/actions/permissions` },
     { route: "repos/commits/check-runs", path: `/repos/${repoFullName}/commits/HEAD/check-runs?per_page=1` },
+    {
+      route: "repos/pulls/requested_reviewers",
+      path: `/repos/${repoFullName}/pulls/1/requested_reviewers`,
+    },
   ];
 }
 
@@ -149,7 +188,7 @@ export const GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV = "PAPERCLIP_GITHUB_RATE_LIMIT_SA
  */
 export const DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO = "Blockcast/paperclip";
 
-/** Default cadence. 5 min × 3 probes is ~36 calls/h against a ~19,300/h installation budget. */
+/** Default cadence. 5 min × 4 probes is ~48 calls/h against a ~19,300/h installation budget. */
 export const DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_INTERVAL_MS = 5 * 60_000;
 
 const PROBE_DEADLINE_MS = 10_000;
