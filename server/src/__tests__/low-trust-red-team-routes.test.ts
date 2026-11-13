@@ -32,6 +32,7 @@ import {
   issues,
   issueThreadInteractions,
   issueWorkProducts,
+  pluginEventOutbox,
   principalPermissionGrants,
   projects,
   workspaceOperations,
@@ -111,6 +112,21 @@ async function deleteCompaniesAfterSideEffectsDrain(db: Db) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await deleteDocuments(db);
     await db.delete(workspaceOperations);
+    // PEN-5682: a plain unkeyed comment now rides the effect outbox, and its
+    // `comment_activity` effect writes the activity row with
+    // `{ deferPublish: true, enlistPluginOutbox: true }` — so the request
+    // leaves a durable `plugin_event_outbox` row behind where the inline path
+    // published live and left none. That row holds a non-cascading
+    // `company_id` reference, so `delete from "companies"` fails 23503 and the
+    // teardown takes every test in the file down with it. Draining it here is
+    // the whole fix: nothing about the suite's subject changed, and the
+    // `issue_comment_effects` rows need no line of their own because they
+    // cascade from the `issueComments` delete above.
+    //
+    // ⚠ NOT inside the catch/retry: this is a deterministic consequence of the
+    // request having succeeded, not a drain that settles on its own, so
+    // retrying without deleting would spin all ten attempts and still throw.
+    await db.delete(pluginEventOutbox);
     try {
       await db.delete(companies);
       return;

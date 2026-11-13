@@ -32,14 +32,92 @@ const mockIssueReferenceService = vi.hoisted(() => ({
   syncDocument: vi.fn(async () => undefined),
   syncIssue: vi.fn(async () => undefined),
 }));
-const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+// PEN-5682: the effect path calls `logActivity(tx, payload, { deferPublish:
+// true, enlistPluginOutbox: true })` and then INVOKES what it returns —
+// durable delivery is enlisted in the transaction, the live fan-out happens
+// after commit. A mock resolving `undefined` makes `publish()` a TypeError, so
+// the whole effect chain dies before the wake effects that follow it.
+const mockPublishActivity = vi.hoisted(() => vi.fn(() => undefined));
+const mockLogActivity = vi.hoisted(() => vi.fn(async () => mockPublishActivity));
 const mockGetActiveCompanyMembership = vi.hoisted(() => vi.fn(async () => ({ id: "membership-1" })));
+// PEN-5682: an in-memory stand-in for the `issue_comment_effects` ledger, so
+// the route's own `executeKeyedCommentEffect` actually RUNS in this harness.
+// An eligible UNKEYED comment now commits its effect intents with the insert
+// instead of running its side effects inline, so with `processCommentEffects`
+// stubbed to resolve `true` the intents were enqueued and nothing ever drained
+// them — and every behavioural assertion in this file (the assignee was woken,
+// the mentioned agent was woken) failed with `Number of calls: 0`. The
+// behaviour had not regressed; the harness stopped one layer short of it.
+// Mirrors `issue-comment-reopen-routes.test.ts`, which proved the shape.
+const commentEffectLedger = vi.hoisted(() => new Map<string, Array<Record<string, unknown>>>());
+const ledgerRows = vi.hoisted(() => (commentId: string) => commentEffectLedger.get(commentId) ?? []);
 const mockCommentEffects = vi.hoisted(() => ({
-  enqueueCommentEffects: vi.fn(async () => undefined),
-  getEffectResult: vi.fn(async () => null),
-  hasCommentEffects: vi.fn(async () => true),
-  processCommentEffects: vi.fn(async () => true),
+  enqueueCommentEffects: vi.fn(
+    async (
+      _handle: unknown,
+      input: {
+        companyId: string;
+        issueId: string;
+        commentId: string;
+        effects: ReadonlyArray<{ effectKind: string; effectKey: string; payload: unknown }>;
+      },
+    ) => {
+      const rows = commentEffectLedger.get(input.commentId) ?? [];
+      for (const effect of input.effects) {
+        // The real table conflicts on `(comment_id, effect_key)`; a replay must
+        // not duplicate an intent.
+        if (rows.some((row) => row.effectKey === effect.effectKey)) continue;
+        rows.push({
+          id: `effect-${input.commentId}-${effect.effectKey}`,
+          companyId: input.companyId,
+          issueId: input.issueId,
+          commentId: input.commentId,
+          effectKind: effect.effectKind,
+          effectKey: effect.effectKey,
+          payload: effect.payload,
+          status: "queued",
+        });
+      }
+      commentEffectLedger.set(input.commentId, rows);
+    },
+  ),
+  getEffectResult: vi.fn(async (_db: unknown, commentId: string, effectKey: string) =>
+    ledgerRows(commentId).find((row) => row.effectKey === effectKey) ?? null,
+  ),
+  hasCommentEffects: vi.fn(async (_db: unknown, commentId: string) => ledgerRows(commentId).length > 0),
+  // Invokes the executor the ROUTE passed in, so what runs here is the real
+  // `executeKeyedCommentEffect` rather than a re-implementation of it.
+  processCommentEffects: vi.fn(
+    async (_db: unknown, commentId: string, execute: (row: unknown) => Promise<unknown>) => {
+      for (const row of ledgerRows(commentId)) {
+        if (row.status === "processed") continue;
+        row.result = await execute(row);
+        row.status = "processed";
+      }
+      return true;
+    },
+  ),
 }));
+// PEN-5682: `select()` has to be TABLE-AWARE, and that is not a tidiness
+// preference. `executeKeyedCommentEffect` loads the comment with
+// `select().from(issueComments).where(eq(id)).limit(1)`, and
+// `findWakeIdempotencyReceipt` uses the IDENTICAL `.limit(1)` shape on
+// `agent_wakeup_requests`. A blanket non-empty return therefore makes every
+// wake effect find a receipt and report `wakeSkipped: "already_accepted"` —
+// silently deleting the very behaviour this file is about, while every status
+// assertion still passes. Keyed on the table, each read answers for itself and
+// an unregistered table still answers `[]`.
+const drizzleTableName = vi.hoisted(() => (table: unknown): string => {
+  const named = table as Record<symbol, unknown> | null | undefined;
+  const name = named?.[Symbol.for("drizzle:Name")];
+  return typeof name === "string" ? name : "";
+});
+const selectRowsByTable = vi.hoisted(() => new Map<string, () => Promise<unknown[]>>());
+const lastSelectedTable = vi.hoisted(() => ({ name: "" }));
+const selectedRows = vi.hoisted(() => async (): Promise<unknown[]> => {
+  const source = selectRowsByTable.get(lastSelectedTable.name);
+  return source ? await source() : [];
+});
 
 const mockHeartbeatService = vi.hoisted(() => ({
   wakeup: vi.fn(async () => undefined),
@@ -201,6 +279,28 @@ async function createApp(actor: Record<string, unknown> = {
   });
   const db = {
     transaction: vi.fn(async (callback: (tx: unknown) => Promise<unknown>) => callback({})),
+    // PEN-5682: see `selectRowsByTable`. Safe to stash the table on the chain
+    // rather than thread it: `select().from().where().limit()` is built and
+    // consumed with no await in between.
+    select: vi.fn(() => ({
+      from: vi.fn((table: unknown) => {
+        lastSelectedTable.name = drizzleTableName(table);
+        const result = {
+          where: vi.fn(() => result),
+          limit: vi.fn(() => ({
+            then: (
+              onFulfilled: (rows: unknown[]) => unknown,
+              onRejected?: (reason: unknown) => unknown,
+            ) => selectedRows().then(onFulfilled, onRejected),
+          })),
+          then: (
+            onFulfilled: (rows: unknown[]) => unknown,
+            onRejected?: (reason: unknown) => unknown,
+          ) => selectedRows().then(onFulfilled, onRejected),
+        };
+        return result;
+      }),
+    })),
   };
   app.use("/api", issueRoutes(db as any, {} as any));
   app.use(errorHandler);
@@ -254,10 +354,33 @@ describe("issue update comment wakeups", () => {
     mockIssueReferenceService.syncComment.mockResolvedValue(undefined);
     mockIssueReferenceService.syncDocument.mockResolvedValue(undefined);
     mockIssueReferenceService.syncIssue.mockResolvedValue(undefined);
-    mockCommentEffects.enqueueCommentEffects.mockResolvedValue(undefined);
-    mockCommentEffects.getEffectResult.mockResolvedValue(null);
-    mockCommentEffects.hasCommentEffects.mockResolvedValue(true);
-    mockCommentEffects.processCommentEffects.mockResolvedValue(true);
+    // PEN-5682: `vi.clearAllMocks()` above clears calls but keeps
+    // implementations, so the ledger-backed bodies declared with the mock
+    // survive and must NOT be replaced here with constant resolutions — doing
+    // that is what left the intents undrained in the first place. Only the
+    // per-test state is reset.
+    commentEffectLedger.clear();
+    mockPublishActivity.mockReset();
+    // Still a publish function after the reset: see `mockPublishActivity`.
+    mockLogActivity.mockResolvedValue(mockPublishActivity as never);
+    // The effect executor re-reads the comment from the database rather than
+    // trusting the payload, so the one table that must answer is
+    // `issue_comments`. Resolved from whatever `addComment` returned for this
+    // test, so a test that customises the persisted row needs no extra wiring —
+    // and, critically, `agent_wakeup_requests` is NOT registered, so
+    // `findWakeIdempotencyReceipt` still answers `[]` and the wake really runs.
+    selectRowsByTable.clear();
+    lastSelectedTable.name = "";
+    selectRowsByTable.set("issue_comments", async () => {
+      const results = mockIssueService.addComment.mock.results;
+      for (let i = results.length - 1; i >= 0; i -= 1) {
+        const settled = results[i];
+        if (settled.type !== "return") continue;
+        const value = await settled.value;
+        if (value) return [value];
+      }
+      return [];
+    });
   });
 
   it("includes the new comment in assignment wakes from issue updates", async () => {

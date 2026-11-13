@@ -448,4 +448,55 @@ describe("issue comment unkeyed outbox routing", () => {
     expect(mockIssueService.addComment.mock.calls[0]).toHaveLength(4);
   });
 
+  // PEN-6645 item 2. `!interruptRequested` is the ONE remaining conjunct that
+  // is INDEPENDENTLY reachable — i.e. the only one a request can falsify while
+  // leaving all six others true, so the only one a test can pin without the
+  // pin being satisfied by a sibling term.
+  //
+  // The reachability of the other four was settled by reading the route, and
+  // the finding is recorded here because a conjunct nobody can isolate is a
+  // result, not a gap:
+  //
+  //  - `!resumeRequested` and `!effectiveMoveToTodoRequested` CO-FIRE on the
+  //    case the route's own comment names (`resume: true` on an already-`todo`
+  //    issue): `explicitMoveToTodoRequested = effectiveReopenRequested ||
+  //    effectiveResumeRequested`, so an effective resume makes BOTH false.
+  //    They separate only for a `commentOnlyGrantedPeerAgent`, where
+  //    `effectiveResumeRequested` is forced false while `resumeRequested` —
+  //    the term the predicate actually reads — stays true. That is a real
+  //    independent case and it is NOT pinned here; it needs the comment-only
+  //    peer-grant fixture, which this suite does not build.
+  //  - `!scheduledRetrySupersededByComment` is a COMPENSATING term, not an
+  //    independently reachable one: it is assigned only inside the
+  //    `effectiveMoveToTodoRequested && (isClosed || isBlocked || shouldResume)`
+  //    block, which unconditionally runs `svc.update(id, { status: "todo" })`.
+  //    So whenever it is true, `effectiveMoveToTodoRequested` is true AND
+  //    `currentIssue.status === issue.status` is false. No request can falsify
+  //    it alone, and a test claiming to pin it would really be pinning one of
+  //    those two.
+  //  - `currentIssue.status === issue.status` is the re-read concurrency guard
+  //    and moves only through that same block, so it inherits the same
+  //    entanglement.
+  it("keeps an INTERRUPTING comment on the inline path", async () => {
+    // `interruptedRunId` rides the activity row and every wake payload, and
+    // `buildKeyedCommentEffectIntents` carries neither — so the interrupt is
+    // excluded rather than silently losing the field. Board-only by the route's
+    // own 403, which is why this uses the default board actor.
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    const { app } = await createApp();
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/comments`)
+      .send({ body: "stop what you are doing", interrupt: true });
+
+    expect(res.status).toBe(201);
+    // No status moved and nothing was reopened — the ONLY conjunct this
+    // request falsifies is `!interruptRequested`, which is what makes the
+    // assertion below a pin on that term rather than on a neighbour.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockCommentEffects.enqueueCommentEffects).not.toHaveBeenCalled();
+    // Inserted on the default handle: four arguments, no transaction.
+    expect(mockIssueService.addComment.mock.calls[0]).toHaveLength(4);
+  });
+
 });

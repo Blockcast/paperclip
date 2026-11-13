@@ -457,7 +457,26 @@ function createRunContextDb(
   const tx = {
     execute: vi.fn(async () => undefined),
     select,
-    insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+    // PEN-5682: `tx.insert().values()` now has TWO shapes on this route. Every
+    // pre-existing caller awaits the builder directly; the comment route's
+    // `enqueueCommentEffects` ends in `.onConflictDoNothing({ target })`,
+    // because the effect ledger conflicts on `(comment_id, effect_key)` so a
+    // replay cannot duplicate an intent. A plain `async () => undefined`
+    // satisfies only the first shape, so an eligible unkeyed comment threw
+    // `values(...).onConflictDoNothing is not a function` INSIDE the
+    // transaction and every ordinary-comment test in this file answered 500 —
+    // a harness gap wearing the costume of an authorization regression.
+    // Returning a thenable that carries both keeps one mock serving both
+    // call shapes, and keeps `await`ing it working unchanged.
+    insert: vi.fn(() => ({
+      values: vi.fn(() => {
+        const result = Promise.resolve(undefined) as Promise<undefined> & {
+          onConflictDoNothing: () => Promise<undefined>;
+        };
+        result.onConflictDoNothing = () => Promise.resolve(undefined);
+        return result;
+      }),
+    })),
   };
   // BLO-23197: the status-only guard stamps
   // `heartbeat_runs.status_only_document_write_refused_at` before returning its
@@ -1230,6 +1249,11 @@ describe("agent issue mutation checkout ownership", () => {
       "I can respond here.",
       expect.any(Object),
       expect.any(Object),
+      // PEN-5682: a fifth argument — the transaction handle — because an
+      // eligible unkeyed comment and its effect intents now commit together.
+      // `toHaveBeenCalledWith` is exact on arity, so it has to be named; the
+      // first four are unchanged, which is the part this assertion is for.
+      expect.objectContaining({ insert: expect.any(Function) }),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
@@ -1261,6 +1285,11 @@ describe("agent issue mutation checkout ownership", () => {
       "Handoff: root cause is X, next step is Y.",
       expect.any(Object),
       expect.any(Object),
+      // PEN-5682: a fifth argument — the transaction handle — because an
+      // eligible unkeyed comment and its effect intents now commit together.
+      // `toHaveBeenCalledWith` is exact on arity, so it has to be named; the
+      // first four are unchanged, which is the part this assertion is for.
+      expect.objectContaining({ insert: expect.any(Function) }),
     );
     // The comment must not drag the blocked issue back to todo.
     expect(mockIssueService.update).not.toHaveBeenCalled();
@@ -2727,6 +2756,11 @@ describe("agent issue mutation checkout ownership", () => {
         "I cannot restore this; escalating.",
         expect.any(Object),
         expect.any(Object),
+        // PEN-5682: a fifth argument — the transaction handle — because an
+        // eligible unkeyed comment and its effect intents now commit together.
+        // `toHaveBeenCalledWith` is exact on arity, so it has to be named; the
+        // first four are unchanged, which is the part this assertion is for.
+        expect.objectContaining({ insert: expect.any(Function) }),
       );
       expect(mockIssueService.update).not.toHaveBeenCalled();
     });
@@ -3900,6 +3934,11 @@ describe("agent issue mutation checkout ownership", () => {
       "recurrence evidence",
       expect.objectContaining({ agentId: ownerAgentId, runId: "88888888-8888-4888-8888-888888888888" }),
       expect.any(Object),
+      // PEN-5682: a fifth argument — the transaction handle — because an
+      // eligible unkeyed comment and its effect intents now commit together.
+      // `toHaveBeenCalledWith` is exact on arity, so it has to be named; the
+      // first four are unchanged, which is the part this assertion is for.
+      expect.objectContaining({ insert: expect.any(Function) }),
     );
   });
 
@@ -5430,6 +5469,11 @@ describe("agent issue mutation checkout ownership", () => {
       "progress update",
       expect.any(Object),
       expect.any(Object),
+      // PEN-5682: a fifth argument — the transaction handle — because an
+      // eligible unkeyed comment and its effect intents now commit together.
+      // `toHaveBeenCalledWith` is exact on arity, so it has to be named; the
+      // first four are unchanged, which is the part this assertion is for.
+      expect.objectContaining({ insert: expect.any(Function) }),
     );
     expect(mockDocumentService.upsertIssueDocument).toHaveBeenCalled();
     // `sourceTrust: null` is the actor-write provenance restamp (BLO-19566): an
@@ -5496,6 +5540,11 @@ describe("agent issue mutation checkout ownership", () => {
       "Correction from the delegating creator",
       expect.any(Object),
       expect.any(Object),
+      // PEN-5682: a fifth argument — the transaction handle — because an
+      // eligible unkeyed comment and its effect intents now commit together.
+      // `toHaveBeenCalledWith` is exact on arity, so it has to be named; the
+      // first four are unchanged, which is the part this assertion is for.
+      expect.objectContaining({ insert: expect.any(Function) }),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
@@ -5517,6 +5566,11 @@ describe("agent issue mutation checkout ownership", () => {
       "Manager guidance for the delegated issue",
       expect.any(Object),
       expect.any(Object),
+      // PEN-5682: a fifth argument — the transaction handle — because an
+      // eligible unkeyed comment and its effect intents now commit together.
+      // `toHaveBeenCalledWith` is exact on arity, so it has to be named; the
+      // first four are unchanged, which is the part this assertion is for.
+      expect.objectContaining({ insert: expect.any(Function) }),
     );
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
@@ -7016,7 +7070,17 @@ describe("agent issue mutation checkout ownership", () => {
       const tx = {
         execute: vi.fn(async () => undefined),
         select,
-        insert: vi.fn(() => ({ values: vi.fn(async () => undefined) })),
+        // PEN-5682: the same two-shape `values()` the top-level factory
+        // explains — `enqueueCommentEffects` ends in `.onConflictDoNothing`.
+        insert: vi.fn(() => ({
+          values: vi.fn(() => {
+            const result = Promise.resolve(undefined) as Promise<undefined> & {
+              onConflictDoNothing: () => Promise<undefined>;
+            };
+            result.onConflictDoNothing = () => Promise.resolve(undefined);
+            return result;
+          }),
+        })),
       };
       return {
         transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(tx),
