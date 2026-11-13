@@ -29,6 +29,7 @@ import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { logger } from "../middleware/logger.js";
 import { renderMetrics } from "../services/metrics.js";
+import { classifyGithubApiRoute } from "../services/github-fetch.js";
 import {
   DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_INTERVAL_MS,
   DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO,
@@ -319,6 +320,47 @@ describe("githubRateLimitProbes", () => {
     // sample of the same counter, which is the failure this item exists to fix.
     expect(routes).toContain("repos/actions/permissions");
     expect(routes).toContain("rate_limit");
+  });
+
+  it("samples at least one route the local hold actually holds", () => {
+    // PEN-6619. Before this, the sampled route set and the routes appearing in
+    // `paperclip_github_api_held_total` were disjoint, so "was this call held
+    // while its own shard had headroom?" could not be asked of any route: an
+    // empty join answered UNDETERMINED and read as zero victims.
+    //
+    // Asserted as a NON-EMPTY INTERSECTION rather than by naming the probe,
+    // because the property that matters is that some held route is sampled.
+    // Naming only `repos/pulls/requested_reviewers` would pass just as well if
+    // it were the last one left, which is the state this test exists to catch.
+    const HELD_ROUTES = [
+      "repos/check-runs",
+      "repos/commits",
+      "repos/commits/statuses",
+      "repos/issues/comments",
+      "repos/issues/timeline",
+      "repos/pulls",
+      "repos/pulls/commits",
+      "repos/pulls/files",
+      "repos/pulls/requested_reviewers",
+      "repos/pulls/reviews",
+      "repos/statuses",
+    ];
+    const routes = githubRateLimitProbes("Blockcast/paperclip").map((p) => p.route);
+    expect(routes.filter((r) => HELD_ROUTES.includes(r))).not.toHaveLength(0);
+  });
+
+  it("labels the held-route probe as classifyGithubApiRoute would", () => {
+    // The sampler bypasses `ghFetch`, so this label is hardcoded rather than
+    // derived -- which is exactly why it can silently stop matching the label
+    // the hold counter writes, and a join keyed on a label that matches
+    // nothing returns empty, i.e. the same false "no victims" as before.
+    const probe = githubRateLimitProbes("Blockcast/paperclip").find(
+      (p) => p.route === "repos/pulls/requested_reviewers",
+    );
+    expect(probe?.path).toBe("/repos/Blockcast/paperclip/pulls/1/requested_reviewers");
+    expect(classifyGithubApiRoute(`https://api.github.com${probe?.path ?? ""}`)).toBe(
+      "repos/pulls/requested_reviewers",
+    );
   });
 
   it.each(["not-a-repo", "a/b/c", "owner/repo?x=1", "../../etc", "owner /repo", ""])(
