@@ -378,18 +378,51 @@ async function waitForRunToSettle(
   return heartbeat.getRun(runId);
 }
 
+/**
+ * Poll `read()` until it returns a truthy value, then return it.
+ *
+ * THE DEFAULT BUDGET IS DERIVED, NOT CHOSEN (PEN-6608):
+ *  - UPPER bound. `server/vitest.config.ts` sets `testTimeout: 60_000`, and **no test in this
+ *    file overrides it**, so any budget >= 60_000 can never expire — vitest kills the test
+ *    first and the throw below becomes unreachable. On the observed failure
+ *    (Blockcast/paperclip#3734, `General tests (server 1/6)`, run 43309857755) the test spent
+ *    43,486 ms, of which ~40,500 ms was everything *except* this helper, leaving ~19,500 ms.
+ *  - LOWER bound. 3_000 ms was measured insufficient on that run. The same test costs
+ *    ~15,300 ms idle, i.e. runner contention stretches these tests ~2.8x.
+ *  => 15_000 is the largest budget that still expires BEFORE the 60 s harness deadline under
+ *     the worst contention actually observed (40.5s + 15s = 55.5s), with ~4.5 s to spare.
+ *
+ * ON EXPIRY THIS THROWS. It previously returned `null`, which surfaced at the caller's next
+ * line as a bare `expected null to be truthy` — naming neither this helper nor its deadline,
+ * so a contention-driven budget miss was indistinguishable from a logic regression in the
+ * subject under test.
+ */
 async function waitForValue<T>(
   read: () => Promise<T | null | undefined>,
-  timeoutMs = 3_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  let latest: T | null | undefined = null;
-  while (Date.now() < deadline) {
-    latest = await read();
+  timeoutMs = 15_000,
+): Promise<T> {
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  let polls = 0;
+  for (;;) {
+    const latest = await read();
+    polls += 1;
     if (latest) return latest;
+    if (Date.now() >= deadline) {
+      const source = read.toString().replace(/\s+/g, " ");
+      const awaiting =
+        source.length > 400 ? `${source.slice(0, 400)}… (truncated)` : source;
+      throw new Error(
+        `waitForValue: polled ${polls}x over ${Date.now() - startedAt}ms ` +
+          `(budget ${timeoutMs}ms) and the value never became truthy. This is a ` +
+          `POLLING-BUDGET EXPIRY, not a failed assertion about the subject under test. ` +
+          `Awaiting: ${awaiting}. If this value legitimately needs longer, raise this ` +
+          `call's timeoutMs — but keep it under the 60_000ms vitest testTimeout, or vitest ` +
+          `kills the test first and this message is never printed.`,
+      );
+    }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return latest ?? null;
 }
 
 function createDeferred<T>() {
