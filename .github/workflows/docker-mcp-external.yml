@@ -13,6 +13,11 @@ name: Docker (mcp-external)
 # Trigger: any change under packages/mcp-external/. Master + tags only; no PR
 # builds (the HARBOR_PASSWORD org secret isn't available to forks, so a PR build
 # would 401 on push). Mirrors docker-mcp-gateway.yml.
+#
+# BLO-54798: also weekly + on demand, so base-OS fixes (the Dockerfile runs
+# apt-get upgrade) reach a fresh digest when the package itself is quiet. Those
+# builds re-pull the base and skip the runtime-stage cache, else the upgrade
+# layer is a cache hit and the digest carries the same CVEs. Re-pinning stays manual.
 
 on:
   push:
@@ -23,6 +28,9 @@ on:
       - ".github/workflows/docker-mcp-external.yml"
     tags:
       - "mcp-external-v*"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -97,7 +105,9 @@ jobs:
           images: |
             harbor.blockcast.net/library/paperclip-mcp-external
           tags: |
-            type=sha,prefix=sha-,format=short
+            type=sha,prefix=sha-,format=short,enable=${{ github.event_name == 'push' }}
+            # Rebuilds get their own tag: the manifest pins by sha- tag, so re-pushing one would redeploy silently.
+            type=raw,value=rebuild-{{date 'YYYYMMDD'}}-{{sha}},enable=${{ github.event_name != 'push' }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
@@ -109,11 +119,13 @@ jobs:
           push: true
           provenance: false
           sbom: false
+          pull: ${{ github.event_name != 'push' }}
+          no-cache-filters: ${{ github.event_name != 'push' && 'runtime' || '' }}
           cache-from: |
             type=registry,ref=harbor.blockcast.net/library/paperclip-mcp-external:buildcache-v1
             type=gha,scope=paperclip-mcp-external
           cache-to: |
-            ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=registry,ref=harbor.blockcast.net/library/paperclip-mcp-external:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true' || '' }}
-            ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=gha,scope=paperclip-mcp-external,mode=min,ignore-error=true' || '' }}
+            ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && 'type=registry,ref=harbor.blockcast.net/library/paperclip-mcp-external:buildcache-v1,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true' || '' }}
+            ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && 'type=gha,scope=paperclip-mcp-external,mode=min,ignore-error=true' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
