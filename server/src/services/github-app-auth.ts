@@ -431,10 +431,13 @@ export async function githubHasCommitEvidence(input: {
  * ⚠ PEN-6341 item 2 MOVED THE READER ONTO GRAPHQL AND THIS PROBE SURVIVED THAT,
  * narrower than before. The lookup is no longer a REST 404: `issueOrPullRequest`
  * resolves an ISSUE number by itself, on `__typename`, so that case never reaches
- * here. What does reach here is the one answer GraphQL collapses -- a null node
- * plus a NOT_FOUND error, which is byte-identical to a FORBIDDEN field or an
- * invisible repository once `ghGraphQlQuery` has folded every `errors` entry into
- * one reason.
+ * here. What does reach here is the one answer that survives the caller's
+ * `errorTypes` filter -- a null node whose `errors` are ALL `NOT_FOUND`, which
+ * cannot distinguish an absent number from a repository this installation cannot
+ * see. A FORBIDDEN field, a `RATE_LIMITED` read and a query timeout are stopped
+ * before this point precisely because the probe below could not tell them from a
+ * real absence, and a readable repo would then stamp `notFound` on a pull request
+ * that exists.
  *
  * The underlying ambiguity is the same one the REST 404 had, exactly as the
  * Actions arm's does: the pull request genuinely does not exist, or the repository
@@ -482,14 +485,29 @@ export async function githubGetPullRequestGate(input: {
   });
 
   if (!node.ok) {
-    // `graphql_errors` is where a NOT_FOUND arrives: GraphQL answers HTTP 200
-    // with the node nulled and an error entry beside it, and `ghGraphQlQuery`
-    // folds every `errors` entry into this one reason by design. So this branch
-    // is ambiguous in exactly the way the REST 404 was -- an absent number, an
-    // invisible repository, or a FORBIDDEN field -- and it is handed to the same
-    // repo probe that disambiguated the 404. The probe is the ONLY path that can
-    // set `notFound`, which is what keeps that flag positive evidence.
-    if (node.reason === "graphql_errors" || node.reason === "pull_request_absent") {
+    // ⛔ ONLY an all-`NOT_FOUND` error set may reach the probe, and the reason is
+    // the whole fail-safe story of this function. `ghGraphQlQuery` folds EVERY
+    // `errors` entry into one `graphql_errors` reason -- correct for a caller
+    // choosing a fail-closed default, and fail-OPEN here, because the probe that
+    // follows can separate out only an INVISIBLE REPOSITORY. GitHub answers a
+    // FORBIDDEN field, a `RATE_LIMITED` read and a query timeout with HTTP 200
+    // plus `errors`, and the probe is REST `GET /repos/{o}/{r}` on a DIFFERENT
+    // budget, so it typically answers 200 -- which would stamp
+    // `notFound: true` on a pull request that exists and is merely unreadable
+    // right now, and `notFound` is the one result that reaches a file-time
+    // refusal. Before this reader moved to GraphQL that required a real REST 404
+    // on `/pulls/{n}`; nothing weaker may be allowed to mean it.
+    //
+    // `errorTypes` carries one entry per error row with `null` for a row whose
+    // `type` could not be read, so `every(... === "NOT_FOUND")` over a PRESENT,
+    // NON-EMPTY array is a positive assertion: an absent channel, an empty one,
+    // or a single unreadable row all fall through to the ambiguous arm.
+    const notFoundOnly =
+      node.reason === "graphql_errors" &&
+      Array.isArray(node.errorTypes) &&
+      node.errorTypes.length > 0 &&
+      node.errorTypes.every((type) => type === "NOT_FOUND");
+    if (notFoundOnly || node.reason === "pull_request_absent") {
       return await classifyPullRequestNotFound({
         apiBase: gitHubApiBase(GITHUB_HOST),
         repoFullName: input.repoFullName,
@@ -499,19 +517,31 @@ export async function githubGetPullRequestGate(input: {
     }
     // Everything else -- transport, a non-2xx (including the synthetic 403
     // `ghFetch` serves from its own rate-limit hold), an unreadable body, a null
-    // `data` -- is NOT a statement about whether the pull request exists, so it
-    // must never reach the probe and must never carry `notFound`.
+    // `data`, and any `errors` set that is not purely NOT_FOUND -- is NOT a
+    // statement about whether the pull request exists, so it must never reach
+    // the probe and must never carry `notFound`.
     return { error: graphQlGateFailureReason(node.reason) };
   }
 
-  // A number that resolves to something OTHER than a pull request is an ISSUE
-  // number, which is the likeliest way this fires in practice. GraphQL answers
-  // that in the SAME call -- `__typename` discriminates issue / pull request /
-  // absent where REST needed a second repo probe to tell the first two apart --
-  // and reaching here at all means `repository` resolved, so the repository is
-  // demonstrably readable and the absence is positive evidence.
-  if (node.data.__typename !== "PullRequest") {
+  // An ISSUE number is the likeliest way this gate's `notFound` fires in
+  // practice, and GraphQL answers it in the SAME call -- `__typename`
+  // discriminates issue / pull request / absent where REST needed a second repo
+  // probe to tell the first two apart. Reaching here at all means `repository`
+  // resolved, so the repository is demonstrably readable and the absence is
+  // positive evidence.
+  //
+  // ⛔ Tested POSITIVELY, against `"Issue"`, never as `!== "PullRequest"`: the
+  // negated form hands `notFound` to a missing or unrecognised `__typename` as
+  // well, which is a payload this reader could not understand rather than
+  // evidence of anything. GitHub always returns `__typename` when asked, so this
+  // is defensive -- but `notFound` is exactly the flag that must rest on
+  // positive evidence only, and an unreadable node falls to the same
+  // `pull_request_state_missing` every other unreadable payload uses.
+  if (node.data.__typename === "Issue") {
     return { error: "pull_request_not_found", notFound: true };
+  }
+  if (node.data.__typename !== "PullRequest") {
+    return { error: "pull_request_state_missing" };
   }
 
   const state = readGraphQlPullRequestState(node.data);
@@ -2673,7 +2703,24 @@ export async function githubPostIssueComment(input: {
  */
 export type HeadChecksSettlement = "settled" | "pending" | "unknown";
 
-export type GhGraphQlResult<T> = { ok: true; data: T } | { ok: false; reason: string };
+export type GhGraphQlResult<T> =
+  | { ok: true; data: T }
+  /**
+   * PEN-6341: `errorTypes` is present ONLY on a `graphql_errors` failure, and it
+   * carries one entry per `errors[]` row -- `null` for a row with no readable
+   * `type`, so the array length always equals the error count and a caller can
+   * never mistake "a type we could not read" for "no such error".
+   *
+   * It exists because folding every `errors` entry into one reason is right for
+   * a caller choosing a fail-closed DEFAULT and wrong for a caller that must
+   * tell one error APART from another. `githubGetPullRequestGate` is the second
+   * kind: a `NOT_FOUND` means the pull request may really be absent, while a
+   * FORBIDDEN, a RATE_LIMITED or a query timeout says nothing about whether it
+   * exists -- and treating those alike let a readable-repo probe stamp
+   * `notFound: true` on a pull request that is simply unreadable right now.
+   * Every other caller ignores this field and keeps the folded behaviour.
+   */
+  | { ok: false; reason: string; errorTypes?: readonly (string | null)[] };
 
 /**
  * A GraphQL READ against GitHub. Never throws, never reports a partial success,
@@ -2766,7 +2813,17 @@ export async function ghGraphQlQuery<T>(input: {
     return { ok: false, reason: "unreadable_body" };
   }
   if (!body || typeof body !== "object") return { ok: false, reason: "unreadable_body" };
-  if (Array.isArray(body.errors) && body.errors.length > 0) return { ok: false, reason: "graphql_errors" };
+  if (Array.isArray(body.errors) && body.errors.length > 0) {
+    // One entry per error row, `null` where the row carries no readable `type`
+    // (GitHub's query-timeout error is type-less). Keeping the nulls rather
+    // than dropping them is what makes "every entry is NOT_FOUND" a sound test.
+    const errorTypes = (body.errors as unknown[]).map((e) =>
+      e && typeof e === "object" && typeof (e as { type?: unknown }).type === "string"
+        ? ((e as { type: string }).type)
+        : null,
+    );
+    return { ok: false, reason: "graphql_errors", errorTypes };
+  }
   if (body.data === null || body.data === undefined) return { ok: false, reason: "no_data" };
   return { ok: true, data: body.data };
 }
@@ -2870,12 +2927,15 @@ export async function ghGraphQlPullRequestFields(input: {
  *
  * ## What the caller must still do
  *
- * `null` + NOT_FOUND arrives through `ghGraphQlQuery` as `graphql_errors`, the
- * same reason a FORBIDDEN or an invisible repository produces, so this helper
- * CANNOT tell the caller which it was. That branch is still ambiguous and the
- * caller still hands it to the repo probe. Only the `Issue` answer is resolved
- * here, and it is the likeliest way the gate's `notFound` fires in practice: an
- * agent files a card with the issue number it has to hand.
+ * `null` + NOT_FOUND arrives through `ghGraphQlQuery` as `graphql_errors` --
+ * the same REASON a FORBIDDEN field, a `RATE_LIMITED` read or a query timeout
+ * produces, because that helper folds every `errors` entry into one. The caller
+ * separates them on `errorTypes`, which the failure arm carries alongside the
+ * reason, and hands ONLY an all-`NOT_FOUND` set to the repo probe. Even then the
+ * branch stays ambiguous between an absent number and an invisible repository,
+ * which is exactly what the probe is for. The `Issue` answer is the one resolved
+ * here outright, and it is the likeliest way the gate's `notFound` fires in
+ * practice: an agent files a card with the issue number it has to hand.
  *
  * ## `databaseId` lives on the concrete types
  *
