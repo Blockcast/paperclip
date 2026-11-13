@@ -196,26 +196,24 @@ const ALLOWLIST = [
       "and clearing the review request would achieve nothing. " +
       "Measured live 2026-11-13: #3205 OPEN, CONFLICTING/DIRTY, " +
       "labels ['do-not-merge'], head eb2dc737 unmoved since the " +
-      "2026-11-02T14:09:36Z force-push, and its only owning Paperclip row " +
-      "PEN-5181 closed `done` on 2026-11-05 -- so no agent wake loads it. " +
-      "WITHDRAWN 2026-11-13, and stated here because this entry is where a " +
-      "reader meets the question: until today this reason said removing the " +
-      "label was 'ALREADY asked on board card c4bfaa88 (annotation " +
-      "c5350051) -- a second ask is a duplicate, not an escalation'. Both " +
-      "halves are false. Card c4bfaa88 was WITHDRAWN 2026-11-06T16:04:19Z, " +
-      "five days BEFORE this entry was written; its live successor card " +
-      "c69b1a65 (pending, payloadRevision 4) names neither #3205 nor the " +
-      "label anywhere in its body; and annotation c5350051 says the " +
-      "OPPOSITE of what was attributed to it -- that the label and the " +
-      "DIRTY state are 'not touched by any of' that card's four options. " +
-      "As of 2026-11-13 no ask for this label's removal is pending on any " +
-      "board card, so filing one is NOT a duplicate. Do not read a " +
-      "deterrent out of this entry; re-read the cards before relying on " +
-      "either sentence. The release condition actually on record is the " +
-      "CEO ruling in #3205's own thread at 2026-11-03T03:57Z -- the label " +
-      "comes off when @kkroo reviews -- and that review request, restored " +
-      "2026-11-03T03:57:12Z, is still outstanding with zero @kkroo reviews " +
-      "of any state on the PR. " +
+      "2026-11-02T14:09:36Z force-push. The release condition on record " +
+      "is the CEO ruling in #3205's own thread at 2026-11-03T03:57Z -- " +
+      "the label comes off when @kkroo reviews -- and that review " +
+      "request, restored 2026-11-03T03:57:12Z, is still outstanding with " +
+      "zero @kkroo reviews of any state on the PR. " +
+      "DO NOT READ A DETERRENT OUT OF THIS ENTRY, AND DO NOT RE-PIN IT " +
+      "TO ONE. The revision that stood here from 2026-11-12 to " +
+      "2026-11-13 said removing the label was ALREADY asked on a board " +
+      "card and that a second ask would be a duplicate; it was withdrawn " +
+      "as false -- the card it named had already been withdrawn when that " +
+      "revision was written. A board card, a card annotation and a " +
+      "Paperclip row are objects this repository's CI cannot resolve, so " +
+      "a claim here about their state is checked by nothing and goes " +
+      "false silently, in the direction that discourages the only act " +
+      "that releases #3205. This file's git history carries both " +
+      "withdrawn texts and the measurements that killed them. Whether an " +
+      "ask is pending NOW is Paperclip state: read PEN-5272, and infer " +
+      "nothing either way from this entry. " +
       "PEN-5272 forbids routing around the " +
       "hold, so the step is NOT duplicated here and this entry stands in for " +
       "it. DELETE THIS ENTRY when #3205 lands (arm 4 will print a notice " +
