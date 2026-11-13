@@ -113,7 +113,8 @@
     "src/__tests__/work-product-external-id-write-canonicalization.test.ts",
     "src/__tests__/github-rate-limit-sampler.test.ts",
     "src/__tests__/routine-pipeline-workspace-command-authz.test.ts",
-    "src/__tests__/pr-reconciler-work-product-repair.test.ts"
+    "src/__tests__/pr-reconciler-work-product-repair.test.ts",
+    "src/__tests__/plugin-database.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }
