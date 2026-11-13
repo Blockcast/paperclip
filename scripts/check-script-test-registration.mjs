@@ -157,6 +157,51 @@ import { fileURLToPath } from "node:url";
  * `reason` is mandatory and is read by arm 3. `pendingRegistrationPr` marks an
  * entry whose file is expected to become reachable when that PR lands -- see
  * arm 4 -- and is the only way an entry survives its file becoming registered.
+ *
+ * WHAT A `reason` MAY AND MAY NOT REST ON. Arm 3 enforces that a `reason` is
+ * PRESENT; nothing enforces that it is TRUE, and the gap has now been paid for
+ * twice in one entry. The soak-queries entry below went false twice and was
+ * corrected on 2026-11-12 (PR #3685) and again on 2026-11-13, both times
+ * through the same door: its attendance claim rested on the state of an object
+ * no job in this repository can read -- first a code-owner review request,
+ * then a Paperclip board card and its annotation.
+ *
+ * Both times it was false in the direction that DISCOURAGED the only act that
+ * would release the blocked PR, which is the expensive direction, because a
+ * deterred act leaves no trace and nothing ever reports it.
+ *
+ * The convention, which is a CONTENT discipline and deliberately not an arm:
+ *
+ *   - A `reason` MAY cite an external identifier (a PR, a row, a card) as
+ *     CONTEXT. It must never rest its VALIDITY on one, and must never carry a
+ *     PROHIBITION whose premise is external state. The entry above is the
+ *     worked form: it names PEN-5277 and #3278 and then immunises itself
+ *     against both -- "that repair does NOT make it registerable... do not
+ *     read PEN-5277 closing as a cue to delete this entry."
+ *   - The write-time test is one question: WOULD THIS SENTENCE STILL BE TRUE
+ *     IF EVERY EXTERNAL SYSTEM CHANGED STATE TOMORROW? If no, it does not go
+ *     in the file. Put it on the owning row, where a correction can be filed
+ *     next to it and a reader meets it with its date attached.
+ *   - If an attendance claim is worth making, make it in a FIELD this guard
+ *     can check. `pendingRegistrationPr` already is exactly that -- the claim
+ *     "this becomes reachable when that PR lands" made mechanical, which arm 4
+ *     reads against the live tree. A claim that cannot be a field does not
+ *     belong in this file at all.
+ *
+ * WHY THERE IS NO ARM FOR THIS, so nobody adds one thinking it was missed. A
+ * lexical arm refusing a `reason` that cites an external identifier was ruled
+ * against on PEN-5272 (2026-11-13), on three grounds, measured rather than
+ * reasoned: the two entries in this allowlist are a discriminating pair and
+ * such an arm scores them IDENTICALLY -- both cite external ids, so it refuses
+ * the one entry that has never gone stale, i.e. the exemplar; the incentive
+ * runs backwards, since both stale claims were CATCHABLE because they named
+ * the objects they rested on, and penalising the citation selects for reasons
+ * that assert without citing, which is strictly less falsifiable; and an arm
+ * that instead RESOLVED the identifier against live state would reproduce,
+ * inside this guard, the very failure the entry above is allowlisted for --
+ * a terminal assertion that can turn red with no change to this repository.
+ * That ruling is cited as history, not as live state: it does not matter to
+ * any sentence here whether that row is still open.
  */
 const ALLOWLIST = [
   {
