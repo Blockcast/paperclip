@@ -2177,6 +2177,59 @@ describe("PEN-2918 attendance observations", () => {
   });
 
   /**
+   * PEN-6121 (2026-11-13) — the SAME correction on the retract sentence, which
+   * had no cover.
+   *
+   * `retryBudgetSpentSentence` grew a `!hostAnswered` branch alongside
+   * `wakeSentence`'s, and only `wakeSentence`'s was tested: the four-sweep test
+   * above throws a CODED `issue.blocked`, so `hostAnswered` is `true` there and
+   * the new branch never executes — deleting it would turn nothing red. This is
+   * the same four-sweep sequence with an UNCODED throw.
+   *
+   * ⛔ It matters more here than on the opening comment, not less. This is the
+   * sentence a reader lands on when the rung is being ABANDONED: the ladder is
+   * about to escalate past this agent, so "No run was queued" is the claim an
+   * operator acts on, and on PEN-5911 that claim was false while the run was
+   * already running.
+   */
+  it("does not assert the negative on the spent-budget retract either, when the host named no cause", async () => {
+    const store = buildFakeAlertmanagerStore();
+    let current: AlertStateRecord = due();
+    const { ctx, mocks } = sweepContext(current, "cto", store);
+    mocks.state.get = vi.fn(async () => current);
+    mocks.state.set = vi.fn(async (_ref: unknown, next: AlertStateRecord) => { current = next; });
+    // UNCODED — no `data.code`, which is the whole discriminator. A transport
+    // timeout or a pre-wake guard that throws without a token lands here.
+    mocks.issues.requestWakeup = vi.fn(async () => { throw new Error("Timed out waiting for host response"); });
+
+    for (let sweep = 0; sweep < 4; sweep += 1) {
+      await runAlertEscalationSweep(ctx, config(), new Date(NOW.getTime() + sweep * 31 * 60_000));
+    }
+
+    const bodies = (mocks.issues.createComment.mock.calls as unknown as Array<[string, string, string]>).map(([, body]) => body);
+    expect(bodies).toHaveLength(3);
+
+    // The retract still happens, still on rung 1, and still reports the spent
+    // budget — none of that is conditional on the cause.
+    expect(bodies[1]).toContain("[alert-escalation 1/3]");
+    expect(bodies[1]).toContain("Retry 2 of 2 failed");
+    expect(bodies[1]).toContain("The retry budget for this rung is spent");
+
+    // The assertion under test: it hedges rather than denying the run.
+    expect(bodies[1]).toContain("could NOT be confirmed");
+    expect(bodies[1]).not.toContain("No run was queued");
+    expect(bodies[1]).not.toContain("no run was queued");
+
+    // Fixed sentences only — never the raw error.
+    expect(bodies[1]).not.toContain("Timed out waiting");
+
+    // And the ladder still climbs afterwards: hedging the sentence must not
+    // change the control flow it is attached to.
+    expect(bodies[2]).toContain("[alert-escalation 2/3]");
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(4);
+  });
+
+  /**
    * PEN-6229 — the bound, from the other side. A rung whose retry SUCCEEDS must
    * not gain a comment: the `enqueued` arm already reports that, and adding a
    * second would be the comment storm the CAS ordering exists to prevent.

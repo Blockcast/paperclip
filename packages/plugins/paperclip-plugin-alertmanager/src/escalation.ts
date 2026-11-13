@@ -1793,7 +1793,7 @@ function wakeDetailFor(wake: WakeOutcome, hostAnswered: boolean): string | null 
   switch (wake) {
     case "refused":
       if (!hostAnswered) {
-        return "issues.requestWakeup threw WITHOUT a cause: the host named no gate, so this is NOT established as a refusal. All seven coded gates (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive, agent.not_invokable) throw with details.code attached and refuse BEFORE a run is created; an uncoded rejection comes from the host handler or the RPC transport downstream of heartbeat.wakeup(), where the run may already exist. Measured once (PEN-5911, 2026-11-13T05:36Z): the run existed and ran to success while this column read refused. To settle one of these, look for a run whose contextSnapshot.source is alertmanager-escalation created inside the sweep window; the issue.assignment_wakeup_requested activity row is written after the run, so its ABSENCE does not mean no run.";
+        return "issues.requestWakeup threw WITHOUT a cause: the host named no gate, so this is NOT established as a refusal. The seven coded gates (six distinct tokens: issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive, agent.not_invokable -- budgets.getInvocationBlock is one gate yielding two of them) all throw with details.code attached and all refuse BEFORE a run is created. An uncoded rejection may come from BEFORE heartbeat.wakeup() -- ensurePluginAvailableForCompany, requireInCompany, or a DB or transport error out of issues.getById or budgets.getInvocationBlock, none of which leaves a run -- or from AFTER it, which does. Only the second kind can leave a run behind, which is why such a row is UNSETTLED rather than refuted. Measured once (PEN-5911, 2026-11-13T05:36Z): the run existed and ran to success while this column read refused. To settle one of these, look for a run whose contextSnapshot.source is alertmanager-escalation created inside the sweep window; the issue.assignment_wakeup_requested activity row is written after the run, so its ABSENCE does not mean no run.";
       }
       return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate -- pre-wake in the plugin host (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive) or downstream in enqueueWakeup (budget.blocked, company.inactive, agent.not_invokable). That set GROWS; it is documentation, not a closed list. A null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     case "declined":
@@ -1859,9 +1859,12 @@ async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, co
     // wake was refused. None of the seven coded gates can produce one: each
     // throws an `HttpError` with `details.code`, which `workerHostErrorData`
     // projects onto `data`. An uncoded rejection therefore comes from
-    // somewhere else in the host handler or from the RPC transport — both of
-    // which sit DOWNSTREAM of `heartbeat.wakeup()`, so the run may already
-    // exist. `hostAnswered: false` keeps the thread from asserting otherwise.
+    // somewhere else in the host handler or from the RPC transport, and those
+    // sit on BOTH sides of `heartbeat.wakeup()`: the pre-wake guards
+    // (`ensurePluginAvailableForCompany`, `requireInCompany`, a DB error out
+    // of `issues.getById`) reject before any run exists, while anything after
+    // it can leave one behind. The run MAY exist, so this is unsettled, not a
+    // refusal. `hostAnswered: false` keeps the thread from asserting otherwise.
     return { outcome: "refused", cause, hostAnswered: cause !== null };
   }
 }
