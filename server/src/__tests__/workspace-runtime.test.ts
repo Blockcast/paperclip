@@ -8678,10 +8678,10 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       .update(issues)
       .set({ executionWorkspaceId: null })
       .where(eq(issues.id, ids.sourceIssueId));
-    const coherent = () => ensureGitWorktreeBranchCoherent({
+    const coherent = (callPath = worktreePath) => ensureGitWorktreeBranchCoherent({
       db,
       repoRoot,
-      worktreePath,
+      worktreePath: callPath,
       expectedBranchName: expectedBranch,
       sourceIssue: { id: ids.sourceIssueId, identifier: ids.sourceIdentifier, title: "Repair dirty branch mismatch" },
       executionWorkspaceId: null,
@@ -8703,8 +8703,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(repoRoot, ["show", `${rescue}:untracked.txt`])).resolves.toBe("dirty untracked work");
   }, 20_000);
 
-  it("still refuses an unbound dirty quarantine while a runtime service runs inside the worktree", async () => {
-    const { actualBranch, worktreePath, ids, coherent } = await seedUnboundDirtyMismatch("PAP-464");
+  async function insertOrphanRuntimeService(ids: Awaited<ReturnType<typeof seedUnboundDirtyMismatch>>["ids"], cwd: string) {
     await db.insert(workspaceRuntimeServices).values({
       id: randomUUID(),
       companyId: ids.companyId,
@@ -8719,7 +8718,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       lifecycle: "shared",
       reuseKey: "orphan-dev",
       command: "pnpm dev",
-      cwd: path.join(worktreePath, "server"),
+      cwd,
       port: 49196,
       url: "http://127.0.0.1:49196",
       provider: "local_process",
@@ -8732,8 +8731,33 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       stopPolicy: { type: "manual" },
       healthStatus: "healthy",
     });
+  }
+
+  it("still refuses an unbound dirty quarantine while a runtime service runs inside the worktree", async () => {
+    const { actualBranch, worktreePath, ids, coherent } = await seedUnboundDirtyMismatch("PAP-464");
+    await insertOrphanRuntimeService(ids, path.join(worktreePath, "server"));
 
     await expect(coherent()).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining('runtime service "orphan-dev"'),
+          }),
+        }),
+      },
+    });
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+  }, 20_000);
+
+  it("finds a runtime service whose cwd spells the worktree path differently (symlink, trailing slash)", async () => {
+    const { actualBranch, worktreePath, ids, coherent } = await seedUnboundDirtyMismatch("PAP-465");
+    await insertOrphanRuntimeService(ids, `${worktreePath}/`);
+    const alias = `${worktreePath}-alias`;
+    await fs.symlink(worktreePath, alias);
+
+    await expect(coherent(alias)).rejects.toMatchObject({
       code: "workspace_validation_failed",
       resultJson: {
         workspaceValidation: expect.objectContaining({

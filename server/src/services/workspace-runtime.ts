@@ -1918,10 +1918,19 @@ async function findActiveRuntimeServiceOnWorktreePath(input: {
   companyId: string;
   worktreePath: string;
 }) {
+  // A missed match lets the quarantine proceed, so match every spelling of the root:
+  // as given, resolved (no trailing slash), and through symlinks.
+  const resolved = path.resolve(input.worktreePath);
+  let real = resolved;
+  try { real = realpathSync(resolved); } catch { /* missing path: resolved spelling only */ }
+  const roots = [...new Set([input.worktreePath.replace(/\/+$/, "") || "/", resolved, real])];
   const workspaces = await input.db
     .select()
     .from(executionWorkspaces)
-    .where(and(eq(executionWorkspaces.companyId, input.companyId), eq(executionWorkspaces.cwd, input.worktreePath)));
+    .where(and(
+      eq(executionWorkspaces.companyId, input.companyId),
+      inArray(executionWorkspaces.cwd, roots.flatMap((root) => [root, `${root}/`])),
+    ));
   for (const workspace of workspaces) {
     const service = await findActiveRuntimeServiceBlockingDirtyQuarantine({ db: input.db, workspace });
     if (service) return service;
@@ -1938,8 +1947,8 @@ async function findActiveRuntimeServiceOnWorktreePath(input: {
       eq(workspaceRuntimeServices.companyId, input.companyId),
       ne(workspaceRuntimeServices.status, "stopped"),
       or(
-        eq(workspaceRuntimeServices.cwd, input.worktreePath),
-        sql`starts_with(${workspaceRuntimeServices.cwd}, ${`${input.worktreePath.replace(/\/+$/, "")}/`})`,
+        inArray(workspaceRuntimeServices.cwd, roots),
+        ...roots.map((root) => sql`starts_with(${workspaceRuntimeServices.cwd}, ${`${root}/`})`),
       ),
     ))
     .limit(1);
