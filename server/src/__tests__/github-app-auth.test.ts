@@ -176,18 +176,79 @@ describe("getInstallationToken", () => {
   });
 });
 
+/**
+ * PEN-6341 item 2 moved this reader from `GET /repos/{o}/{r}/pulls/{n}` to a
+ * GraphQL `issueOrPullRequest` read, so every double below is GRAPHQL-shaped.
+ *
+ * ⚠ That is the point of rewriting them rather than translating them. A double
+ * left in the OLD transport's shape makes the assertion a tautology about its own
+ * fixture: the stub supplies the input and the assertion checks the output, so it
+ * agrees with the migration instead of testing it. The previous slice of this
+ * migration shipped exactly that and a real bug reached review behind it.
+ */
+const GRAPHQL_URL = "https://api.github.com/graphql";
+
+function stubGateFetch(opts: {
+  node?: unknown;
+  errors?: unknown[];
+  graphqlOk?: boolean;
+  graphqlStatus?: number;
+  graphqlThrows?: boolean;
+  repoStatus?: number;
+  repoBody?: unknown;
+}) {
+  const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+    const u = String(url);
+    if (u.includes("/access_tokens")) {
+      return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+    }
+    if (u.startsWith(GRAPHQL_URL)) {
+      if (opts.graphqlThrows) throw new Error("socket");
+      const status = opts.graphqlStatus ?? 200;
+      const ok = opts.graphqlOk ?? (status >= 200 && status < 300);
+      const body: Record<string, unknown> = {
+        data: { repository: { issueOrPullRequest: opts.node ?? null } },
+      };
+      if (opts.errors) body.errors = opts.errors;
+      return jsonResponse(body, ok, status);
+    }
+    const repoStatus = opts.repoStatus ?? 200;
+    return jsonResponse(
+      opts.repoBody ?? { full_name: "Blockcast/paperclip" },
+      repoStatus >= 200 && repoStatus < 300,
+      repoStatus,
+    );
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+const NOT_FOUND_ERRORS = [{
+  type: "NOT_FOUND",
+  path: ["repository", "issueOrPullRequest"],
+  message: "Could not resolve to an issue or pull request with the number of 999999.",
+}];
+
+const graphQlCalls = (mock: ReturnType<typeof stubGateFetch>) =>
+  mock.mock.calls.filter(([url]) => String(url).startsWith(GRAPHQL_URL));
+const repoProbeCalls = (mock: ReturnType<typeof stubGateFetch>) =>
+  mock.mock.calls.filter(([url]) => /\/repos\/[^/]+\/[^/]+$/.test(String(url)));
+
 describe("githubGetPullRequestGate", () => {
   it.each([
     {
-      body: { state: "open", merged: false, closed_at: null, merged_by: null },
+      name: "open",
+      node: { __typename: "PullRequest", state: "OPEN", merged: false, closedAt: null, mergedBy: null },
       expected: { state: "open", merged: false, closedAt: null, mergedBy: null },
     },
     {
-      body: {
-        state: "closed",
+      name: "closed unmerged",
+      node: {
+        __typename: "PullRequest",
+        state: "CLOSED",
         merged: false,
-        closed_at: "2026-11-05T08:37:27Z",
-        merged_by: null,
+        closedAt: "2026-11-05T08:37:27Z",
+        mergedBy: null,
       },
       expected: {
         state: "closed",
@@ -197,70 +258,132 @@ describe("githubGetPullRequestGate", () => {
       },
     },
     {
-      // PEN-6055: a merged pull request names its merger, and GitHub's actor object
-      // carries far more than the three fields kept. The extra keys are dropped
-      // rather than passed through, so the stored shape is the documented one.
-      body: {
-        state: "closed",
+      // ⛔ THE FOLD. GraphQL has no `closed` for a merged pull request -- it
+      // reports `MERGED`, a member REST has no equivalent of -- so a reader that
+      // handed the lower-cased enum value on would bail on exactly the merged
+      // pull requests this gate exists to classify. Measured on both surfaces,
+      // one pull request, 2026-11-13: REST `{state: "closed", merged: true}`
+      // against GraphQL `{state: "MERGED", merged: true}`.
+      name: "merged, folded back to REST's closed+merged pair",
+      node: {
+        __typename: "PullRequest",
+        state: "MERGED",
         merged: true,
-        closed_at: "2026-10-30T11:02:04Z",
-        merged_by: {
-          login: "allyblockcast[bot]",
-          id: 290875700,
-          type: "Bot",
-          node_id: "BOT_kgDOEU3dtA",
-          site_admin: false,
-        },
+        closedAt: "2026-10-30T11:02:04Z",
+        mergedBy: { __typename: "User", login: "kkroo", databaseId: 1845185 },
       },
       expected: {
         state: "closed",
         merged: true,
         closedAt: "2026-10-30T11:02:04Z",
-        mergedBy: { login: "allyblockcast[bot]", id: 290875700, type: "Bot" },
+        mergedBy: { login: "kkroo", id: 1845185, type: "User" },
       },
     },
-  ] as const)(
-    "returns the authoritative PR gate state: $body.state merged=$body.merged",
-    async ({ body, expected }) => {
-      setCreds();
-      const fetchMock = vi.fn(async (url: string | URL) => {
-        if (String(url).includes("/access_tokens")) {
-          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-        }
-        expect(String(url)).toContain("/repos/Blockcast/paperclip/pulls/847");
-        return jsonResponse(body);
-      });
-      vi.stubGlobal("fetch", fetchMock);
-
-      // `closedAt` is surfaced alongside `{ state, merged }` so the closed-unmerged
-      // retirement can tell a durable close from a close/reopen transient (PEN-5662).
-      // Carried through verbatim: this reader does not parse it, and the one consumer
-      // that does treats anything unparseable as "fall back to the shipped rule".
-      //
-      // `mergedBy` rides the same GET for the same reason (PEN-6055): the approval-gate
-      // reconciler already pays for this call to learn `merged`, and the actor is in
-      // the response it gets back.
-      await expect(githubGetPullRequestGate({
-        repoFullName: "Blockcast/paperclip",
-        prNumber: 847,
-      })).resolves.toEqual(expected);
-    },
-  );
-
-  it("keeps a partial merged_by rather than discarding the readable half (PEN-6055)", async () => {
-    // GitHub substitutes a `ghost` account for a deleted user, and a proxy could drop
-    // fields. Each field is independently nullable, so a partial actor still records
-    // what is known instead of collapsing to "unknown".
+  ] as const)("returns the authoritative PR gate state: $name", async ({ node, expected }) => {
     setCreds();
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) =>
-      String(url).includes("/access_tokens")
-        ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
-        : jsonResponse({
-            state: "closed",
-            merged: true,
-            closed_at: null,
-            merged_by: { id: 1845185 },
-          })));
+    const fetchMock = stubGateFetch({ node });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toEqual(expected);
+
+    // One GraphQL read and no REST read of the pull request at all: the whole
+    // point of the migration is that this call no longer draws the `core` budget.
+    expect(graphQlCalls(fetchMock)).toHaveLength(1);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/pulls/"))).toBe(false);
+  });
+
+  it("re-attaches the [bot] suffix GraphQL drops from an App merger (PEN-6341)", async () => {
+    // ⛔ THE SAME TRAP THE PREVIOUS SLICE SHIPPED, in a different field. Measured
+    // first-party on `Blockcast/paperclip#3694`, 2026-11-13, BOTH surfaces:
+    // REST `merged_by.login` is `allyblockcast[bot]` where GraphQL
+    // `mergedBy.login` is the bare `allyblockcast` with `__typename: "Bot"`, and
+    // both report id 290875700. Every other field agrees, the value is a
+    // non-empty string either way, and the difference is a five-character
+    // suffix -- so no type, null or truthiness check can see it.
+    setCreds();
+    stubGateFetch({
+      node: {
+        __typename: "PullRequest",
+        state: "MERGED",
+        merged: true,
+        closedAt: "2026-11-13T05:17:44Z",
+        mergedBy: { __typename: "Bot", login: "allyblockcast", databaseId: 290875700 },
+      },
+    });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 3694,
+    })).resolves.toEqual({
+      state: "closed",
+      merged: true,
+      closedAt: "2026-11-13T05:17:44Z",
+      mergedBy: { login: "allyblockcast[bot]", id: 290875700, type: "Bot" },
+    });
+  });
+
+  it("does not double-suffix a login that already carries [bot]", async () => {
+    setCreds();
+    stubGateFetch({
+      node: {
+        __typename: "PullRequest",
+        state: "MERGED",
+        merged: true,
+        closedAt: null,
+        mergedBy: { __typename: "Bot", login: "allyblockcast[bot]", databaseId: 290875700 },
+      },
+    });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toMatchObject({
+      mergedBy: { login: "allyblockcast[bot]", id: 290875700, type: "Bot" },
+    });
+  });
+
+  it.each([
+    { name: "MERGED without merged:true", state: "MERGED", merged: false },
+    { name: "CLOSED with merged:true", state: "CLOSED", merged: true },
+    { name: "OPEN with merged:true", state: "OPEN", merged: true },
+    { name: "a state this reader has never seen", state: "LOCKED", merged: false },
+    { name: "an absent state", state: undefined, merged: false },
+  ])("fails closed on $name (PEN-6341)", async ({ state, merged }) => {
+    // GitHub sets `MERGED` if and only if `merged` is true, so a payload where
+    // the two disagree is one this reader could not understand. BOTH directions
+    // of that disagreement are harmful and neither is merely conservative:
+    // reporting merged retires an approval card against a merge that never
+    // happened, and reporting closed-unmerged routes a merged PR into the
+    // closed-unmerged retirement, which is a different wrong disposition rather
+    // than a safe wait.
+    setCreds();
+    stubGateFetch({
+      node: { __typename: "PullRequest", state, merged, closedAt: null, mergedBy: null },
+    });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toEqual({ error: "pull_request_state_missing" });
+  });
+
+  it("keeps a partial merger rather than discarding the readable half (PEN-6055)", async () => {
+    // GitHub substitutes a `ghost` account for a deleted user, `databaseId` is
+    // reachable only through the inline fragments on the concrete actor types, and
+    // a proxy could drop fields. Each is independently nullable, so a partial
+    // actor still records what is known instead of collapsing to "unknown".
+    setCreds();
+    stubGateFetch({
+      node: {
+        __typename: "PullRequest",
+        state: "MERGED",
+        merged: true,
+        closedAt: null,
+        mergedBy: { databaseId: 1845185 },
+      },
+    });
 
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
@@ -273,15 +396,19 @@ describe("githubGetPullRequestGate", () => {
     });
   });
 
-  it("reports an unreadable merged_by as absent rather than as a row of nulls (PEN-6055)", async () => {
-    // An actor object with none of the three fields readable carries no more
-    // information than its absence. Reading it must never fail the lookup: the gate
-    // verdict does not depend on who merged, only on whether it merged.
+  it("reports an unreadable merger as absent rather than as a row of nulls (PEN-6055)", async () => {
+    // Reading the merger must never fail the lookup: the gate verdict does not
+    // depend on who merged, only on whether it merged.
     setCreds();
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) =>
-      String(url).includes("/access_tokens")
-        ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
-        : jsonResponse({ state: "closed", merged: true, closed_at: null, merged_by: "ghost" })));
+    stubGateFetch({
+      node: {
+        __typename: "PullRequest",
+        state: "MERGED",
+        merged: true,
+        closedAt: null,
+        mergedBy: "ghost",
+      },
+    });
 
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
@@ -289,16 +416,9 @@ describe("githubGetPullRequestGate", () => {
     })).resolves.toEqual({ state: "closed", merged: true, closedAt: null, mergedBy: null });
   });
 
-  it("normalises a missing closed_at to null rather than undefined", async () => {
-    // GitHub always sends the field, but a proxy or a future payload change could
-    // drop it. `null` keeps the success arm one shape, so a consumer destructuring
-    // it cannot tell "absent" from "present and empty" by accident. `mergedBy`
-    // follows the same rule for the same reason.
+  it("normalises a missing closedAt to null rather than undefined", async () => {
     setCreds();
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) =>
-      String(url).includes("/access_tokens")
-        ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
-        : jsonResponse({ state: "closed", merged: false })));
+    stubGateFetch({ node: { __typename: "PullRequest", state: "CLOSED", merged: false } });
 
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
@@ -311,17 +431,23 @@ describe("githubGetPullRequestGate", () => {
     });
   });
 
-  it("threads the caller's signal into the installation-token mint, not just the resource fetch (BLO-38257)", async () => {
+  it("threads the caller's signal into the installation-token mint, not just the GraphQL read (BLO-38257)", async () => {
     setCreds();
-    // The token mint is the FIRST of two network calls. Stubbing only the
-    // second cannot see that hop, which is why this asserts on call [0]: an
-    // unthreaded mint carries only ghFetch's own default and reads NOT aborted.
+    // The token mint is the FIRST of two network calls. Stubbing only the second
+    // cannot see that hop, which is why this asserts on call [0]: an unthreaded
+    // mint carries only ghFetch's own default and reads NOT aborted.
     const signalsByCall: Array<AbortSignal | null | undefined> = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
       signalsByCall.push(init?.signal);
       return String(url).includes("/access_tokens")
         ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
-        : jsonResponse({ state: "open", merged: false });
+        : jsonResponse({
+            data: {
+              repository: {
+                issueOrPullRequest: { __typename: "PullRequest", state: "OPEN", merged: false },
+              },
+            },
+          });
     }));
 
     await githubGetPullRequestGate({
@@ -331,73 +457,96 @@ describe("githubGetPullRequestGate", () => {
     });
 
     expect(signalsByCall.length).toBeGreaterThan(0);
-    expect(signalsByCall[0]?.aborted).toBe(true);
+    expect(signalsByCall.every((signal) => signal?.aborted === true)).toBe(true);
   });
 
   it("fails open to an explicit error when GitHub is unavailable", async () => {
     setCreds();
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
-      if (String(url).includes("/access_tokens")) {
-        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-      }
-      return jsonResponse({ message: "unavailable" }, false, 503);
-    }));
+    stubGateFetch({ graphqlStatus: 503, graphqlOk: false });
 
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
       prNumber: 847,
     })).resolves.toEqual({ error: "pull_request_http_503" });
   });
+
+  it("fails open to an explicit error when the GraphQL hop throws", async () => {
+    setCreds();
+    stubGateFetch({ graphqlThrows: true });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toEqual({ error: "pull_request_fetch_failed" });
+  });
+
+  it("refuses a repo name it cannot split rather than querying with a guess", async () => {
+    setCreds();
+    const fetchMock = stubGateFetch({ node: null });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "not-a-repo-full-name",
+      prNumber: 847,
+    })).resolves.toEqual({ error: "pull_request_repo_full_name_invalid" });
+    expect(graphQlCalls(fetchMock)).toHaveLength(0);
+  });
 });
 
 /**
- * PEN-5254 — a 404 on `/pulls/{n}` has two opposite causes and only one of them is
- * the caller's fault.
+ * PEN-5254 — an unresolvable pull-request lookup has two opposite causes and only
+ * one of them is the caller's fault.
  *
  * `notFound` is the single result that reaches the file-time refusal, so it must be
  * set ONLY when the repository is confirmed readable. The alternative — an App that
- * is not installed, mid-reinstall, or whose access was revoked — 404s identically,
- * and refusing that card would tell an agent its PR number is wrong when it is not.
+ * is not installed, mid-reinstall, or whose access was revoked — is reported
+ * identically, and refusing that card would tell an agent its PR number is wrong
+ * when it is not.
  *
- * ⚠ The 404-only narrowness is the point and is pinned below. Keying the refusal on
- * `retryable === false` instead would also catch 401 and non-rate-limit 403, so a
- * broken installation token would refuse every PR-gated escalation at the door.
+ * ⭐ PEN-6341 item 2 made ONE of the two causes resolvable in the SAME call.
+ * `issueOrPullRequest` answers an ISSUE number with `__typename: "Issue"` rather
+ * than with the null-plus-NOT_FOUND an absent number produces — verified
+ * first-party 2026-11-13 — and that is the likeliest way this fires in practice,
+ * since an agent has the issue number to hand when it files a card. The repo probe
+ * survives, narrower: it now runs only for the answer GraphQL still collapses.
  */
-describe("githubGetPullRequestGate 404 disambiguation", () => {
-  const stubFetch = (prStatus: number, repoStatus: number, repoBody: unknown = {}) => {
-    const fetchMock = vi.fn(async (url: string | URL) => {
-      const u = String(url);
-      if (u.includes("/access_tokens")) {
-        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-      }
-      if (u.includes("/pulls/")) {
-        return jsonResponse({ message: "Not Found" }, false, prStatus);
-      }
-      return jsonResponse(repoBody, repoStatus >= 200 && repoStatus < 300, repoStatus);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    return fetchMock;
-  };
-
-  it("reports notFound only once the repository is confirmed readable", async () => {
+describe("githubGetPullRequestGate not-found disambiguation", () => {
+  it("resolves an ISSUE number in one call, with no repo probe at all", async () => {
     setCreds();
-    const fetchMock = stubFetch(404, 200, { full_name: "Blockcast/paperclip" });
+    const fetchMock = stubGateFetch({ node: { __typename: "Issue" } });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 3041,
+    })).resolves.toEqual({ error: "pull_request_not_found", notFound: true });
+
+    // Reaching the `Issue` answer at all means `repository` resolved, so the
+    // repository is demonstrably readable and the absence is positive evidence
+    // without a second call. The REST reader needed one.
+    expect(repoProbeCalls(fetchMock)).toHaveLength(0);
+  });
+
+  it("reports notFound for an absent number only once the repository is confirmed readable", async () => {
+    setCreds();
+    const fetchMock = stubGateFetch({
+      node: null,
+      errors: NOT_FOUND_ERRORS,
+      repoStatus: 200,
+      repoBody: { full_name: "Blockcast/paperclip" },
+    });
 
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
       prNumber: 999999,
     })).resolves.toEqual({ error: "pull_request_not_found", notFound: true });
 
-    // The repo probe is what makes the pull request's absence positive evidence.
-    expect(fetchMock.mock.calls.some(([url]) => /\/repos\/Blockcast\/paperclip$/.test(String(url))))
-      .toBe(true);
+    expect(repoProbeCalls(fetchMock)).toHaveLength(1);
   });
 
   it.each([404, 403, 401])(
     "withholds notFound when the repository answers %i",
     async (repoStatus) => {
       setCreds();
-      stubFetch(404, repoStatus);
+      stubGateFetch({ node: null, errors: NOT_FOUND_ERRORS, repoStatus });
 
       const result = await githubGetPullRequestGate({
         repoFullName: "Blockcast/private-repo",
@@ -413,7 +562,7 @@ describe("githubGetPullRequestGate 404 disambiguation", () => {
 
   it("withholds notFound when the repository probe itself fails transiently", async () => {
     setCreds();
-    stubFetch(404, 503);
+    stubGateFetch({ node: null, errors: NOT_FOUND_ERRORS, repoStatus: 503 });
 
     const result = await githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
@@ -424,11 +573,13 @@ describe("githubGetPullRequestGate 404 disambiguation", () => {
   });
 
   it.each([401, 403, 429, 500, 503])(
-    "never sets notFound for a %i, which is not a 404 at all",
-    async (prStatus) => {
+    "never sets notFound for a %i, which says nothing about whether the PR exists",
+    async (graphqlStatus) => {
       setCreds();
-      // No repo probe should even be attempted: only a 404 is ambiguous.
-      const fetchMock = stubFetch(prStatus, 200, { full_name: "Blockcast/paperclip" });
+      // No repo probe should even be attempted: only the collapsed NOT_FOUND
+      // answer is ambiguous. A transport-level status is not a statement about
+      // the pull request at all.
+      const fetchMock = stubGateFetch({ graphqlStatus, graphqlOk: false });
 
       const result = await githubGetPullRequestGate({
         repoFullName: "Blockcast/paperclip",
@@ -436,12 +587,11 @@ describe("githubGetPullRequestGate 404 disambiguation", () => {
       });
 
       expect(result).not.toHaveProperty("notFound");
-      expect(fetchMock.mock.calls.some(([url]) => /\/repos\/Blockcast\/paperclip$/.test(String(url))))
-        .toBe(false);
+      expect(repoProbeCalls(fetchMock)).toHaveLength(0);
     },
   );
 
-  it("threads the caller's signal into the repo probe as well as the PR read", async () => {
+  it("threads the caller's signal into the repo probe as well as the GraphQL read", async () => {
     setCreds();
     const signals: Array<AbortSignal | null | undefined> = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
@@ -450,7 +600,12 @@ describe("githubGetPullRequestGate 404 disambiguation", () => {
       if (u.includes("/access_tokens")) {
         return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       }
-      if (u.includes("/pulls/")) return jsonResponse({ message: "Not Found" }, false, 404);
+      if (u.startsWith(GRAPHQL_URL)) {
+        return jsonResponse({
+          data: { repository: { issueOrPullRequest: null } },
+          errors: NOT_FOUND_ERRORS,
+        });
+      }
       return jsonResponse({ full_name: "Blockcast/paperclip" });
     }));
 
@@ -460,7 +615,7 @@ describe("githubGetPullRequestGate 404 disambiguation", () => {
       signal: AbortSignal.abort(new Error("already-aborted")),
     });
 
-    // Three hops now (mint, PR, repo probe) and the probe is the one this PR adds.
+    // Three hops: mint, GraphQL read, repo probe.
     expect(signals).toHaveLength(3);
     expect(signals.every((signal) => signal?.aborted === true)).toBe(true);
   });
