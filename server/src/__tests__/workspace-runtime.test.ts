@@ -6346,6 +6346,61 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
     expect(inspection).toMatchObject({ valid: false, reasonCode: "not_registered" });
   });
 
+  // PEN-3381. Both stepping loops below drive SIMULATED time past a bound the
+  // subject arms in simulated time, while everything the subject does in
+  // between -- `git worktree list` and the other git subprocesses, a real
+  // `fs.readFile` -- runs in REAL time. So each step has to hand that real work
+  // some wall clock before simulated time is allowed to move again. Starve it
+  // and fake time runs away from the subprocesses, and the subject reports a
+  // stall that is not there: a false red on a contended runner, in a test whose
+  // subject is fine, which reds the whole shard for an unrelated PR.
+  //
+  // Starvation is MEASURABLE, and measuring it is what set the number below.
+  // Sweeping the per-step grace on an idle host and recording how much
+  // SIMULATED time each loop needed before it settled:
+  //
+  //     grace    rethrows-stall   finalize   sameHead-repair
+  //      20ms      125_000ms      130_000ms      575_000ms
+  //      50ms       85_000ms       90_000ms      245_000ms
+  //     100ms       75_000ms       70_000ms      135_000ms
+  //     200ms       65_000ms       65_000ms       85_000ms
+  //     400ms       60_000ms       60_000ms       60_000ms
+  //
+  // 60_000ms is the floor and it is structural, not empirical: these subjects
+  // chain exactly two 30s bounds. Everything above it is fake time the real
+  // work never got to use. The previous literal (20ms per step, i.e. 6 x 20ms =
+  // 120ms of wall clock per 30s bound) was therefore ALREADY in the starved
+  // regime on an IDLE host, overshooting the floor by 2x and by 9.6x -- so the
+  // margin on the shared ARC pool, where this row measured a ~9.4x contention
+  // multiplier, was not thin, it was already gone.
+  //
+  // The grace is DERIVED from the wall-clock budget we mean to grant per bound,
+  // never written as a literal: a literal silently changes that budget whenever
+  // the step size or the subject's bound is edited, which is the same drift
+  // that left a 10_000ms vitest deadline wrapping a 30_000ms executionTarget in
+  // two other tests on this row. 6_000ms per bound is 50x what the old literal
+  // granted, and it costs ~13s of wall clock per test (13 steps x 1_000ms)
+  // against the 60s suite-wide testTimeout.
+  //
+  // Nothing in either helper asserts how long the wait took, so this is
+  // plumbing and widening it weakens no assertion. If these tests fail at this
+  // budget the answer is NOT another multiplier: that is then a real finding
+  // about worktree-inspection latency.
+  const FAKE_STEP_MS = 5_000;
+  const SUBJECT_BOUND_MS = 30_000;
+  const STEPS_PER_BOUND = SUBJECT_BOUND_MS / FAKE_STEP_MS;
+  const REAL_BUDGET_PER_BOUND_MS = 6_000;
+  const STEP_REAL_GRACE_MS = REAL_BUDGET_PER_BOUND_MS / STEPS_PER_BOUND;
+  // The measured floor, in steps, for a loop that is NOT starved.
+  const SETTLE_FLOOR_STEPS = (2 * SUBJECT_BOUND_MS) / FAKE_STEP_MS;
+  // Give up after this many bounds' worth of simulated time. Stated in bounds
+  // so it keeps meaning the same thing if either constant above moves, and
+  // deliberately below the suite testTimeout in REAL terms
+  // (STEP_MAX x STEP_REAL_GRACE_MS = 36s < 60s) so a starved loop surfaces as
+  // the named throw below rather than as an anonymous vitest timeout.
+  const STEP_MAX_BOUNDS = 6;
+  const STEP_MAX = STEP_MAX_BOUNDS * STEPS_PER_BOUND;
+
   // Stalls `git worktree list` (30s bound) and the direct `.git` read (reclaim
   // deadline), then steps fake time until the inspection settles.
   async function inspectWithListAndReadStalled(branchName: string, rethrowListStall?: boolean) {
@@ -6363,14 +6418,21 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
       return await withFailingWorktreeList(async () => {
         const settled = inspectManagedGitWorktreeBranch({ worktreePath, expectedBranchName: branchName, rethrowListStall })
           .then((value) => ({ value }), (error: unknown) => ({ error }));
-        // Each 30s bound is armed only when its call starts, so step fake time
-        // while giving the real subprocesses a moment between steps.
-        for (let step = 0; step < 300; step += 1) {
-          const done = await Promise.race([settled, new Promise<null>((resolve) => realSetTimeout(() => resolve(null), 20))]);
+        // Each bound is armed only when its call starts, so step fake time while
+        // handing the real subprocesses STEP_REAL_GRACE_MS of wall clock per step.
+        for (let step = 0; step < STEP_MAX; step += 1) {
+          const done = await Promise.race([
+            settled,
+            new Promise<null>((resolve) => realSetTimeout(() => resolve(null), STEP_REAL_GRACE_MS)),
+          ]);
           if (done) return done;
-          await vi.advanceTimersByTimeAsync(5_000);
+          await vi.advanceTimersByTimeAsync(FAKE_STEP_MS);
         }
-        throw new Error("inspection never settled");
+        throw new Error(
+          `inspection never settled: fake time outran the real work for ${STEP_MAX} steps ` +
+            `(${STEP_MAX * FAKE_STEP_MS}ms simulated, ${STEP_MAX * STEP_REAL_GRACE_MS}ms real). ` +
+            `The floor is ${SETTLE_FLOOR_STEPS} steps; see REAL_BUDGET_PER_BOUND_MS above.`,
+        );
       }, "stall");
     } finally {
       vi.useRealTimers();
@@ -6388,12 +6450,12 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
     expect(outcome).toMatchObject({
       error: { name: "GitCommandTimeoutError", message: expect.stringContaining("worktree list") },
     });
-  }, 30_000);
+  });
 
   it("keeps not_registered for finalize, which must not turn a finished run into a retry", async () => {
     const outcome = await inspectWithListAndReadStalled("BLO-42089-finalize", false);
     expect(outcome).toMatchObject({ value: { valid: false, reasonCode: "not_registered" } });
-  }, 30_000);
+  });
 
   // BLO-48176: the branch-incoherence evidence read a timed-out list as
   // "worktree path is not registered", so no safe repair could ever run on a
@@ -6404,12 +6466,19 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
     try {
       return await withFailingWorktreeList(async () => {
         const settled = run().then((value) => ({ value }), (error: unknown) => ({ error }));
-        for (let step = 0; step < 300; step += 1) {
-          const done = await Promise.race([settled, new Promise<null>((resolve) => realSetTimeout(() => resolve(null), 20))]);
+        for (let step = 0; step < STEP_MAX; step += 1) {
+          const done = await Promise.race([
+            settled,
+            new Promise<null>((resolve) => realSetTimeout(() => resolve(null), STEP_REAL_GRACE_MS)),
+          ]);
           if (done) return done;
-          await vi.advanceTimersByTimeAsync(5_000);
+          await vi.advanceTimersByTimeAsync(FAKE_STEP_MS);
         }
-        throw new Error("never settled");
+        throw new Error(
+          `never settled: fake time outran the real work for ${STEP_MAX} steps ` +
+            `(${STEP_MAX * FAKE_STEP_MS}ms simulated, ${STEP_MAX * STEP_REAL_GRACE_MS}ms real). ` +
+            `The floor is ${SETTLE_FLOOR_STEPS} steps; see REAL_BUDGET_PER_BOUND_MS above.`,
+        );
       }, "stall");
     } finally {
       vi.useRealTimers();
@@ -6431,7 +6500,7 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
 
     expect(outcome).toMatchObject({ value: { branchName: "BLO-48176-recorded" } });
     expect(await readGit(worktreePath, ["symbolic-ref", "--short", "HEAD"])).toBe("BLO-48176-recorded");
-  }, 30_000);
+  });
 
   it("names the failed enumeration, not \"not registered\", when a diverged repair needs the list (BLO-48176)", async () => {
     const { repoRoot, worktreePath } = await createLinkedWorktree("BLO-48176-diverged-live");
