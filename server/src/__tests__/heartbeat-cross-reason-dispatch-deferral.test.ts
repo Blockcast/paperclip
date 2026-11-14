@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyHeartbeatWakeClass,
   contextCarriesGithubWake,
+  describeDuplicateDispatchDeferralMiss,
   mergeCoalescedContextSnapshot,
 } from "../services/heartbeat.js";
 import { KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS } from "../services/metrics.js";
@@ -267,16 +268,31 @@ describe("the duplicate-dispatch cancel reason", () => {
     // The retired tail named the github-arrival branch unconditionally, so the
     // largest reader of this string — a non-github arrival, 26 of 112 cancels
     // in the measured window — was pointed at an arm it fails in BOTH positions.
+    //
+    // PEN-6629 moved the three string-content assertions that used to live here
+    // into the executed suite below, where they run against the real return
+    // value instead of against a text slice of a 2.3 MB file. What a slice can
+    // still say, and nothing else can, is that the reason USES the per-arrival
+    // computation rather than a literal: swap the call for a constant and every
+    // executed assertion below would still pass on its own fixtures.
     const start = HEARTBEAT_SOURCE.indexOf("async function cancelQueuedRunForDuplicateDispatch(");
     expect(start).toBeGreaterThanOrEqual(0);
     const body = HEARTBEAT_SOURCE.slice(start, start + 4_000);
-    // The branch is computed from the arrival, not stated unconditionally.
-    expect(body).toContain("const deferralMiss = contextCarriesGithubWake(arrivalSnapshot)");
-    expect(body).toContain("and this arrival is ");
-    expect(body).toContain("the incumbent already carries a github wake");
+    // The branch is computed from THIS arrival, not stated unconditionally.
+    expect(body).toContain(
+      "const deferralMiss = describeDuplicateDispatchDeferralMiss(arrivalSnapshot)",
+    );
     // Reaching the cancel falsifies `carriesGithubWake(arrival) && !incumbent.has(github)`,
     // so the two branches are exhaustive — there is no third, unhandled case.
     expect(body).toContain("The duplicate_dispatch_cross_reason_deferred arm did not apply");
+  });
+
+  it("no longer names a tracker row as OWNING the population the arm misses", () => {
+    // PEN-6629 fix 2, asserted over the WHOLE file for the same reason the
+    // assertion above it is: the claim is that the retired literal survives
+    // nowhere, so the comment explaining the fix paraphrases it rather than
+    // quoting it. A quotation would satisfy this test with the defect live.
+    expect(HEARTBEAT_SOURCE).not.toContain("owns the uncovered population");
   });
 
   it("keeps the routine-execution cancel's wording, which a sibling matches verbatim", () => {
@@ -288,5 +304,116 @@ describe("the duplicate-dispatch cancel reason", () => {
     expect(HEARTBEAT_SOURCE).toContain(
       "already owns this dispatch lock; the owner run will continue the work",
     );
+  });
+});
+
+/**
+ * PEN-6629. Both claims the cancel reason makes about the arrival, pinned by
+ * EXECUTION rather than by slicing `heartbeat.ts` as text.
+ *
+ * The slice window in the suite above already had to be widened once
+ * (2_000 -> 4_000) because the function grew past the cut, and a short slice
+ * fails toward `not.toContain` passing vacuously. Nothing here can go vacuous:
+ * every assertion runs against a real return value, and the negative controls
+ * below would fail against a helper that returned one constant for everything.
+ */
+describe("describeDuplicateDispatchDeferralMiss", () => {
+  it("names the github branch when the incumbent already carries a github wake", () => {
+    expect(describeDuplicateDispatchDeferralMiss({ wakeReason: "github_pr_review_requested" })).toContain(
+      "the incumbent already carries a github wake",
+    );
+  });
+
+  it("reads the STICKY marker, not the raw wake class", () => {
+    // A webhook that a later comment coalesced onto still belongs in the github
+    // branch; `wakeReason` alone reads issue-local by then. Same one-character
+    // difference the gate's own guard test pins, on the reason-string side.
+    const merged = mergeCoalescedContextSnapshot(
+      { issueId: "issue-1", wakeReason: "github_pr_review_requested" },
+      { issueId: "issue-1", wakeReason: "issue_commented" },
+    );
+    expect(classifyHeartbeatWakeClass(merged)).toBe("issue_local");
+    expect(describeDuplicateDispatchDeferralMiss(merged)).toContain(
+      "the incumbent already carries a github wake",
+    );
+  });
+
+  it("says issue-local only where the class was actually established", () => {
+    for (const wakeReason of ["issue_commented", "issue_comment_mentioned", "issue_monitor_due"]) {
+      expect(describeDuplicateDispatchDeferralMiss({ wakeReason })).toContain(
+        "this arrival is issue-local",
+      );
+    }
+  });
+
+  it("does NOT assert issue-local for an arrival whose class was never established", () => {
+    // PEN-6629 fix 1, and the whole defect. `contextCarriesGithubWake` is false
+    // for an unclassifiable arrival as well as an issue-local one, so a single
+    // `false` branch spoke for both and asserted a class the code never read.
+    // Branch SELECTION was right either way — neither can satisfy the deferral
+    // arm — so only the reason given over-claimed. The reason string renders
+    // the same `null` as "unclassified" a clause earlier, so the sentence
+    // contradicted itself inside one line.
+    const unclassifiable: Array<Record<string, unknown> | null | undefined> = [
+      {},
+      { wakeReason: "" },
+      { wakeReason: "   " },
+      { wakeReason: 42 },
+      null,
+      undefined,
+    ];
+    for (const arrival of unclassifiable) {
+      expect(classifyHeartbeatWakeClass(arrival)).toBeNull();
+      expect(contextCarriesGithubWake(arrival)).toBe(false);
+      const miss = describeDuplicateDispatchDeferralMiss(arrival);
+      expect(miss).not.toContain("this arrival is issue-local");
+      expect(miss).toContain("no established class");
+    }
+  });
+
+  it("states the standing decision as fact and cites the rows, naming no owner", () => {
+    // PEN-6629 fix 2. The retired tail was a STATUS CLAIM about a tracker row,
+    // persisted in a string that admits no adjacent correction — and it does
+    // not decay, it INVERTS: PEN-6575 done-when 3 declined the cross-reason
+    // widening on measurement, so from the moment that row closed the sentence
+    // told a reader somebody was on it when the standing decision is nobody is.
+    //
+    // Dropping the identifiers is NOT the remedy: a reader of a cancelled run
+    // cannot reach the code comment, and those rows are the only address for
+    // the census behind the sentence. So they stay, as citations.
+    const miss = describeDuplicateDispatchDeferralMiss({ wakeReason: "issue_commented" });
+    expect(miss).toContain("measured and declined");
+    expect(miss).toContain("PEN-6575");
+    expect(miss).toContain("PEN-6625");
+    expect(miss).not.toMatch(/\bowns\b/);
+  });
+
+  it("names no owner on ANY branch, and discriminates between them (negative control)", () => {
+    // Without the second half, every assertion in this suite would also pass
+    // against a helper that ignored its argument and returned one constant.
+    const github = describeDuplicateDispatchDeferralMiss({
+      wakeReason: "github_pr_review_requested",
+    });
+    const issueLocal = describeDuplicateDispatchDeferralMiss({ wakeReason: "issue_commented" });
+    const unclassified = describeDuplicateDispatchDeferralMiss({});
+    for (const miss of [github, issueLocal, unclassified]) {
+      expect(miss).not.toMatch(/\bowns\b/);
+      expect(miss.length).toBeGreaterThan(0);
+    }
+    expect(new Set([github, issueLocal, unclassified]).size).toBe(3);
+  });
+
+  it("returns a clause the reason template can splice without double punctuation", () => {
+    // The caller appends "...arm did not apply: ${deferralMiss}." — so a
+    // trailing period here would render "...(PEN-6625).." on every cancelled
+    // row. Cheap to get wrong while rewording, invisible until someone reads a
+    // real cancel.
+    for (const arrival of [
+      { wakeReason: "github_pr_review_requested" },
+      { wakeReason: "issue_commented" },
+      {},
+    ]) {
+      expect(describeDuplicateDispatchDeferralMiss(arrival).endsWith(".")).toBe(false);
+    }
   });
 });
