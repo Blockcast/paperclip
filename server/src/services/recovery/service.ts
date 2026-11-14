@@ -100,8 +100,8 @@ import {
 } from "../issue-checkout-status.js";
 import {
   applyIssueMonitorPolicyTransition,
-  buildIssueMonitorClearedPatch,
-  buildIssueMonitorEligibilityPatch,
+  buildIssueMonitorClear,
+  buildIssueMonitorEligibilityClear,
   derivePersistedMonitorState,
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
@@ -7630,15 +7630,21 @@ export function recoveryService(
         })
       ) return null;
 
+      // PEN-6571: hoisted so the audit payload is captured from the PRE-clear
+      // row, and folded into this path's existing `issue.updated` row below.
+      // That row already recorded the escalation; what it did not record was
+      // the monitor note this clear destroys.
+      const monitorClear = buildIssueMonitorClear({
+        issue: fresh,
+        policy: normalizeIssueExecutionPolicy(fresh.executionPolicy ?? null),
+        clearReason: "suppressed_by_status",
+      });
+
       const updated = await issuesSvc.update(
         fresh.id,
         {
           status: "blocked",
-          ...buildIssueMonitorClearedPatch({
-            issue: fresh,
-            policy: normalizeIssueExecutionPolicy(fresh.executionPolicy ?? null),
-            clearReason: "suppressed_by_status",
-          }),
+          ...monitorClear.patch,
           expectedCurrentStatus: fresh.status,
           expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
           expectedCurrentCheckoutRunId: fresh.checkoutRunId,
@@ -7676,6 +7682,7 @@ export function recoveryService(
           status: "blocked",
           previousStatus: input.previousStatus,
           source: "recovery.reconcile_stranded_recovery_issue",
+          monitorCleared: monitorClear.audit,
           latestRunId: input.latestRun?.id ?? null,
           latestRunStatus: input.latestRun?.status ?? null,
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
@@ -8844,6 +8851,15 @@ export function recoveryService(
       });
 
       const escalatedAssigneeAgentId = action.ownerAgentId ?? fresh.assigneeAgentId;
+      // PEN-6571: captured from the PRE-clear row and folded into this path's
+      // existing escalation activity row below. Keyed on the *computed*
+      // `escalatedStatus`, matching the spread it replaces.
+      const monitorClear = buildIssueMonitorEligibilityClear({
+        ...fresh,
+        status: escalatedStatus,
+        assigneeAgentId: escalatedAssigneeAgentId,
+      });
+
       const issueUpdate = {
         status: escalatedStatus,
         blockedByIssueIds: blockerIds,
@@ -8858,13 +8874,9 @@ export function recoveryService(
         //
         // Keyed on the *computed* `escalatedStatus`, not on `fresh.status`: the
         // BLO-27635 branch deliberately leaves capacity strands dispatchable, and
-        // `buildIssueMonitorEligibilityPatch` returns `{}` whenever the resulting
+        // `buildIssueMonitorEligibilityClear` returns `null` whenever the resulting
         // status still allows a monitor, so that path is unaffected.
-        ...buildIssueMonitorEligibilityPatch({
-          ...fresh,
-          status: escalatedStatus,
-          assigneeAgentId: escalatedAssigneeAgentId,
-        }),
+        ...(monitorClear?.patch ?? {}),
         expectedCurrentStatus: fresh.status,
         // Keep the assignee snapshot as a belt-and-braces write precondition.
         expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
@@ -9114,6 +9126,9 @@ export function recoveryService(
           statusBefore: fresh.status,
           statusAfter: escalatedStatus,
           recoveryPathAbsent: hasNoRecoveryPath,
+          // PEN-6571: null when the escalated status still allows a monitor, so
+          // this key doubles as "did this escalation clear one".
+          monitorCleared: monitorClear?.audit ?? null,
           source: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
             ? "recovery.reconcile_successful_run_handoff_missing_state"
             : recoveryCause === "workspace_validation_failed"
@@ -9310,17 +9325,21 @@ export function recoveryService(
         })
       ) return null;
 
+      // PEN-6571: see the sibling escalation above — captured pre-clear and
+      // folded into this path's existing `issue.updated` row.
+      const monitorClear = buildIssueMonitorClear({
+        issue: fresh,
+        policy: normalizeIssueExecutionPolicy(fresh.executionPolicy ?? null),
+        clearReason: "suppressed_by_status",
+      });
+
       let updated: Awaited<ReturnType<typeof issuesSvc.update>>;
       try {
         updated = await issuesSvc.update(
           fresh.id,
           {
             status: "blocked",
-            ...buildIssueMonitorClearedPatch({
-              issue: fresh,
-              policy: normalizeIssueExecutionPolicy(fresh.executionPolicy ?? null),
-              clearReason: "suppressed_by_status",
-            }),
+            ...monitorClear.patch,
             expectedCurrentStatus: fresh.status,
             expectedCurrentAssigneeAgentId: fresh.assigneeAgentId,
             expectedCurrentCheckoutRunId: fresh.checkoutRunId,
@@ -9359,6 +9378,7 @@ export function recoveryService(
           status: "blocked",
           previousStatus: input.previousStatus,
           source: "recovery.reconcile_stranded_assigned_issue.zero_token_startup_failure",
+          monitorCleared: monitorClear.audit,
           latestRunId: input.latestRun?.id ?? null,
           latestRunStatus: input.latestRun?.status ?? null,
           latestRunErrorCode: input.latestRun?.errorCode ?? null,

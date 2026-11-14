@@ -128,7 +128,8 @@ import {
   type ParsedExecutionWorkspaceMode,
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
-import { buildInitialIssueMonitorFields, buildIssueMonitorEligibilityPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
+import { buildInitialIssueMonitorFields, buildIssueMonitorEligibilityClear, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
+import { logIssueMonitorClearedUndeliverable } from "./activity-log.js";
 import { isDeliberateParkActive, isIssueParkExpiryWakeStatus } from "./issue-park-expiry.js";
 import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
@@ -4715,7 +4716,7 @@ const issueListSelect = {
   //
   // The monitor_* columns next to this one do NOT mirror the lifecycle state, and the
   // comment above saying `monitor` is "mirrored by the monitor_* columns" is true only of
-  // its scheduling fields. `buildIssueMonitorClearedPatch` nulls `monitorNextCheckAt` and
+  // its scheduling fields. `buildIssueMonitorClear` nulls `monitorNextCheckAt` and
   // leaves `monitorLastTriggeredAt` standing, and so does a fire — so `triggered` and
   // `cleared` are BYTE-IDENTICAL on this surface (`nextCheckAt` null, `lastTriggeredAt`
   // set), while their attendance verdicts are opposite:
@@ -14672,6 +14673,16 @@ export function issueService(db: Db) {
           }
         }
 
+        // PEN-6571: computed before the write so the audit payload is read off
+        // the PRE-clear row. After the `.set` below lands there is nothing left
+        // to read it from — that is the whole reason it travels on the return
+        // value rather than being re-derived from `updated`.
+        const monitorClear = buildIssueMonitorEligibilityClear({
+          ...existing,
+          status: "todo",
+          assigneeAgentId: null,
+        });
+
         const updated = await tx
           .update(issues)
           .set({
@@ -14698,16 +14709,27 @@ export function issueService(db: Db) {
             // (status leaves `in_progress`, the agent assignee is dropped), so a
             // monitor left armed here can never fire again. Reconcile against
             // the post-write shape, not `existing`.
-            ...buildIssueMonitorEligibilityPatch({
-              ...existing,
-              status: "todo",
-              assigneeAgentId: null,
-            }),
+            ...(monitorClear?.patch ?? {}),
           })
           .where(eq(issues.id, id))
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        // PEN-6571: the release route logs `issue.released` with no details at
+        // all, so before this the notes this write just nulled left no record
+        // anywhere. Logged from the service rather than the route because the
+        // destruction happens here, and `release` is reachable from more than
+        // one caller.
+        if (monitorClear) {
+          await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+            companyId: updated.companyId,
+            issueId: updated.id,
+            identifier: updated.identifier,
+            status: "todo",
+            audit: monitorClear.audit,
+            source: "issues.release",
+          });
+        }
         await cancelStaleIssueContextRuns({
           companyId: updated.companyId,
           issueId: updated.id,

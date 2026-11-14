@@ -32,7 +32,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS, TIMER_PRE_DISPATCH_EXCLUSION_SOURCE } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
-  buildIssueMonitorClearedPatch,
+  buildIssueMonitorClear,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
@@ -2137,12 +2137,12 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     // the fixture.
     await db
       .update(issues)
-      .set(buildIssueMonitorClearedPatch({
+      .set(buildIssueMonitorClear({
         issue: row,
         policy: normalizeIssueExecutionPolicy(row.executionPolicy ?? null),
         clearReason: "manual",
         clearedAt: new Date("2026-04-11T12:31:02.000Z"),
-      }))
+      }).patch)
       .where(eq(issues.id, issueId));
   }
 
@@ -2540,7 +2540,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   // retired monitor's metadata is the only declared bound such a row carries,
   // `monitorAttemptCount` survives a clear so its ceiling has to survive with it
   // or a 26-attempt row is judged against the default 24, and the row's own next
-  // write (`buildIssueMonitorClearedPatch`) derives its `previous` through this
+  // write (`buildIssueMonitorClear`) derives its `previous` through this
   // same unfiltered helper. A `status !== "cleared"` filter flips this test to a
   // dispatch, and would have to move those builders in the same commit — the
   // lesson of PEN-5170, applied to the siblings that actually share this helper

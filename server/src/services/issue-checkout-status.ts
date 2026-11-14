@@ -1,7 +1,8 @@
 import { and, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { heartbeatRuns, issueRelations, issues, type Db, type DbTransaction } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
-import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
+import { buildIssueMonitorEligibilityClear } from "./issue-execution-policy.js";
+import { logIssueMonitorClearedUndeliverable } from "./activity-log.js";
 import { externalWaitFromDescription } from "./external-wait-declaration.js";
 
 type DbOrTransaction = Db | DbTransaction;
@@ -351,6 +352,11 @@ const restoreCheckoutPromotionSet = (declaredExternalWaitIds: readonly string[] 
  */
 const restoreReturning = {
   id: issues.id,
+  // PEN-6571: carried so `reconcileRestoredMonitors` can record the clear it
+  // performs. This pass destroys the monitor notes and used to write no
+  // activity row at all, because the row it reads had no company to log under.
+  companyId: issues.companyId,
+  identifier: issues.identifier,
   status: issues.status,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
@@ -366,6 +372,8 @@ const restoreReturning = {
 
 type RestoredRow = {
   id: string;
+  companyId: string;
+  identifier: string;
   status: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
@@ -402,7 +410,7 @@ type RestoredRow = {
  * `triggered` — precisely the state this pass excluded. The row then sat outside
  * `tickExpiredIssueMonitors`' `in_progress`/`in_review` window forever. Measured
  * at 91–106 days on three rows, each watching a pull request that had already
- * merged. The skip is gone; `buildIssueMonitorEligibilityPatch` now decides.
+ * merged. The skip is gone; `buildIssueMonitorEligibilityClear` now decides.
  *
  * The restore itself stays one set-based statement — the batch form exists
  * precisely so cleanup scales without N round-trips. Reconciliation is a
@@ -433,7 +441,7 @@ async function reconcileRestoredMonitors(
   rows: readonly RestoredRow[],
 ): Promise<void> {
   for (const row of rows) {
-    const patch = buildIssueMonitorEligibilityPatch({
+    const clear = buildIssueMonitorEligibilityClear({
       status: row.status,
       assigneeAgentId: row.assigneeAgentId,
       assigneeUserId: row.assigneeUserId,
@@ -446,10 +454,10 @@ async function reconcileRestoredMonitors(
       monitorNotes: row.monitorNotes,
       monitorScheduledBy: row.monitorScheduledBy,
     });
-    if (Object.keys(patch).length === 0) continue;
-    await dbOrTx
+    if (!clear) continue;
+    const cleared = await dbOrTx
       .update(issues)
-      .set({ ...patch, updatedAt: new Date() })
+      .set({ ...clear.patch, updatedAt: new Date() })
       .where(
         and(
           eq(issues.id, row.id),
@@ -461,7 +469,23 @@ async function reconcileRestoredMonitors(
                 sql`(${issues.executionState} -> 'monitor' ->> 'status') is distinct from 'cleared'`,
               ),
         ),
-      );
+      )
+      .returning({ id: issues.id });
+
+    // PEN-6571: record the clear that just destroyed the notes. Gated on the
+    // CAS above having matched — the guard can legitimately miss (another
+    // writer cleared first), and a log line for a write that did not happen is
+    // worse than none, because the reader cannot tell the two apart.
+    //
+    if (cleared.length === 0) continue;
+    await logIssueMonitorClearedUndeliverable(dbOrTx as Db, {
+      companyId: row.companyId,
+      issueId: row.id,
+      identifier: row.identifier,
+      status: row.status,
+      audit: clear.audit,
+      source: "issue_checkout_status.reconcile_restored_monitors",
+    });
   }
 }
 
