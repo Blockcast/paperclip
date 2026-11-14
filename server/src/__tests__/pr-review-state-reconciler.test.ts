@@ -56,6 +56,62 @@ function jsonResponse(body: unknown, ok = true) {
   return { ok, status: ok ? 200 : 502, json: async () => body };
 }
 
+/**
+ * PEN-6341 item 2: the reviews pager is GraphQL now, so it arrives as a POST to
+ * `/graphql` carrying its PR number in the variables rather than in the path,
+ * and is told apart from any other document by the query text. The rows these
+ * handlers return stay REST-shaped for legibility and are translated here --
+ * including GitHub's bare-slug rule for a Bot actor, which is what the reader
+ * under test has to put back.
+ */
+function isReviewsQuery(init?: unknown): boolean {
+  const body = (init as { body?: unknown } | undefined)?.body;
+  return typeof body === "string" && body.includes("reviews(first:");
+}
+
+function graphQlVariables(init?: unknown): Record<string, unknown> {
+  const body = (init as { body?: unknown } | undefined)?.body;
+  if (typeof body !== "string") return {};
+  try {
+    return (JSON.parse(body) as { variables?: Record<string, unknown> }).variables ?? {};
+  } catch {
+    return {};
+  }
+}
+
+function graphQlReviewsEnvelope(rows: unknown[]): unknown {
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          reviews: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: rows.map((row) => {
+              const r = row as {
+                user?: { login?: string | null } | null;
+                state?: string | null;
+                submitted_at?: string | null;
+              };
+              const login = r.user?.login ?? null;
+              const isBot = typeof login === "string" && login.endsWith("[bot]");
+              return {
+                state: r.state ?? null,
+                body: "",
+                submittedAt: r.submitted_at ?? null,
+                author:
+                  typeof login === "string"
+                    ? { login: isBot ? login.slice(0, -"[bot]".length) : login, __typename: isBot ? "Bot" : "User" }
+                    : null,
+                commit: null,
+              };
+            }),
+          },
+        },
+      },
+    },
+  };
+}
+
 /** Route a mocked GitHub call by URL shape. */
 function routeGithub(handlers: {
   openPrPages?: unknown[][];
@@ -63,17 +119,18 @@ function routeGithub(handlers: {
   reviews?: (prNumber: number) => unknown;
   timeline?: (prNumber: number) => unknown;
 }) {
-  ghFetchMock.mockImplementation(async (url: string) => {
+  ghFetchMock.mockImplementation(async (url: string, init?: unknown) => {
     const prMatch = /\/pulls\/(\d+)\//.exec(url) ?? /\/issues\/(\d+)\//.exec(url);
     const prNumber = prMatch ? Number(prMatch[1]) : 0;
 
+    if (url.endsWith("/graphql") && isReviewsQuery(init)) {
+      const number = Number(graphQlVariables(init).number ?? 0);
+      const result = handlers.reviews?.(number);
+      return result === null ? jsonResponse(null, false) : jsonResponse(graphQlReviewsEnvelope((result as unknown[]) ?? []));
+    }
     if (url.includes("/requested_reviewers")) {
       const result = handlers.requestedReviewers?.(prNumber);
       return result === null ? jsonResponse(null, false) : jsonResponse(result ?? { users: [], teams: [] });
-    }
-    if (url.includes("/reviews")) {
-      const result = handlers.reviews?.(prNumber);
-      return result === null ? jsonResponse(null, false) : jsonResponse(result ?? []);
     }
     if (url.includes("/timeline")) {
       const result = handlers.timeline?.(prNumber);
@@ -440,8 +497,8 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
     // observable without driving a gate evaluation or a single extra fetch.
     ghFetchMock.mockImplementation(async (url: string) => {
       const repo = url.includes(REPO_B) ? REPO_B : REPO;
+      if (url.endsWith("/graphql")) return jsonResponse(graphQlReviewsEnvelope([]));
       if (url.includes("/requested_reviewers")) return jsonResponse({ users: [], teams: [] });
-      if (url.includes("/reviews")) return jsonResponse([]);
       if (url.includes("/timeline")) return jsonResponse([]);
       const page = Number(/[?&]page=(\d+)/.exec(url)?.[1] ?? 1);
       if (page > 1) return jsonResponse([]);
