@@ -472,11 +472,21 @@ function assertPipelineCompanyAccess(req: Request, companyId: string) {
  * ✅ THE `workspaceRuntime` HALF IS CLOSED AT THESE THREE ROUTES, 2026-11-14 (PEN-6595), in
  * exactly that shape — the INHERITANCE gap above is NOT closed. The prescription is kept rather
  * than deleted because it is the specification the guard below has to keep meeting: refuse
- * OUTRIGHT at stage CREATE and at pipeline CREATE's `stages[]`; at stage PATCH admit an
- * unmodified echo of a masked read and refuse a fresh value. The echo test is
- * `isMaskedWorkspaceRuntimeEcho` (`../redaction.ts`) — the mask used as its own oracle, so an
- * identity or enum key added to the mask is honoured by the guard in the same commit. Graded
- * Low because a grant row is the only way an agent reaches these routes at all.
+ * OUTRIGHT at stage CREATE and at pipeline CREATE's `stages[]`; at stage PATCH admit ONLY an
+ * unmodified echo of the STORED value's mask, and refuse everything else.
+ *
+ * ⛔ THAT PREDICATE IS SPECIFIED ONCE, ON `collectStageConfigWorkspaceRuntimePaths` BELOW, AND
+ * THIS PARAGRAPH DELIBERATELY DOES NOT RESTATE IT — read it there before changing the guard.
+ * The shipped test is `isMaskedEchoOfStoredWorkspaceRuntime` (`../redaction.ts`), whose SECOND
+ * operand is the stored value. ⛔ THE FIXPOINT FORM — mask as its own oracle — WAS REJECTED in
+ * review on `#3764` before it landed. That block and `redaction.ts` carry the structure-only
+ * attacks a fixpoint admits: each one IS a fixpoint, and none writes a fresh command string.
+ * ⛔ Two accounts of one predicate is how a rejected form gets restored by an editor who meets
+ * the summary first, so amend the block below and never this paragraph.
+ * (Corrected 2026-11-14 on PEN-6688: this paragraph named a function that does not exist and
+ * prescribed that rejected fixpoint form as the specification.)
+ *
+ * Graded Low because a grant row is the only way an agent reaches these routes at all.
  * `__tests__/pipeline-stage-workspace-runtime-authz.test.ts` pins both arms, and the case that
  * matters most is the one asserting the SAME echo is refused at the two CREATE paths. (Raised
  * by Ally on `#3701` and accepted; it could not be wired then. The PATCH/CREATE split was
@@ -1509,6 +1519,18 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     // stage would have returned, so the guard needs the stored row. Read lazily: the query
     // runs only for an agent actor that actually supplied the field, which is the rare path.
     // ⛔ Fail CLOSED — a stage that cannot be read yields `undefined`, which refuses.
+    // ⚠ ACCEPTED RACE (PEN-6688), graded non-blocking by Ally on `#3764` and re-measured at
+    // source: this SELECT and `svc.updateStage`'s own `getStageOrThrow` are two separate reads
+    // of the same row, so the stored config can change between them and this guard can admit an
+    // echo of a row the restore no longer sees. ⛔ The worst outcome is a persisted literal
+    // SENTINEL — visible breakage — and NEVER an agent-authored command: a body that passes
+    // this guard is wholly derived from `mask(stored)`, so every leaf is a sentinel or a
+    // passed-through identity/enum and no fresh command string can reach the row. It also needs
+    // a concurrent OPERATOR write, which the agent cannot cause.
+    // ⛔ Moving the check into `updateStage` NARROWS this window and does NOT close it: that
+    // function's own read is still separate from its UPDATE. A close needs the read and the
+    // write under one transaction — a row lock or a config CAS — which is why this is carried
+    // as accepted rather than scheduled.
     if (req.actor.type === "agent" && stageConfigCarriesWorkspaceRuntime(req.body.config)) {
       const [storedStage] = await db
         .select({ config: pipelineStages.config })
