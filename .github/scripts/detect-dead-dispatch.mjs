@@ -140,6 +140,15 @@ export const DISPATCH_FATE = Object.freeze({
    * skips the same way.
    */
   LANE_GATED_OFF: 'lane-gated-off',
+  /**
+   * Terminal `failure` whose `deploy` job was REFUSED by the BLO-49140
+   * minimum-interval guard: the worker was rolled too recently, so nothing was
+   * attempted. BLO-57061: this used to read as `survived` (the deploy job
+   * "ran"), so no slot retried and one same-image worker restart before the
+   * 07:23Z slot cost a whole day of deploys. Retryable: the hourly slots
+   * re-dispatch once paperclip-0 is past the interval.
+   */
+  REFUSED_MIN_INTERVAL: 'refused-min-interval',
   /** No completed dispatch run in the window, or the window is empty. */
   NONE: 'none',
   /** Anything unreadable. Reports nothing, reddens nothing. */
@@ -205,6 +214,22 @@ export const DEPLOY_GATE_JOB_NAME = 'guard-pending-deploy';
  * latent rather than live — which is the right time to close it.
  */
 export const DEPLOY_BRANCH = 'master';
+
+/**
+ * The BLO-49140 guard step inside docker.yml's `deploy` job, matched EXACTLY.
+ * Same coupling hazard as DEPLOY_JOB_NAME: rename one, rename both, or the
+ * refusal silently classifies as `survived` again.
+ */
+export const MIN_INTERVAL_STEP_NAME = 'Minimum interval since last roll (BLO-49140)';
+
+/** Did the `deploy` job fail AT the minimum-interval guard step? */
+export function deployRefusedByMinInterval(jobs) {
+  const deploy = (jobs ?? []).find((job) => job?.name === DEPLOY_JOB_NAME);
+  if (deploy?.conclusion !== 'failure') return false;
+  return (deploy.steps ?? []).some(
+    (step) => step?.name === MIN_INTERVAL_STEP_NAME && step?.conclusion === 'failure',
+  );
+}
 
 /**
  * Was the whole deploy lane gated off before it could start?
@@ -278,6 +303,11 @@ export function deployJobExecuted(jobs) {
  */
 export function classifyDispatchRun(run, jobs) {
   if (!run || run.status !== 'completed') return DISPATCH_FATE.UNKNOWN;
+  // BLO-57061. Before the `survived` check: a refused deploy job DID execute,
+  // but only far enough to decline, so it delivered nothing and is retryable.
+  if (run.conclusion === 'failure' && deployRefusedByMinInterval(jobs)) {
+    return DISPATCH_FATE.REFUSED_MIN_INTERVAL;
+  }
   // A run that reached `deploy` is `survived` whatever the run concluded —
   // including `failure`. That is the PEN-4176 shape (a deploy job that ran and
   // failed its migration pre-flight), and it is explicitly not this module's.
@@ -364,7 +394,8 @@ export async function findLastCompletedDispatch({
       // read successfully — an unreadable job list returns the raw run object
       // above and carries no such field, so the close gate sees `false` and
       // withholds, which is this module's fail-quiet direction.
-      deployExecuted: deployJobCompleted(jobs),
+      // A min-interval refusal executed `deploy` only far enough to decline.
+      deployExecuted: deployJobCompleted(jobs) && !deployRefusedByMinInterval(jobs),
     },
   };
 }

@@ -1054,3 +1054,71 @@ test('the fate reaches the backstop, so the red run names the right lever too', 
   assert.match(backstop[0], /PAPERCLIP_CI_DEPLOY/, 'the error must name the lever for a gated lane');
   assert.match(backstop[0], /exit 1/, 'and must still make the conclusion carry it');
 });
+
+// ---------------------------------------------------------------------------
+// BLO-57061. A dispatch refused by docker.yml's BLO-49140 minimum-interval guard
+// shipped nothing, and only the daily slot dispatched, so one worker restart
+// before 07:23Z cost a day. A sampling slot now re-dispatches once paperclip-0
+// is past the interval. Run the retry block itself in bash, with kubectl
+// stubbed, so the test exercises the real shell and the real guard script.
+// ---------------------------------------------------------------------------
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync as readText } from 'node:fs';
+import os from 'node:os';
+
+function runRetryBlock({ fate, isDispatchSlot, podAgeSeconds, kubectlFails = false }) {
+  const start = code.indexOf('RETRY_MIN_INTERVAL=false');
+  const end = code.indexOf('if [ "$IS_DISPATCH_SLOT" != "true" ] && [ "$RETRY_MIN_INTERVAL" != "true" ]');
+  assert.ok(start !== -1 && end > start, 'the retry block must sit before the sampling-slot branch');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'blo57061-'));
+  const created = new Date(Date.now() - podAgeSeconds * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+  writeFileSync(
+    path.join(dir, 'kubectl'),
+    kubectlFails ? '#!/bin/sh\nexit 1\n' : `#!/bin/sh\nprintf '%s' '${created}'\n`,
+  );
+  chmodSync(path.join(dir, 'kubectl'), 0o755);
+  const json = path.join(dir, 'dead.json');
+  writeFileSync(json, JSON.stringify({ fate, run: { databaseId: 43571300881 } }));
+  const out = path.join(dir, 'out');
+  const summary = path.join(dir, 'summary');
+  writeFileSync(out, '');
+  const script = `set -euo pipefail\n${code.slice(start, end)}\necho "RETRY=$RETRY_MIN_INTERVAL"\n`;
+  const stdout = execFileSync('bash', ['-c', script], {
+    cwd: path.resolve(path.dirname(workflowPath), '../..'),
+    env: {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH}`,
+      DEAD_FATE: fate,
+      IS_DISPATCH_SLOT: isDispatchSlot,
+      DEAD_DISPATCH_JSON_PATH: json,
+      GITHUB_OUTPUT: out,
+      GITHUB_STEP_SUMMARY: summary,
+      GITHUB_RUN_ID: '1',
+    },
+    encoding: 'utf8',
+  });
+  return { stdout, outputs: readText(out, 'utf8') };
+}
+
+test('BLO-57061: a sampling slot re-dispatches a refused run once paperclip-0 is past 6h', () => {
+  const r = runRetryBlock({ fate: 'refused-min-interval', isDispatchSlot: 'false', podAgeSeconds: 7 * 3600 });
+  assert.match(r.stdout, /RETRY=true/);
+  assert.match(r.stdout, /Retrying the dispatch: run 43571300881/);
+  assert.doesNotMatch(r.outputs, /outcome=/);
+});
+
+test('BLO-57061: inside the interval, or with an unreadable pod, the slot defers and does not dispatch', () => {
+  for (const args of [{ podAgeSeconds: 2 * 3600 }, { podAgeSeconds: 7 * 3600, kubectlFails: true }]) {
+    const r = runRetryBlock({ fate: 'refused-min-interval', isDispatchSlot: 'false', ...args });
+    assert.doesNotMatch(r.stdout, /RETRY=/, 'the block must exit before the dispatch path');
+    assert.match(r.outputs, /outcome=deferred-min-interval/);
+  }
+});
+
+test('BLO-57061: any other fate, or the daily slot, leaves the existing flow untouched', () => {
+  for (const [fate, slot] of [['survived', 'false'], ['refused-min-interval', 'true']]) {
+    const r = runRetryBlock({ fate, isDispatchSlot: slot, podAgeSeconds: 7 * 3600 });
+    assert.match(r.stdout, /RETRY=false/);
+    assert.equal(r.outputs, '');
+  }
+});
