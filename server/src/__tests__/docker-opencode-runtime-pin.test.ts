@@ -335,7 +335,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   it("routes server image builds through the dedicated remote BuildKit pool", () => {
     // PEN-6677: group-pinned so a build cannot land on the tools-cluster twin,
     // which reaches a different BuildKit. Still exactly one such job.
-    expect(dockerWorkflow.match(/group: arc-paperclip-buildkit/g)).toHaveLength(1);
+    // PEN-6682: the trailing newline anchors the end of the group name --
+    // without it this is a prefix match that `arc-paperclip-buildkit-tools`
+    // satisfies, which is the one substitution the assertion exists to catch.
+    expect(dockerWorkflow.match(/group: arc-paperclip-buildkit\n/g)).toHaveLength(1);
     expect(dockerWorkflow).not.toContain("runs-on: arc-dind");
     expect(dockerWorkflow).toContain("driver: remote");
     expect(dockerWorkflow).toContain(
@@ -610,7 +613,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     // arc-paperclip-buildkit has no Docker daemon, so the default
     // docker-container buildx driver would fail there.
     // PEN-6677: group-pinned; see docker.yml for the full rationale.
-    expect(agentRuntimeImagesWorkflow).toContain("group: arc-paperclip-buildkit");
+    // PEN-6682: trailing newline, so `arc-paperclip-buildkit-tools` cannot
+    // satisfy this as a prefix.
+    expect(agentRuntimeImagesWorkflow).toContain("group: arc-paperclip-buildkit\n");
     expect(agentRuntimeImagesWorkflow).not.toContain("runs-on: arc-dind");
     expect(agentRuntimeImagesWorkflow).toContain("driver: remote");
     expect(agentRuntimeImagesWorkflow).toContain(
