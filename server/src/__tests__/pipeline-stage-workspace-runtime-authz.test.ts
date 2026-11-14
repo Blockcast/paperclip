@@ -438,6 +438,13 @@ describe("PEN-6595 pipeline stage-config workspaceRuntime authorization", () => 
     expect(create.body.error).toContain("send `null`");
     expect(patch.body.error).toContain("Do NOT send `null` here");
     expect(patch.body.error).not.toContain("Omit the key, or send `null`");
+    // A PATCH `config` replaces the stored config as a whole (`updateStage` persists it in place
+    // of the stored one, and the withheld-value restore only covers keys the caller sent), so
+    // "omit the key" deletes the operator's runtime config just as `null` does. The remedy must
+    // name the two non-destructive ways out instead.
+    expect(patch.body.error).not.toContain("Omit the key");
+    expect(patch.body.error).toContain("leave `config` out of this PATCH");
+    expect(patch.body.error).toContain("`config` replaces the stored config as a whole");
   });
 
   it("NON-AGENT CONTROL: a board actor may still set a stage workspaceRuntime", async () => {
