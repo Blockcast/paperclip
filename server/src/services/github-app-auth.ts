@@ -1834,40 +1834,53 @@ async function listReviewerSurface<T>(input: {
   return out;
 }
 
-function listReviewerReviews(input: {
-  apiBase: string;
+/**
+ * PEN-6341 item 2: the formal-review surface, read over GraphQL.
+ *
+ * It no longer rides `listReviewerSurface`, which stays as the REST pager for
+ * `/issues/{n}/comments` -- a different route, on its own migration. The
+ * identity filter, the PENDING drop and the `{error}`-on-exhaustion contract
+ * are unchanged; only the transport moved.
+ *
+ * PENDING is an unsubmitted draft, returned by GitHub only to the identity that
+ * created it -- which is this App. A run that dies mid-flow leaves exactly such
+ * a draft; keeping it would let that run self-attest. The filter is retained
+ * whether or not the GraphQL connection surfaces one, so a difference there
+ * cannot change the answer.
+ */
+async function listReviewerReviews(input: {
+  token: string;
   repoFullName: string;
   prNumber: number;
-  headers: Record<string, string>;
   botLogin: string;
   signal?: AbortSignal;
 }): Promise<ReviewerReview[] | { error: string }> {
-  return listReviewerSurface<ReviewerReview>({
-    ...input,
-    prefix: "reviews",
-    url: (page) =>
-      `${input.apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`,
-    // PENDING is an unsubmitted draft, returned by GitHub only to the identity
-    // that created it — which is this App. A run that dies mid-flow leaves
-    // exactly such a draft; keeping it would let that run self-attest.
-    select: (row, login) => {
-      const r = row as {
-        body?: string | null;
-        state?: string | null;
-        commit_id?: string | null;
-        submitted_at?: string | null;
-      };
-      const state = (r.state ?? "").toUpperCase();
-      if (state === "PENDING") return null;
-      return {
-        login,
-        body: r.body ?? "",
-        state,
-        commitId: headShaHex(r.commit_id),
-        submittedAt: r.submitted_at ?? null,
-      };
-    },
+  const result = await ghGraphQlPullRequestReviews({
+    token: input.token,
+    repoFullName: input.repoFullName,
+    prNumber: input.prNumber,
+    maxPages: REVIEWER_EVIDENCE_MAX_PAGES,
+    signal: input.signal,
   });
+  if (!result.ok) return { error: graphQlReviewsFailureReason("reviews", result.reason) };
+
+  const out: ReviewerReview[] = [];
+  for (const review of result.reviews) {
+    // Matched AFTER the `[bot]` suffix is re-attached by
+    // `readGraphQlPullRequestReview`: `githubReviewerIdentityMatches` accepts
+    // only `<slug>[bot]` / `app/<slug>`, so a bare GraphQL slug would filter
+    // every Ally review out and return empty surfaces.
+    if (!githubReviewerIdentityMatches(review.login ?? "", input.botLogin)) continue;
+    if (review.state === "PENDING") continue;
+    out.push({
+      login: review.login ?? "",
+      body: review.body,
+      state: review.state,
+      commitId: review.commitId,
+      submittedAt: review.submittedAt,
+    });
+  }
+  return out;
 }
 
 function listReviewerComments(input: {
@@ -1915,6 +1928,7 @@ export async function githubListReviewerSurfacesAtPr(input: {
   const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return { error: "no_token" };
   const args = {
+    token,
     apiBase: gitHubApiBase(GITHUB_HOST),
     repoFullName: input.repoFullName,
     prNumber: input.prNumber,
@@ -2117,7 +2131,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
     headShaHex(input.headSha) ?? (await fetchPrHeadSha(token, input.repoFullName, input.prNumber));
   if (!headSha) return { found: false };
 
-  const args = { apiBase, repoFullName: input.repoFullName, prNumber: input.prNumber, headers, botLogin };
+  const args = { token, apiBase, repoFullName: input.repoFullName, prNumber: input.prNumber, headers, botLogin };
 
   // The two surfaces are read in sequence and SHORT-CIRCUIT, rather than via
   // `githubListReviewerSurfacesAtPr`, even though that would be the tidier
@@ -2244,7 +2258,7 @@ export async function githubListIssueCommentsWithTimestamps(input: {
  * already reads both surfaces for the same reason.
  *
  * `PENDING` reviews are skipped: an unsubmitted draft is visible only to its
- * creator and carries no `submitted_at`.
+ * creator and carries no `submittedAt`.
  *
  * `DISMISSED` reviews are skipped too, and the contrast with
  * `githubHasReviewerEvidenceForPr` — which deliberately *accepts* them — is the
@@ -2268,40 +2282,27 @@ export async function githubListPrReviewsWithTimestamps(input: {
 }): Promise<Array<{ login: string | null; body: string; createdAt: string }> | null> {
   const token = await getInstallationToken();
   if (!token) return null;
-  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
-  const apiBase = gitHubApiBase(GITHUB_HOST);
+  // PEN-6341 item 2: GraphQL, sharing `ghGraphQlPullRequestReviews` with the
+  // other two readers of this route. The page cap is this reader's own, and an
+  // exhausted budget stays a `null` rather than a short list.
+  const result = await ghGraphQlPullRequestReviews({
+    token,
+    repoFullName: input.repoFullName,
+    prNumber: input.prNumber,
+    maxPages: GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES,
+  });
+  if (!result.ok) return null;
+
   const reviews: Array<{ login: string | null; body: string; createdAt: string }> = [];
-
-  try {
-    for (let page = 1; page <= GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES; page += 1) {
-      const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
-      const response = await ghFetch(url, { headers });
-      if (!response.ok) return null;
-      const batch = (await response.json()) as Array<{
-        user?: { login?: string | null } | null;
-        body?: string | null;
-        state?: string | null;
-        submitted_at?: string | null;
-      }>;
-
-      for (const review of batch) {
-        const state = (review.state ?? "").toUpperCase();
-        if (state === "PENDING" || state === "DISMISSED") continue;
-        if (typeof review.submitted_at !== "string") continue;
-        reviews.push({
-          login: review.user?.login ?? null,
-          body: review.body ?? "",
-          createdAt: review.submitted_at,
-        });
-      }
-
-      if (batch.length < 100) return reviews;
-      if (page === GITHUB_COMMENT_PAGINATION_HARD_LIMIT_PAGES) return null;
-    }
-    return reviews;
-  } catch {
-    return null;
+  for (const review of result.reviews) {
+    if (review.state === "PENDING" || review.state === "DISMISSED") continue;
+    // No `submittedAt` is an unsubmitted draft, which the PENDING guard above
+    // has already dropped; kept as a second, independent refusal because the
+    // timestamp is what every caller dates the verdict from.
+    if (review.submittedAt === null) continue;
+    reviews.push({ login: review.login, body: review.body, createdAt: review.submittedAt });
   }
+  return reviews;
 }
 
 export type GitHubCommitStatusState = "error" | "failure" | "pending" | "success";
@@ -2907,6 +2908,203 @@ export async function ghGraphQlPullRequestFields(input: {
   const pr = result.data.repository?.pullRequest;
   if (!pr || typeof pr !== "object") return { ok: false, reason: "pull_request_absent" };
   return { ok: true, data: pr };
+}
+
+/**
+ * PEN-6341 item 2: the GraphQL replacement for paging
+ * `GET /repos/{o}/{r}/pulls/{n}/reviews`.
+ *
+ * This moves the WHOLE `repos/pulls/reviews` route -- measured at 345.5/h of
+ * demand against the REST `core` shard that exhausts roughly 44 minutes into
+ * each window -- onto the separate `graphql` bucket measured at 97-99% idle.
+ * Three readers shared that route and each paged it separately: the
+ * reviewer-evidence surface (`listReviewerReviews`), the comment-review gate's
+ * history (`githubListPrReviewsWithTimestamps`) and the review-state
+ * reconciler's per-PR read (`fetchPullRequestReviews`). They now share one
+ * query; the per-site semantics each of them needs stays at the site.
+ *
+ * ## The field map, and the one that bites
+ *
+ * | REST | GraphQL |
+ * |---|---|
+ * | `state` | `PullRequestReviewState` -- the SAME five members, already upper-case |
+ * | `submitted_at` | `submittedAt`, null on an unsubmitted draft as REST omits it |
+ * | `commit_id` | `commit { oid }` |
+ * | `user.login` | `author { login }` -- the BARE slug for an App |
+ *
+ * THE LOGIN IS THE ONE THAT BITES, and it is the third field in this migration
+ * to carry it. GraphQL types an App actor as a `Bot` and returns
+ * `allyblockcast` where REST returns `allyblockcast[bot]`; the suffix is
+ * re-attached from `__typename` through the shared `withBotLoginSuffix`.
+ * Getting it wrong would have been invisible, because this repository carries
+ * TWO login conventions and only one of them notices:
+ * `githubReviewerIdentityMatches` REQUIRES the `[bot]` form, so a bare slug
+ * filters every Ally review out and hands the caller empty surfaces -- which
+ * reads as "Ally reviewed and found nothing" -- while `isAllyReviewIdentity`
+ * in `pr-review-request-ageing.ts` STRIPS the suffix and would have agreed
+ * with either spelling. A reader checked only against the second would pass
+ * its own tests and silently disarm the reviewer-evidence gate.
+ *
+ * The `state` enum does NOT fold the way `PullRequestState` does: there is no
+ * extra `MERGED`-shaped member, so unlike the gate reader this one needs no
+ * un-folding. Said explicitly because the sibling reader's trap invites the
+ * assumption that every enum on this migration carries one.
+ *
+ * ## Polarity: a failure is never an empty list
+ *
+ * All three callers read `[]` as "this pull request has no reviews" -- which
+ * suppresses an ageing escalation, credits a retirement, or re-raises
+ * `pr_review_output_missing`. So a null node, a malformed payload, a
+ * `hasNextPage` with no cursor and an exhausted page budget are each reported
+ * as a FAILURE, and every caller maps that onto the value it already used for
+ * an unreadable REST response.
+ */
+const PULL_REQUEST_REVIEWS_QUERY = `query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          state
+          body
+          submittedAt
+          author { login __typename }
+          commit { oid }
+        }
+      }
+    }
+  }
+}`;
+
+/** One submitted review, in the shape the REST pager handed its callers. */
+export type GraphQlPullRequestReview = {
+  login: string | null;
+  body: string;
+  state: string;
+  commitId: string | null;
+  submittedAt: string | null;
+};
+
+type PullRequestReviewNode = {
+  state?: unknown;
+  body?: unknown;
+  submittedAt?: unknown;
+  author?: { login?: unknown; __typename?: unknown } | null;
+  commit?: { oid?: unknown } | null;
+};
+
+type PullRequestReviewsConnection = {
+  pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+  nodes?: unknown;
+};
+
+type PullRequestReviewsResponse = {
+  repository?: { pullRequest?: { reviews?: PullRequestReviewsConnection | null } | null } | null;
+};
+
+export type PullRequestReviewsResult =
+  | { ok: true; reviews: GraphQlPullRequestReview[] }
+  | { ok: false; reason: string };
+
+/**
+ * Total over anything the API can return: every field is independently
+ * nullable, and an unreadable one falls to the value the REST reader produced
+ * for a missing key rather than dropping the row. Dropping it would be a
+ * silent truncation of the very list the polarity note above refuses to
+ * truncate.
+ */
+function readGraphQlPullRequestReview(node: PullRequestReviewNode): GraphQlPullRequestReview {
+  const bare = typeof node.author?.login === "string" ? node.author.login : null;
+  const isBot = node.author?.__typename === "Bot";
+  return {
+    login: bare === null ? null : isBot ? withBotLoginSuffix(bare) : bare,
+    body: typeof node.body === "string" ? node.body : "",
+    state: typeof node.state === "string" ? node.state.toUpperCase() : "",
+    commitId: headShaHex(typeof node.commit?.oid === "string" ? node.commit.oid : null),
+    submittedAt: typeof node.submittedAt === "string" ? node.submittedAt : null,
+  };
+}
+
+export async function ghGraphQlPullRequestReviews(input: {
+  token: string;
+  repoFullName: string;
+  prNumber: number;
+  /** Mirrors each caller's own REST page cap; exceeding it is a failure. */
+  maxPages: number;
+  signal?: AbortSignal;
+}): Promise<PullRequestReviewsResult> {
+  const [owner, name, ...rest] = input.repoFullName.split("/");
+  if (!owner || !name || rest.length > 0) {
+    return { ok: false, reason: "repo_full_name_invalid" };
+  }
+
+  const reviews: GraphQlPullRequestReview[] = [];
+  let cursor: string | null = null;
+  for (let page = 1; page <= input.maxPages; page += 1) {
+    const result: GhGraphQlResult<PullRequestReviewsResponse> = await ghGraphQlQuery<PullRequestReviewsResponse>({
+      token: input.token,
+      query: PULL_REQUEST_REVIEWS_QUERY,
+      variables: { owner, name, number: input.prNumber, cursor },
+      signal: input.signal,
+    });
+    if (!result.ok) return { ok: false, reason: result.reason };
+
+    // Both annotations below break a TypeScript inference CYCLE rather than
+    // documenting anything: `cursor` is passed into `variables`, so its
+    // control-flow type at the call site depends on `cursor = next`, which
+    // depends on `next`, on `connection`, and so back on this call. Reproduced
+    // in 17 lines, 2026-11-14 -- the cycle appears whenever `cursor` is a
+    // member of the variables object and disappears when it is not, and the
+    // `let cursor: string | null` declaration does not break it because what
+    // the literal needs is the NARROWED type.
+    const connection: PullRequestReviewsConnection | null | undefined =
+      result.data.repository?.pullRequest?.reviews;
+    // A null node is NOT an empty page. REST answered 404 here and every caller
+    // mapped that onto "unreadable"; reporting `[]` would instead say "this
+    // pull request has no reviews", which is the one answer that reads as
+    // "nobody reviewed it".
+    if (!connection || typeof connection !== "object") {
+      return { ok: false, reason: "pull_request_absent" };
+    }
+    if (!Array.isArray(connection.nodes)) return { ok: false, reason: "payload_malformed" };
+    for (const node of connection.nodes) {
+      if (!node || typeof node !== "object") continue;
+      reviews.push(readGraphQlPullRequestReview(node as PullRequestReviewNode));
+    }
+
+    if (connection.pageInfo?.hasNextPage !== true) return { ok: true, reviews };
+    const next: unknown = connection.pageInfo?.endCursor;
+    // `hasNextPage` with no usable cursor cannot be followed, and answering
+    // with what we have would be exactly the silent truncation the page cap
+    // below exists to refuse.
+    if (typeof next !== "string" || next.length === 0) {
+      return { ok: false, reason: "cursor_missing" };
+    }
+    cursor = next;
+  }
+  return { ok: false, reason: "pagination_exhausted" };
+}
+
+/**
+ * Map a `ghGraphQlPullRequestReviews` failure onto the `<surface>_*` vocabulary
+ * the REST pager emitted, so the strings already recorded in tests and in the
+ * evidence probe's diagnostics stay recognisable across the transport change.
+ *
+ * `transport` keeps the old `_fetch_failed` spelling: that was the REST
+ * reader's catch-all for a thrown fetch and is the same condition.
+ *
+ * ONE DISTINCTION IS LOST AND IS NOT WORTH FAKING, exactly as
+ * `graphQlGateFailureReason` records for the gate reader: the REST pager told a
+ * rate-limited 403 (`reviews_rate_limited`) from any other 403 by reading the
+ * response headers, and `ghGraphQlQuery` does not hand back the `Response`. A
+ * rate limit now records `reviews_http_403`. No consumer matches on either
+ * string -- `githubHasReviewerEvidenceForPr`'s callers fail closed on ANY
+ * `{error}` and the reason is carried for telemetry -- so this costs
+ * legibility, not behaviour.
+ */
+function graphQlReviewsFailureReason(surface: string, reason: string): string {
+  if (reason === "transport") return `${surface}_fetch_failed`;
+  return `${surface}_${reason}`;
 }
 
 /**

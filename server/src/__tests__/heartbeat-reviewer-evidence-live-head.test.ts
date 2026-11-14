@@ -65,16 +65,56 @@ function jsonResponse(data: unknown, ok = true, status = 200): Response {
 
 type FakeReview = { user: { login: string }; commit_id: string; state: string };
 
+/**
+ * PEN-6341 item 2: model GitHub's GraphQL `reviews` connection from the
+ * REST-shaped rows these fixtures are written in. A Bot actor's `login` is the
+ * BARE slug over GraphQL where REST returns `<slug>[bot]` (measured on
+ * Blockcast/paperclip#3694), so the suffix is stripped here and the reader is
+ * what puts it back.
+ */
+function graphQlReviewsEnvelope(rows: FakeReview[]): unknown {
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          reviews: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: rows.map((row) => {
+              const isBot = row.user.login.endsWith("[bot]");
+              return {
+                state: row.state,
+                body: "",
+                submittedAt: null,
+                author: {
+                  login: isBot ? row.user.login.slice(0, -"[bot]".length) : row.user.login,
+                  __typename: isBot ? "Bot" : "User",
+                },
+                commit: { oid: row.commit_id },
+              };
+            }),
+          },
+        },
+      },
+    },
+  };
+}
+
+/** True when this GraphQL POST is the reviews pager rather than the head read. */
+function isReviewsQuery(init?: unknown): boolean {
+  const body = (init as { body?: unknown } | undefined)?.body;
+  return typeof body === "string" && body.includes("reviews(first:");
+}
+
 /** Fake GitHub. `prHead` is the CURRENT head, now reported over GraphQL (PEN-6341). */
 function stubGithub(routes: { reviews?: FakeReview[]; comments?: unknown[]; prHead?: string }) {
-  const fetchMock = vi.fn(async (url: string | URL) => {
+  const fetchMock = vi.fn(async (url: string | URL, init?: unknown) => {
     const u = String(url);
     if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-    if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse(routes.reviews ?? []);
     if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(routes.comments ?? []);
-    // PEN-6341: the head read is GraphQL now. Reviews above are still REST and
-    // are deliberately untouched -- only the pull-request FIELD read moved.
+    // PEN-6341: the head read AND the reviews pager are both GraphQL now, so
+    // they arrive on one URL and are told apart by the document.
     if (u.endsWith("/graphql")) {
+      if (isReviewsQuery(init)) return jsonResponse(graphQlReviewsEnvelope(routes.reviews ?? []));
       return jsonResponse({
         data: { repository: { pullRequest: { headRefOid: routes.prHead ?? LIVE_HEAD } } },
       });
@@ -214,7 +254,7 @@ describe("BLO-28920: reviewer-evidence attestation accepts the live head as well
 
     // One reviews fetch, not two: a null pinned head already resolved live, so a
     // re-check would be byte-identical work.
-    const reviewFetches = fetchMock.mock.calls.filter(([url]) => String(url).includes("/reviews"));
+    const reviewFetches = fetchMock.mock.calls.filter(([, init]) => isReviewsQuery(init));
     expect(reviewFetches).toHaveLength(1);
   });
 
@@ -224,7 +264,7 @@ describe("BLO-28920: reviewer-evidence attestation accepts the live head as well
       vi.fn(async (url: string | URL) => {
         const u = String(url);
         if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-        if (u.includes("/reviews")) return jsonResponse({ message: "boom" }, false, 500);
+        if (u.endsWith("/graphql")) return jsonResponse({ message: "boom" }, false, 500);
         throw new Error(`unexpected url ${u}`);
       }),
     );
@@ -241,15 +281,17 @@ describe("BLO-28920: reviewer-evidence attestation accepts the live head as well
     let reviewsCalls = 0;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: string | URL) => {
+      vi.fn(async (url: string | URL, init?: unknown) => {
         const u = String(url);
         if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-        if (u.includes("/pulls/") && u.includes("/reviews")) {
-          reviewsCalls += 1;
-          return reviewsCalls === 1 ? jsonResponse([]) : jsonResponse({ message: "boom" }, false, 500);
-        }
         if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse([]);
         if (u.endsWith("/graphql")) {
+          if (isReviewsQuery(init)) {
+            reviewsCalls += 1;
+            return reviewsCalls === 1
+              ? jsonResponse(graphQlReviewsEnvelope([]))
+              : jsonResponse({ message: "boom" }, false, 500);
+          }
           return jsonResponse({ data: { repository: { pullRequest: { headRefOid: LIVE_HEAD } } } });
         }
         throw new Error(`unexpected url ${u}`);
