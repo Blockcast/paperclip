@@ -42,9 +42,10 @@ describe("paperclip agent Dockerfile", () => {
 
   it("bakes the full Go toolchain (go, gofmt, tinygo) onto PATH", () => {
     // Go + gofmt symlinked into /usr/local/bin (on PATH for the node user).
-    // Pinned to 1.25.6 to match CI / multicast; older versions made agents
-    // self-install go1.25.6 into the PVC home and shadow the image.
-    expect(dockerfileToolchain).toContain("ARG GO_VERSION=1.25.6");
+    // Pinned to the 1.25 line to match CI / multicast; older versions made
+    // agents self-install go1.25.x into the PVC home and shadow the image.
+    // 1.25.6 carried Critical CVE-2025-68121 (BLO-56939).
+    expect(dockerfileToolchain).toContain("ARG GO_VERSION=1.25.14");
     expect(dockerfileToolchain).toContain("ln -s /usr/local/go/bin/go /usr/local/bin/go");
     expect(dockerfileToolchain).toContain("ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt");
 

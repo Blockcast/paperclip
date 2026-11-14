@@ -38,6 +38,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
        fonts-liberation fonts-noto-color-emoji \
   && corepack enable
 
+# The node base image bundles npm 11.13 whose own node_modules/tar is 7.5.13
+# (Critical CVE-2026-59873). npm 11.21.2 bundles tar 7.5.22 (BLO-56939).
+ARG NPM_VERSION=11.21.2
+RUN npm install -g "npm@${NPM_VERSION}" \
+  && npm cache clean --force \
+  && test "$(npm --version)" = "${NPM_VERSION}"
+
 # gh from the upstream release, pinned and checksummed. Debian trixie's package
 # is 2.46.0 (upstream early 2024), so `apt-get install gh` left agents ~56 minor
 # releases behind cli/cli. The sha256 is the release's own

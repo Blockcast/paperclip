@@ -57,13 +57,14 @@ RUN apt-get update \
 # Languages
 # ---------------------------------------------------------------------------
 
-# Go — pinned to 1.25.6 to match what CI workflows use (e.g.
+# Go — pinned to the 1.25 line to match what CI workflows use (e.g.
 # ciab-data-plane-uat.yml, multicast's `setup-go` / GO_VERSION) and what
 # multicast's toolchain requires. Keeping the image behind that version made
 # agents self-install go1.25.6 into /paperclip/bin (PVC home) on every run and
 # shadow the image binary — wasteful and lost on workspace reset. Baking the
-# right version here stops the self-install.
-ARG GO_VERSION=1.25.6
+# right version here stops the self-install. Patch level tracks the latest 1.25
+# release: 1.25.6 carried Critical CVE-2025-68121 into every image (BLO-56939).
+ARG GO_VERSION=1.25.14
 RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
   | tar -C /usr/local -xzf - \
   && ln -s /usr/local/go/bin/go /usr/local/bin/go \
@@ -221,11 +222,14 @@ RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kub
   && chmod +x /usr/local/bin/kubectl \
   && kubectl version --client=true -o json | grep -Fq "${KUBECTL_VERSION}"
 
-ARG HELM_VERSION=v3.20.0
+# v3.20.x embeds google.golang.org/grpc v1.72.2 (Critical CVE-2026-33186);
+# v3.22.1 drops grpc entirely and is built with go1.26.9 (BLO-56939).
+ARG HELM_VERSION=v3.22.1
 RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
   | tar -C /tmp -xzf - \
   && mv /tmp/linux-amd64/helm /usr/local/bin/helm \
-  && rm -rf /tmp/linux-amd64
+  && rm -rf /tmp/linux-amd64 \
+  && helm version --short | grep -Fq "${HELM_VERSION}+"
 
 # kind (in-Docker Kubernetes) — magma/cdn/fab/k8s_ops.py detects the
 # `kind-kind` context as a first-class local runtime alongside minikube.
