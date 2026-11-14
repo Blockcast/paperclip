@@ -1895,6 +1895,188 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     });
   });
 
+  describe("migration search_path is pinned to the plugin namespace (PEN-6669)", () => {
+    /**
+     * PEN-6604 pinned `query`/`execute`. It deliberately did NOT pin this path,
+     * because `applyMigrations` interleaves the plugin's own statements with the
+     * Drizzle ledger writes (`plugin_migrations`, `plugin_database_namespaces`), which
+     * Drizzle emits UNQUALIFIED -- so a transaction-level pin breaks the ledger. The
+     * pin is therefore scoped to the statement loop and lifted before the ledger write,
+     * and these tests are what hold that scope in place: one half proves the plugin
+     * statements resolve INSIDE the namespace, the other proves the ledger still
+     * resolves OUTSIDE it.
+     *
+     * These prove RESOLUTION, not the verdict. Every migration below is ALLOWED by
+     * `validatePluginMigrationStatement` before and after -- measured at master
+     * e89b8388 -- which is exactly why a lexical fix was not available.
+     */
+    async function installPublicDecoys() {
+      // The core-schema objects an unpinned migration reached. `pen6669_shadow` exists
+      // in BOTH schemas with DIFFERENT values, so the assertions discriminate rather
+      // than matching whichever row happens to be there; `pen6669_only_public` exists
+      // in `public` alone.
+      await db.execute(sql.raw("CREATE TABLE public.pen6669_shadow (label text NOT NULL)"));
+      await db.execute(sql.raw("INSERT INTO public.pen6669_shadow (label) VALUES ('from-public')"));
+      await db.execute(sql.raw("CREATE TABLE public.pen6669_only_public (label text NOT NULL)"));
+      await db.execute(sql.raw("INSERT INTO public.pen6669_only_public (label) VALUES ('from-public')"));
+    }
+
+    afterEach(async () => {
+      await db.execute(sql.raw("DROP TABLE IF EXISTS public.pen6669_shadow CASCADE"));
+      await db.execute(sql.raw("DROP TABLE IF EXISTS public.pen6669_only_public CASCADE"));
+    });
+
+    it("resolves an unqualified backfill source inside the namespace", async () => {
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        CREATE TABLE ${namespace}.sink (label text NOT NULL);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        INSERT INTO ${namespace}.sink (label) SELECT label FROM pen6669_shadow;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+
+      // Control: the public decoy really is there and really carries the other value.
+      const decoy = await db.execute(sql.raw("SELECT label FROM public.pen6669_shadow"));
+      expect(Array.from(decoy as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const rows = await db.execute(sql.raw(`SELECT label FROM "${namespace}".sink`));
+      expect(Array.from(rows as Iterable<{ label: string }>)).toEqual([{ label: "from-namespace" }]);
+    });
+
+    it("cannot reach a core table the namespace does not shadow", async () => {
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.sink (label text NOT NULL);
+        INSERT INTO ${namespace}.sink (label) SELECT label FROM pen6669_only_public;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+
+      // Control: the table is really there, so the rejection below is `search_path`
+      // and not a missing relation.
+      const present = await db.execute(sql.raw("SELECT label FROM public.pen6669_only_public"));
+      expect(Array.from(present as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+
+      await expect(
+        pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+      ).rejects.toThrow(/pen6669_only_public/i);
+    });
+
+    it("binds a migration-created view inside the namespace, permanently", async () => {
+      // The one shape that outlives the migration. Postgres resolves a view body at
+      // CREATE and stores the OIDs, so an unpinned `CREATE VIEW` over a bare name binds
+      // to `public` for the life of the view -- every later read through it leaves the
+      // namespace, long after the migration that made it has gone.
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        CREATE VIEW ${namespace}.shadow_view AS SELECT label FROM pen6669_shadow;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const rows = await db.execute(sql.raw(`SELECT label FROM "${namespace}".shadow_view`));
+      expect(Array.from(rows as Iterable<{ label: string }>)).toEqual([{ label: "from-namespace" }]);
+    });
+
+    it("still writes the ledger, across two migration files, with the pin in force", async () => {
+      // The conjunct that makes a transaction-level pin wrong. `pg_advisory_xact_lock`
+      // runs before any pin; the `plugin_migrations` SELECT for file 002 runs AFTER
+      // file 001's statements, so it is the one the pin would have broken if the
+      // restore did not happen; the INSERT and the `plugin_database_namespaces` write
+      // run after each file. All of them name their tables unqualified.
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `CREATE TABLE ${namespace}.first (id int PRIMARY KEY);`,
+      );
+      await writeFile(
+        path.join(packageRoot, pluginManifest.database!.migrationsDir, "002_second.sql"),
+        `CREATE TABLE ${namespace}.second (id int PRIMARY KEY);`,
+        "utf8",
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const applied = await db
+        .select()
+        .from(pluginMigrations)
+        .where(and(eq(pluginMigrations.pluginId, pluginId), eq(pluginMigrations.status, "applied")));
+      expect(applied.map((row) => row.migrationKey).sort()).toEqual(["001_init.sql", "002_second.sql"]);
+
+      const [namespaceRow] = await db
+        .select()
+        .from(pluginDatabaseNamespaces)
+        .where(eq(pluginDatabaseNamespaces.pluginId, pluginId));
+      expect(namespaceRow?.namespaceName).toBe(namespace);
+    });
+
+    it("leaves no search_path behind on the pooled connection", async () => {
+      // `SET LOCAL` is scoped to the transaction `applyMigrations` opens, and the
+      // restore puts back a value CAPTURED from the session rather than one this code
+      // composes. Either failing leaks this plugin's namespace onto a shared pool.
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const after = await db.execute(sql.raw("SELECT label FROM pen6669_shadow"));
+      expect(Array.from(after as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+    });
+
+    it("refuses to apply migrations through a client it cannot pin", async () => {
+      // `SET LOCAL` outside a transaction block is NOT an error in Postgres -- it warns
+      // and changes nothing -- so an unpinnable fallback would apply every plugin
+      // migration with the hole wide open and report success. Built by hand rather than
+      // spread: `{ ...db }` drops the prototype methods and fails on `db.select` long
+      // before it reaches the pin.
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `CREATE TABLE ${namespace}.rows (id int PRIMARY KEY);`,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      const unpinnable = pluginDatabaseService({
+        select: db.select.bind(db),
+        insert: db.insert.bind(db),
+        update: db.update.bind(db),
+        execute: db.execute.bind(db),
+      });
+
+      await expect(
+        unpinnable.applyMigrations(pluginId, pluginManifest, packageRoot),
+      ).rejects.toThrow(/transactional database client/i);
+    });
+  });
+
   it("rejects runtime writes to public core tables", async () => {
     const pluginManifest = manifest();
     const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
