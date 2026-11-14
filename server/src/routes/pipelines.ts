@@ -1522,11 +1522,18 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     // ⚠ ACCEPTED RACE (PEN-6688), graded non-blocking by Ally on `#3764` and re-measured at
     // source: this SELECT and `svc.updateStage`'s own `getStageOrThrow` are two separate reads
     // of the same row, so the stored config can change between them and this guard can admit an
-    // echo of a row the restore no longer sees. ⛔ The worst outcome is a persisted literal
-    // SENTINEL — visible breakage — and NEVER an agent-authored command: a body that passes
-    // this guard is wholly derived from `mask(stored)`, so every leaf is a sentinel or a
-    // passed-through identity/enum and no fresh command string can reach the row. It also needs
-    // a concurrent OPERATOR write, which the agent cannot cause.
+    // echo of a row the restore no longer sees. ⛔ NEVER an agent-authored command — a body that
+    // passes this guard is wholly derived from `mask(stored)`, so every leaf is a sentinel or a
+    // passed-through identity/enum and no fresh command string can reach the row.
+    // ⚠ But the worst outcome is NOT merely a visibly-wrong sentinel, and saying so overstates
+    // the guard: `restoreWithheldValue` puts the SECOND read's values back under the FIRST
+    // read's identity and enums, so an operator who edits `kind`/`lifecycle` inside the window
+    // has that edit SILENTLY reverted; and `matchExistingArrayElement` falls back to INDEX for
+    // identity-less elements, which can land a neighbour's real command in the wrong slot —
+    // which `redaction.ts` itself notes is not visibly wrong the way a sentinel is. ⇒ a
+    // mixed-revision row or a lost operator edit, both SILENT. The non-blocking grade therefore
+    // rests on needing a concurrent OPERATOR write the agent cannot cause, NOT on visibility.
+    // (Raised by Ally on `#3796`; verified at `redaction.ts` `matchExistingArrayElement`.)
     // ⛔ Moving the check into `updateStage` NARROWS this window and does NOT close it: that
     // function's own read is still separate from its UPDATE. A close needs the read and the
     // write under one transaction — a row lock or a config CAS — which is why this is carried
