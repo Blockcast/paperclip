@@ -76,7 +76,7 @@
 //
 // Usage:
 //   check-doc-line-anchors.mjs [--root <dir>] [--glob <pattern>] [--base <ref>]
-//                              [--head <ref>] [--fix] [--quiet]
+//                              [--head <ref>] [--fix | --fix-all] [--quiet]
 //
 // --head names the commit whose diff against --base is "what this PR changed". It
 // defaults to the worktree HEAD, which is right locally and WRONG under a
@@ -85,6 +85,12 @@
 // --fix rewrites a drifted line number in place when the construct occurs EXACTLY
 // ONCE in the file. An ambiguous construct is left alone and reported: picking one
 // of several matches would silently re-point a security citation at the wrong one.
+//
+// --fix is NARROWED TO WHAT THIS CHANGE MADE STALE and needs --base to know it; see
+// ownsStaleNumber. Without one it refuses rather than guessing wide. --fix-all is the
+// wide mode, named so that taking it is a decision: it rewrites every renumberable
+// anchor in the corpus, which only a single writer on master can do without
+// manufacturing the conflicts PEN-6674 removed the mandate for.
 //
 // SEVERITY: A STALE NUMBER IS NOT ANCHOR ROT (PEN-6674)
 //
@@ -325,8 +331,39 @@ export function checkDocument({ docPath, docText, readSource }) {
 // construct occurs exactly once. Relocating a RANGE means re-deriving its extent, which
 // is a judgement about what the citation covers and not something to guess, so a drifted
 // range is reported and left alone. This set is exactly the set that is never fatal.
-export function applyFixes(docText, findings) {
-  const fixable = findings.filter((f) => f.status === "stale-number");
+//
+// WHICH of them a run may rewrite is a second question (PEN-6680). `--fix` used to rewrite every one
+// in the corpus, so running the prescribed remedy silently widened your diff into
+// documents you never opened: measured on #3774, a `--fix` run also renumbered a
+// Dockerfile anchor, from line 674 to line 705, in an unrelated security document, over
+// drift the same run's own report had scored as the base's. That write is a fresh
+// pairwise conflict with whoever owns the drift -- the conflict PEN-6674 removed the
+// MANDATE for, reached voluntarily through the remedy the report recommends.
+//
+// The FAIL decision already distinguishes introduced from inherited. It could not be
+// read here as it stood: attributeInherited returns early on every status outside
+// FAILING, and `stale-number` is outside it by construction -- a stale number is never
+// fatal -- so no stale-number finding has ever carried an `inherited` flag to consult.
+// Hence a predicate of its own, on the same `changed` set and in the same two cases.
+//
+// `changed === null` is "there is nothing to attribute against, and the caller has said
+// so". `main` refuses `--fix` without `--base` rather than arriving here by accident,
+// and reaches it only under the explicit `--fix-all`.
+export function ownsStaleNumber(f, changed) {
+  if (f.status !== "stale-number") return false;
+  if (changed === null) return true;
+  // This change moved the cited code, so this change is what made the number stale --
+  // the case the check exists for, where the PR moves the source and never opens the
+  // document.
+  if (f.file && changed.has(f.file)) return true;
+  // Or this change is already editing the document. Renumbering a line in a file it
+  // ALREADY touches adds no conflict surface it has not taken, and keeping that arm is
+  // what leaves "I am writing this citation, renumber it for me" working.
+  return changed.has(f.docPath);
+}
+
+export function applyFixes(docText, findings, changed = null) {
+  const fixable = findings.filter((f) => ownsStaleNumber(f, changed));
   if (fixable.length === 0) return { text: docText, fixed: [] };
 
   let text = docText;
@@ -510,7 +547,9 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
   // Two labels, because they are two different facts and only one of them was checked
   // against the base. Claiming the stronger one for both is what made a reader trust a
   // statement the run never established.
-  const FIX_HINT = `\`node scripts/check-doc-line-anchors.mjs --fix\` corrects the renumberable ones`;
+  const FIX_HINT =
+    `\`node scripts/check-doc-line-anchors.mjs --fix --base origin/master\` corrects the ` +
+    `renumberable ones THIS change made stale`;
   if (driftedSinceBase.length > 0) {
     console.error(
       `DRIFTED ON MASTER SINCE THE BASE (resolved at the base, not caused by this PR's ` +
@@ -634,7 +673,10 @@ function main(argv) {
   const root = arg("--root", process.cwd());
   const pattern = arg("--glob", "docs/security/**/*.md");
   const manifestPath = arg("--unverified", join(root, "scripts/doc-line-anchors.unverified.json"));
-  const fix = argv.includes("--fix");
+  // --fix-all implies fixing: a run that passed it and silently did nothing would read
+  // as the narrowing refusing, which is the opposite of what it asked for.
+  const fixAll = argv.includes("--fix-all");
+  const fix = argv.includes("--fix") || fixAll;
   const quiet = argv.includes("--quiet");
   const writeManifest = argv.includes("--update-unverified");
   // Empty is "no base": CI passes $PR_BASE_SHA straight through, and it is unset on
@@ -663,6 +705,48 @@ function main(argv) {
     return 2;
   }
 
+  // The base is resolved BEFORE the documents are read, because `--fix` needs it: WHAT
+  // TO REWRITE is the same attribution question as what to fail on, and answering it
+  // after the write has answered it too late. `changed` is a diff of two commits, so
+  // nothing the fix loop writes into the worktree can move it, and the attribution
+  // below reads the same set.
+  let changed = null;
+  if (baseRef) {
+    // A base that cannot be read would mark every inherited failure as introduced and
+    // fail the PR for drift it did not cause. Say so instead of judging on it.
+    const resolved = spawnSync("git", ["rev-parse", "--verify", `${baseRef}^{commit}`], {
+      cwd: root,
+      encoding: "utf8",
+    });
+    if (resolved.status !== 0) {
+      console.error(`cannot judge: --base ${baseRef} does not resolve in ${root}`);
+      console.error(`         the job needs the base commit on disk (fetch-depth: 0)`);
+      return 2;
+    }
+    // A head that is not on disk needs no guard of its own: the diff below fails, and
+    // `changed === null` already refuses to judge rather than attributing everything
+    // to this PR. --base has an explicit pre-check only because it is ALSO read by
+    // collectAgainstBaseSource, where a silent miss would read as "clean at the base".
+    changed = changedSince(baseRef, root, headRef);
+    if (changed === null) {
+      console.error(`cannot judge: cannot diff ${baseRef}...${headRef} in ${root}`);
+      return 2;
+    }
+  }
+
+  // Without a base there is no introduced set to narrow to, and the wide answer is the
+  // foot-gun itself: it writes shared lines in documents this change never opened. The
+  // documented remedy was a bare `--fix`, so this is the invocation the corpus actually
+  // sees. Refuse it, and name the wide mode rather than defaulting to it -- a single
+  // writer on master can hold it safely and an arbitrary PR cannot.
+  if (fix && changed === null && !fixAll) {
+    console.error(`cannot judge: --fix needs --base <ref> to tell the anchors this change`);
+    console.error(`         made stale from the ones it inherited (PEN-6680). Pass`);
+    console.error(`         --base origin/master, or --fix-all to rewrite every`);
+    console.error(`         renumberable anchor in the corpus.`);
+    return 2;
+  }
+
   const sourceCache = new Map();
   const readSource = (file) => {
     if (!sourceCache.has(file)) {
@@ -677,7 +761,7 @@ function main(argv) {
     const abs = join(root, rel);
     const findings = checkDocument({ docPath: rel, docText: readFileSync(abs, "utf8"), readSource });
     if (fix) {
-      const { text, fixed } = applyFixes(readFileSync(abs, "utf8"), findings);
+      const { text, fixed } = applyFixes(readFileSync(abs, "utf8"), findings, fixAll ? null : changed);
       if (fixed.length > 0) {
         writeFileSync(abs, text);
         for (const f of fixed) console.log(`fixed ${rel}:${f.docLine} \`${f.anchor}\` -> :${f.to}`);
@@ -712,26 +796,9 @@ function main(argv) {
   let attributed = all;
   let inheritedStale = [];
   if (baseRef) {
-    // A base that cannot be read would mark every inherited failure as introduced and
-    // fail the PR for drift it did not cause. Say so instead of judging on it.
-    const resolved = spawnSync("git", ["rev-parse", "--verify", `${baseRef}^{commit}`], {
-      cwd: root,
-      encoding: "utf8",
-    });
-    if (resolved.status !== 0) {
-      console.error(`cannot judge: --base ${baseRef} does not resolve in ${root}`);
-      console.error(`         the job needs the base commit on disk (fetch-depth: 0)`);
-      return 2;
-    }
-    // A head that is not on disk needs no guard of its own: the diff below fails, and
-    // `changed === null` already refuses to judge rather than attributing everything
-    // to this PR. --base has an explicit pre-check only because it is ALSO read by
-    // collectAgainstBaseSource, where a silent miss would read as "clean at the base".
-    const changed = changedSince(baseRef, root, headRef);
-    if (changed === null) {
-      console.error(`cannot judge: cannot diff ${baseRef}...${headRef} in ${root}`);
-      return 2;
-    }
+    // Read AFTER the fix loop on purpose: collectAgainstBaseSource resolves the
+    // worktree's document text against the base source, so it has to see whatever
+    // --fix just wrote. The base commit itself was resolved above.
     const baseSource = collectAgainstBaseSource(baseRef, docs, root);
     attributed = attributeInherited(all, baseSource, changed, { queueBase });
     inheritedStale = applyUnverified(baseSource, manifest, docs).stale.filter(

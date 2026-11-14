@@ -10,6 +10,7 @@ import {
   isMainModule,
   isRenumberable,
   locateConstruct,
+  ownsStaleNumber,
   parseAnchorSpan,
   parseDirective,
   resolveConstruct,
@@ -274,6 +275,59 @@ test("applyFixes keeps offsets valid when one line carries several anchors", () 
     checkDocument({ docPath: "d.md", docText: text, readSource: () => wide }).map((f) => f.status),
     ["ok", "ok"],
   );
+});
+
+// PEN-6680. `--fix` is the remedy the report recommends, so what it writes is what an
+// author who follows the instruction writes. Rewriting every stale number in the corpus
+// made that instruction widen the diff into documents the author never opened -- and a
+// write to a shared line is the pairwise conflict PEN-6674 removed the MANDATE for,
+// arrived at voluntarily.
+test("ownsStaleNumber: this change moved the cited file, so it owns the number", () => {
+  const f = { status: "stale-number", docPath: "docs/d.md", file: "src/a.ts" };
+  assert.equal(ownsStaleNumber(f, new Set(["src/a.ts"])), true);
+});
+
+test("ownsStaleNumber: this change is already editing the document", () => {
+  // The arm that keeps "I am writing this citation, renumber it for me" working. The
+  // document is already in the diff, so the rewrite takes no conflict surface the
+  // change has not taken.
+  const f = { status: "stale-number", docPath: "docs/d.md", file: "src/a.ts" };
+  assert.equal(ownsStaleNumber(f, new Set(["docs/d.md"])), true);
+});
+
+test("ownsStaleNumber: a number this change touched neither end of is not its own", () => {
+  // The #3774 case: the run's own report scored this `1 inherited from the base`, and
+  // --fix rewrote it anyway.
+  const f = { status: "stale-number", docPath: "docs/d.md", file: "src/a.ts" };
+  assert.equal(ownsStaleNumber(f, new Set(["src/unrelated.ts"])), false);
+});
+
+test("ownsStaleNumber: no base is the caller accepting the whole corpus", () => {
+  // `null` is reachable only under --fix-all; main refuses a bare --fix without a base.
+  const f = { status: "stale-number", docPath: "docs/d.md", file: "src/a.ts" };
+  assert.equal(ownsStaleNumber(f, null), true);
+});
+
+test("ownsStaleNumber: only stale numbers are ever rewritten, whatever changed", () => {
+  // The widening must not reach the statuses --fix has always refused. A drifted range
+  // is a judgement about what the citation covers, not a renumber.
+  for (const status of ["drifted", "ambiguous", "ok", "unverified", "missing-file"]) {
+    const f = { status, docPath: "docs/d.md", file: "src/a.ts" };
+    assert.equal(ownsStaleNumber(f, new Set(["docs/d.md", "src/a.ts"])), false, status);
+  }
+});
+
+test("applyFixes rewrites only the stale numbers this change owns", () => {
+  const doc = "`parseThing` (`src/a.ts:5`)";
+  const findings = check(doc);
+  assert.equal(findings[0].status, "stale-number", "fixture must be renumberable");
+
+  const mine = applyFixes(doc, findings, new Set(["src/a.ts"]));
+  assert.equal(mine.text, "`parseThing` (`src/a.ts:2`)");
+
+  const theirs = applyFixes(doc, findings, new Set(["src/elsewhere.ts"]));
+  assert.equal(theirs.text, doc, "an inherited stale number must be left byte-identical");
+  assert.deepEqual(theirs.fixed, []);
 });
 
 // The manifest carries anchors a human has to settle, so these fixtures use RANGES:
@@ -754,6 +808,185 @@ test("a stale number does not eject a merge-group entry, and real rot still does
     assert.match(r.stderr, /no longer in the file at all/);
   } finally {
     rot.rm();
+  }
+});
+
+// PEN-6680, pinned end to end because `--fix` is a COMMAND LINE: the narrowing lives in
+// main's ordering as much as in the predicate. The fix loop used to run before the base
+// was even resolved, so there was no attribution in scope to consult -- a change that
+// only taught applyFixes the term would have satisfied every unit test above and still
+// written the inherited number.
+//
+// The fixture carries one of each. `src/a.ts` is moved by this change, so the number
+// citing it is this change's doing. `src/b.ts` and the document citing it are untouched,
+// and that number was already stale at the base -- master's drift, which #3774 measured
+// --fix rewriting into an unrelated security document.
+const OTHER_SOURCE = [
+  "const b = 1;", // 1
+  "function otherThing(", // 2
+  "  input: unknown,", // 3
+  ") {", // 4
+  "  return null;", // 5
+  "}", // 6
+].join("\n");
+
+const INHERITED_DOC = "`otherThing` (`src/b.ts:4`)\n";
+
+const introducedInheritedFixture = async ({ touchDoc = null, manifest = null } = {}) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const root = mkdtempSync(join(tmpdir(), "anchor-narrow-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "master");
+  git("config", "user.email", "t@t");
+  git("config", "user.name", "t");
+  mkdirSync(join(root, "src"));
+  mkdirSync(join(root, "docs"));
+  writeFileSync(join(root, "src/a.ts"), SOURCE);
+  writeFileSync(join(root, "src/b.ts"), OTHER_SOURCE);
+  writeFileSync(join(root, "docs/one.md"), "`parseThing` (`src/a.ts:2`)\n");
+  // Stale at the base already: `otherThing` is at :2 and has never been at :4.
+  writeFileSync(join(root, "docs/two.md"), INHERITED_DOC);
+  if (manifest) writeFileSync(join(root, "m.json"), JSON.stringify(manifest));
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD");
+
+  // The change: it pushes src/a.ts down two lines. It opens neither src/b.ts nor, by
+  // default, either document.
+  writeFileSync(join(root, "src/a.ts"), `// this change added\n// two lines\n${SOURCE}`);
+  if (touchDoc) {
+    writeFileSync(join(root, touchDoc), `${INHERITED_DOC}\nthis change edited the document.\n`);
+  }
+  git("add", "-A");
+  git("commit", "-qm", "the change moves the cited file");
+  const head = git("rev-parse", "HEAD");
+  return { root, base, head, rm: () => rmSync(root, { recursive: true, force: true }) };
+};
+
+const checkerPath = async () => {
+  const { join, dirname } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  return join(dirname(fileURLToPath(import.meta.url)), "check-doc-line-anchors.mjs");
+};
+
+test("end to end: --fix rewrites what this change made stale and nothing else", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const script = await checkerPath();
+
+  const f = await introducedInheritedFixture();
+  try {
+    const run = (...extra) =>
+      spawnSync(process.execPath, [script, "--root", f.root, "--glob", "docs/*.md", ...extra], {
+        encoding: "utf8",
+      });
+    const doc = (rel) => readFileSync(join(f.root, rel), "utf8");
+
+    const r = run("--base", f.base, "--head", f.head, "--fix");
+    assert.equal(r.status, 0, `a stale number is never fatal: ${r.stderr}`);
+    assert.equal(doc("docs/one.md"), "`parseThing` (`src/a.ts:4`)\n", "the introduced one");
+    assert.equal(
+      doc("docs/two.md"),
+      INHERITED_DOC,
+      "an inherited stale number must be left textually untouched, not merely unreported",
+    );
+
+    // And still REPORTED. Narrowing what --fix writes must not narrow what it says:
+    // the number is the one thing the run is holding, and dropping it would trade a
+    // widened diff for a silent corpus.
+    assert.match(r.stderr, /STALE NUMBER {2}docs\/two\.md/);
+    assert.match(r.stderr, /construct `otherThing` is now at :2/);
+    assert.match(r.stdout, /1 with a stale number/, "the inherited one still counts");
+
+    // The must-fail half. Without it this test passes just as well against a --fix that
+    // writes nothing at all, and the fixture would not be shown to contain two
+    // rewritable anchors in the first place.
+    const wide = run("--fix-all");
+    assert.equal(wide.status, 0, wide.stderr);
+    assert.equal(doc("docs/two.md"), "`otherThing` (`src/b.ts:2`)\n", "--fix-all takes both");
+  } finally {
+    f.rm();
+  }
+});
+
+test("end to end: --fix without a base refuses rather than guessing wide", async () => {
+  // The remedy the report and docs/security both recommended was a bare `--fix`, so
+  // this is the invocation the corpus actually sees. With no base there is no
+  // introduced set, and the wide answer is the foot-gun itself.
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const script = await checkerPath();
+
+  const f = await introducedInheritedFixture();
+  try {
+    const r = spawnSync(
+      process.execPath,
+      [script, "--root", f.root, "--glob", "docs/*.md", "--fix"],
+      { encoding: "utf8" },
+    );
+    assert.equal(r.status, 2, "a run that cannot attribute must refuse, not judge");
+    assert.match(r.stderr, /cannot judge/);
+    assert.match(r.stderr, /--fix-all/, "and must name the deliberate wide mode");
+    assert.equal(readFileSync(join(f.root, "docs/one.md"), "utf8"), "`parseThing` (`src/a.ts:2`)\n");
+    assert.equal(readFileSync(join(f.root, "docs/two.md"), "utf8"), INHERITED_DOC);
+  } finally {
+    f.rm();
+  }
+});
+
+// PEN-6680 R1. Since PEN-6674 a single-line anchor whose construct is still uniquely
+// placed is a STALE NUMBER, which is outside FAILING -- so a manifest entry naming it is
+// no longer discharged, and comes back as STALE MANIFEST ENTRY. That is intended: only a
+// STILL-FAILING anchor discharges an entry, which is what makes the manifest shrink and
+// stops it becoming a permanent hole. It was carried on prose alone, with the manifest
+// empty at master, which is exactly the state in which the next author meets it cold.
+test("a manifest entry whose anchor is now a stale number is reported, not discharged", () => {
+  const doc = "`parseThing` (`src/a.ts:5`)";
+  const findings = check(doc);
+  assert.equal(findings[0].status, "stale-number", "fixture must be renumberable");
+  const manifest = [{ doc: "d.md", anchor: "src/a.ts:5", construct: "parseThing" }];
+  const { findings: out, stale } = applyUnverified(findings, manifest, ["d.md"]);
+  assert.equal(out[0].status, "stale-number", "a stale number must not be downgraded");
+  assert.deepEqual(stale, ["d.md\tsrc/a.ts:5\tparseThing"]);
+});
+
+test("that entry is fatal for a change that touches the document, inherited otherwise", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const script = await checkerPath();
+  const manifest = [{ doc: "docs/two.md", anchor: "src/b.ts:4", construct: "otherThing" }];
+  const run = (f) =>
+    spawnSync(
+      process.execPath,
+      [script, "--root", f.root, "--glob", "docs/*.md", "--base", f.base, "--head", f.head,
+        "--unverified", `${f.root}/m.json`],
+      { encoding: "utf8" },
+    );
+
+  // Untouched: the entry is stale against the base too, so it is the base's to settle.
+  const away = await introducedInheritedFixture({ manifest });
+  try {
+    const r = run(away);
+    assert.equal(r.status, 0, `an inherited stale entry must not fail this change: ${r.stderr}`);
+    assert.match(r.stderr, /INHERITED[\s\S]*STALE MANIFEST ENTRY {2}docs\/two\.md/);
+  } finally {
+    away.rm();
+  }
+
+  // Touched: the change is editing the document the entry exempts, so it is the change
+  // that has to drop the line. This is the arm that makes the manifest shrink.
+  const here = await introducedInheritedFixture({ manifest, touchDoc: "docs/two.md" });
+  try {
+    const r = run(here);
+    assert.equal(r.status, 1, "a change editing the document owns the stale entry");
+    assert.match(r.stderr, /^STALE MANIFEST ENTRY {2}docs\/two\.md/m);
+    assert.match(r.stderr, /Remove the entry/);
+  } finally {
+    here.rm();
   }
 });
 
