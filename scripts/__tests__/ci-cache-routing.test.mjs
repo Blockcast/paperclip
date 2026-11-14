@@ -36,7 +36,15 @@ test("Docker builds use persistent remote BuildKit, master cache, and bounded co
   const buildJob = workflow.match(/\n  build-and-push:\n([\s\S]*?)\n  deploy:\n/)?.[1];
 
   assert.ok(buildJob, "build-and-push job is missing");
-  assert.match(buildJob, /\n    runs-on: arc-paperclip-buildkit\n/);
+  // PEN-6677: the GROUP is pinned as well as the label -- two org runner groups
+  // answer the bare label, and a tools-cluster runner reaches a different
+  // BuildKit from the Ceph-backed one this job assumes. Asserting the group is
+  // strictly stronger than the old bare-label match, and the routing is what
+  // this assertion was always about.
+  assert.match(
+    buildJob,
+    /\n    runs-on:\n      group: arc-paperclip-buildkit\n      labels: arc-paperclip-buildkit\n/,
+  );
   // BLO-55269: dispatch defaults to ordinal 1 but an operator can pick 0; push stays on 0.
   assert.match(workflow, /\n      buildkit_ordinal:\n[\s\S]*?type: choice\n        default: "1"\n        options:\n          - "1"\n          - "0"\n/);
   assert.match(buildJob, /INPUT_ORDINAL: \$\{\{ inputs\.buildkit_ordinal \}\}/);
