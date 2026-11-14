@@ -973,7 +973,7 @@ Four things a reader should not infer from that paragraph:
    `paperclip-github-token-env` as the binary that starves, and routed the
    answer through the broker's refusal of the `auth` verb. **Neither is on
    this path.** That wrapper installs to `/usr/local/libexec/paperclip/bin/`
-   (`Dockerfile:674` (`/usr/local/libexec/paperclip/bin/`)) and is reached through `PATH`
+   (`Dockerfile:705` (`/usr/local/libexec/paperclip/bin/`)) and is reached through `PATH`
    — which is precisely what
    bypass 4 sidesteps. The system helper is `!/usr/bin/gh auth git-credential`
    (`Dockerfile.runtime:95` (`!/usr/bin/gh auth git-credential`)), an **absolute** path,
