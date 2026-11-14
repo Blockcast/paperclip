@@ -39,6 +39,7 @@
     "src/__tests__/cold-in-review-issue-metrics.test.ts",
     "src/__tests__/costs-by-project-statement-naming-postgres.test.ts",
     "src/__tests__/dep-blocked-retry-dispersion.test.ts",
+    "src/__tests__/background-db-errors-metric.test.ts",
     "src/__tests__/gc-flags-metrics.test.ts",
     "src/__tests__/github-api-refusal-metric.test.ts",
     "src/__tests__/github-webhook-dedicated-pool.test.ts",

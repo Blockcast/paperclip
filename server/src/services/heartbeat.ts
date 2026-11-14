@@ -499,6 +499,7 @@ import {
   recordDepBlockedRetryDispersion,
   recordK8sIsolationConflictDeferral,
   recordBranchClaimConflictDeferral,
+  recordBackgroundDbError,
 } from "./metrics.js";
 import type {
   DispatchDeclineReason,
@@ -21007,6 +21008,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             },
             "setRunStatus write hit a transient db error; retrying (BLO-16998)",
           ),
+        // PEN-6581: census every database error this writer raises, retried or
+        // not. Reached mostly from reapers and sweeps holding no HTTP request,
+        // where the response-path counter cannot see it and `heartbeat_runs`
+        // was the largest class-D contributor with no instrument at all. It is
+        // NOT route-free though -- `POST /agents/:id/pause` reaches it via
+        // `cancelActiveForAgentInternal`, so that overlap is counted twice
+        // across the two metrics; see BACKGROUND_DB_ERRORS_METRIC. `onError`
+        // rather than `onRetry` because the events worth counting are exactly
+        // the ones NOT followed by a retry -- the final failure of an exhausted
+        // sequence and every non-transient error.
+        onError: ({ error }) =>
+          recordBackgroundDbError({ writer: "heartbeat_run_status", error }),
       },
     );
 
@@ -21170,6 +21183,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
               `${label} write hit a transient db error; retrying (BLO-16998)`,
             ),
+          // PEN-6581: see the note on setRunStatus. This sits in
+          // `setRunStatusIfCurrentStatus`, so it covers all three of its
+          // callers -- `setRunStatusIfRunning`, `setRunStatusIfQueued` and the
+          // `cancelRunInternal` CAS, the last of which is reachable from
+          // `POST /heartbeat-runs/:runId/cancel`. Counted under its own
+          // `writer` label rather than folded into the unguarded one -- both
+          // target `heartbeat_runs`, so `sum by (table)` recombines them, while
+          // keeping them apart separates the guarded finalize from the plain
+          // one. NOTE it cannot record a LOST expected-status race: losing that
+          // race returns null without raising, so nothing reaches `onError`.
+          onError: ({ error }) =>
+            recordBackgroundDbError({ writer: "heartbeat_run_status_guarded", error }),
         },
       );
     } catch (error) {
@@ -22164,12 +22189,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         },
       });
     } catch (err) {
+      // PEN-6581: census this writer's database errors. It holds no HTTP
+      // request, and the class-D census's `update "documents" set "title" = $1`
+      // event is this path. `recordBackgroundDbError` returns null and counts
+      // nothing when `err` carries no SQLSTATE, so this broad catch cannot
+      // pollute the counter with a non-database fault.
+      const sqlstate = recordBackgroundDbError({
+        writer: "issue_continuation_summary",
+        error: err,
+      });
       logger.warn(
         {
           err,
           runId: run.id,
           issueId,
           agentId: agent.id,
+          sqlstate,
         },
         "failed to refresh issue continuation summary",
       );
