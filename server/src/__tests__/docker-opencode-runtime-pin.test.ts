@@ -333,7 +333,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   });
 
   it("routes server image builds through the dedicated remote BuildKit pool", () => {
-    expect(dockerWorkflow.match(/runs-on: arc-paperclip-buildkit/g)).toHaveLength(1);
+    // PEN-6677: group-pinned so a build cannot land on the tools-cluster twin,
+    // which reaches a different BuildKit. Still exactly one such job.
+    expect(dockerWorkflow.match(/group: arc-paperclip-buildkit/g)).toHaveLength(1);
     expect(dockerWorkflow).not.toContain("runs-on: arc-dind");
     expect(dockerWorkflow).toContain("driver: remote");
     expect(dockerWorkflow).toContain(
@@ -607,7 +609,8 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
   it("builds agent runtime images daemonless on the remote BuildKit (BLO-48930)", () => {
     // arc-paperclip-buildkit has no Docker daemon, so the default
     // docker-container buildx driver would fail there.
-    expect(agentRuntimeImagesWorkflow).toContain("runs-on: arc-paperclip-buildkit");
+    // PEN-6677: group-pinned; see docker.yml for the full rationale.
+    expect(agentRuntimeImagesWorkflow).toContain("group: arc-paperclip-buildkit");
     expect(agentRuntimeImagesWorkflow).not.toContain("runs-on: arc-dind");
     expect(agentRuntimeImagesWorkflow).toContain("driver: remote");
     expect(agentRuntimeImagesWorkflow).toContain(
