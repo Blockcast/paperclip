@@ -232,6 +232,19 @@ export function deployRefusedByMinInterval(jobs) {
 }
 
 /**
+ * When the min-interval guard step refused (its `completed_at`), or '' if it
+ * did not. The refusal proves paperclip-0 was younger than the interval at
+ * that instant, so by refusedAt + interval it is past it — no cluster read
+ * needed from the dispatcher, which has no kubeconfig (BLO-57061 review).
+ */
+export function minIntervalRefusedAt(jobs) {
+  if (!deployRefusedByMinInterval(jobs)) return '';
+  const deploy = jobs.find((job) => job?.name === DEPLOY_JOB_NAME);
+  const step = deploy.steps.find((s) => s?.name === MIN_INTERVAL_STEP_NAME && s?.conclusion === 'failure');
+  return step?.completed_at ?? '';
+}
+
+/**
  * Was the whole deploy lane gated off before it could start?
  *
  * `skipped` on the entry guard means the shared condition was false. ABSENT is
@@ -396,6 +409,7 @@ export async function findLastCompletedDispatch({
       // withholds, which is this module's fail-quiet direction.
       // A min-interval refusal executed `deploy` only far enough to decline.
       deployExecuted: deployJobCompleted(jobs) && !deployRefusedByMinInterval(jobs),
+      refusedAt: minIntervalRefusedAt(jobs),
     },
   };
 }
