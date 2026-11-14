@@ -15,6 +15,7 @@ import {
   parseDirective,
   resolveConstruct,
   spansOf,
+  worktreeChangedSince,
 } from "./check-doc-line-anchors.mjs";
 
 const SOURCE = [
@@ -832,7 +833,11 @@ const OTHER_SOURCE = [
 
 const INHERITED_DOC = "`otherThing` (`src/b.ts:4`)\n";
 
-const introducedInheritedFixture = async ({ touchDoc = null, manifest = null } = {}) => {
+const introducedInheritedFixture = async ({
+  touchDoc = null,
+  manifest = null,
+  commit = true,
+} = {}) => {
   const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -860,8 +865,13 @@ const introducedInheritedFixture = async ({ touchDoc = null, manifest = null } =
   if (touchDoc) {
     writeFileSync(join(root, touchDoc), `${INHERITED_DOC}\nthis change edited the document.\n`);
   }
-  git("add", "-A");
-  git("commit", "-qm", "the change moves the cited file");
+  // `commit: false` leaves exactly the same change sitting in the WORKTREE. Everything
+  // about the tree is identical; the only difference is whether `base...HEAD` can see
+  // it, which is the whole of PEN-6680's follow-up.
+  if (commit) {
+    git("add", "-A");
+    git("commit", "-qm", "the change moves the cited file");
+  }
   const head = git("rev-parse", "HEAD");
   return { root, base, head, rm: () => rmSync(root, { recursive: true, force: true }) };
 };
@@ -934,6 +944,140 @@ test("end to end: --fix without a base refuses rather than guessing wide", async
     assert.match(r.stderr, /--fix-all/, "and must name the deliberate wide mode");
     assert.equal(readFileSync(join(f.root, "docs/one.md"), "utf8"), "`parseThing` (`src/a.ts:2`)\n");
     assert.equal(readFileSync(join(f.root, "docs/two.md"), "utf8"), INHERITED_DOC);
+  } finally {
+    f.rm();
+  }
+});
+
+// PEN-6680 follow-up (Ally review on #3788). `--fix` WRITES TO THE WORKTREE, and the
+// set it was narrowed to was `base...HEAD` -- committed work only. Locally, before you
+// commit, BOTH ownership arms are therefore empty: an uncommitted source move is not "a
+// file you moved" and an uncommitted doc edit is not "a document you are already
+// editing". So the documented remedy was a silent no-op in its most common use, and the
+// report then recommended the same command again. It failed CLOSED -- fewer writes, the
+// number still reported -- which is why no test and no gate caught it.
+test("end to end: --fix owns an UNCOMMITTED move of the cited file", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const script = await checkerPath();
+
+  const f = await introducedInheritedFixture({ commit: false });
+  try {
+    const run = (...extra) =>
+      spawnSync(process.execPath, [script, "--root", f.root, "--glob", "docs/*.md", ...extra], {
+        encoding: "utf8",
+      });
+    const doc = (rel) => readFileSync(join(f.root, rel), "utf8");
+
+    // The must-fail half FIRST, and it is the same command with --head pinned to the
+    // commit. That is the old behaviour exactly: attribution against a commit cannot see
+    // the worktree, so the fix is a no-op. It is also the CI shape, which must not move.
+    const pinned = run("--base", f.base, "--head", f.head, "--fix");
+    assert.equal(pinned.status, 0, pinned.stderr);
+    assert.equal(
+      doc("docs/one.md"),
+      "`parseThing` (`src/a.ts:2`)\n",
+      "an explicit --head says the worktree is not the change; the union must not apply",
+    );
+
+    // And without --head, where the worktree IS the change being judged.
+    const r = run("--base", f.base, "--fix");
+    assert.equal(r.status, 0, `a stale number is never fatal: ${r.stderr}`);
+    assert.equal(doc("docs/one.md"), "`parseThing` (`src/a.ts:4`)\n", "the uncommitted move");
+    assert.equal(
+      doc("docs/two.md"),
+      INHERITED_DOC,
+      "widening to the worktree must not widen past it: the base's drift stays untouched",
+    );
+  } finally {
+    f.rm();
+  }
+});
+
+// The other ownership arm, and the case ownsStaleNumber keeps the doc-arm for at all:
+// "I am writing this citation, renumber it for me". That almost always happens BEFORE
+// the commit, so it was the arm most completely broken by attributing against one.
+test("end to end: --fix owns a citation in a document edited but not committed", async () => {
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const script = await checkerPath();
+
+  // Nothing is committed on top of the base at all: the only change in this tree is an
+  // unstaged edit to the document that carries the already-stale citation.
+  const f = await introducedInheritedFixture({ commit: false });
+  try {
+    writeFileSync(
+      join(f.root, "docs/two.md"),
+      `${INHERITED_DOC}\nI am editing this document right now.\n`,
+    );
+    const r = spawnSync(
+      process.execPath,
+      [script, "--root", f.root, "--glob", "docs/*.md", "--base", f.base, "--fix"],
+      { encoding: "utf8" },
+    );
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(
+      readFileSync(join(f.root, "docs/two.md"), "utf8"),
+      /`otherThing` \(`src\/b\.ts:2`\)/,
+      "editing the document is what owns the number in it",
+    );
+  } finally {
+    f.rm();
+  }
+});
+
+// The hint half. A run that declined a number declined it on purpose, so pointing the
+// reader back at the command that just declined them reads as the fix having failed.
+test("an inherited stale number is reported apart, and not under the --fix hint", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const script = await checkerPath();
+
+  const f = await introducedInheritedFixture();
+  try {
+    const r = spawnSync(
+      process.execPath,
+      [script, "--root", f.root, "--glob", "docs/*.md", "--base", f.base, "--head", f.head],
+      { encoding: "utf8" },
+    );
+    assert.equal(r.status, 0, r.stderr);
+    const lines = r.stderr.split("\n");
+    const heading = lines.findIndex((l) => l.startsWith("STALE LINE NUMBERS INHERITED FROM THE BASE"));
+    assert.ok(heading >= 0, `expected the inherited heading in:\n${r.stderr}`);
+    assert.match(lines[heading + 1], /STALE NUMBER {2}docs\/two\.md/);
+    // The must-fail half: the fixture's OTHER number is this change's, so the owned
+    // block must still be printed. A rule that moved everything into the new bucket
+    // would pass the assertion above and say nothing true.
+    assert.ok(
+      lines.some((l) => /^STALE LINE NUMBERS \(/.test(l)),
+      `the introduced number keeps the actionable heading:\n${r.stderr}`,
+    );
+  } finally {
+    f.rm();
+  }
+});
+
+test("worktreeChangedSince sees staged, unstaged and untracked work; changedSince does not", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+
+  const f = await introducedInheritedFixture({ commit: false });
+  try {
+    const git = (...args) => execFileSync("git", args, { cwd: f.root, encoding: "utf8" });
+    writeFileSync(join(f.root, "docs/staged.md"), "staged\n");
+    git("add", "docs/staged.md");
+    writeFileSync(join(f.root, "docs/untracked.md"), "untracked\n");
+
+    const wt = worktreeChangedSince(f.base, f.root);
+    assert.ok(wt.has("src/a.ts"), "unstaged");
+    assert.ok(wt.has("docs/staged.md"), "staged");
+    assert.ok(wt.has("docs/untracked.md"), "untracked");
+
+    // The control that makes the test a comparison rather than a tautology: the
+    // committed-only set sees none of it, which is the defect in one line.
+    assert.deepEqual([...changedSince(f.base, f.root)], [], "base...HEAD sees committed work only");
   } finally {
     f.rm();
   }
