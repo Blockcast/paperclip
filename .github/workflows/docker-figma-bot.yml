@@ -88,7 +88,11 @@ jobs:
     # docker.yml). BLO-46675: off org group 1 (arc-dind) so tag pushes
     # (refs/tags/figma-bot-v*) and non-master workflow_dispatch keep a runner once
     # group 1 is scoped to master-pinned workflows (BLO-40782).
-    runs-on: arc-paperclip-buildkit
+    # PEN-6677: group pinned so this cannot land on the tools-cluster twin,
+    # which reaches a different BuildKit. Full rationale in docker.yml.
+    runs-on:
+      group: arc-paperclip-buildkit
+      labels: arc-paperclip-buildkit
     timeout-minutes: 30
     concurrency:
       group: docker-figma-bot-${{ github.ref }}

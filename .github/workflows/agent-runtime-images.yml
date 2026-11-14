@@ -27,7 +27,11 @@ env:
 
 jobs:
   build-and-sign:
-    runs-on: arc-paperclip-buildkit
+    # PEN-6677: group pinned so this cannot land on the tools-cluster twin,
+    # which reaches a different BuildKit. Full rationale in docker.yml.
+    runs-on:
+      group: arc-paperclip-buildkit
+      labels: arc-paperclip-buildkit
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
