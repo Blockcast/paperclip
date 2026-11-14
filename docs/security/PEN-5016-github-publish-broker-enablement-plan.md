@@ -232,7 +232,7 @@ The chain, read at `47d01a4bf`:
 2. `mergeModelProfileAdapterConfig`, defined at `:7466`
    (`export function mergeModelProfileAdapterConfig(input: {`), is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` at `:38336`
+3. The merged object becomes `executionRunConfig` at `:38440`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
 4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3290`
@@ -242,7 +242,7 @@ The chain, read at `47d01a4bf`:
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:37737`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:37841`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
