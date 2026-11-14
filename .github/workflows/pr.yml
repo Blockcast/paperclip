@@ -1013,9 +1013,18 @@ jobs:
       # the failure mode this whole step exists to catch.)
       # Drift that an earlier entry caused is therefore attributed to -- and can eject
       # -- a later one that touched neither the source nor the document. That direction
-      # is deliberate: it fails closed, never open. Read such an ejection as the queue
-      # reporting a real anchor the combined tree broke, not as a regression of this
-      # attribution fix; re-enqueue once the earlier entry's drift is corrected.
+      # is deliberate for anchor ROT: it fails closed, never open. Read such an ejection
+      # as the queue reporting a real anchor the combined tree broke, not as a
+      # regression of this attribution fix.
+      #
+      # It is NOT how a merely stale NUMBER is handled, and PEN-6674 is why. A
+      # single-line anchor whose construct is still in the combined tree, at exactly one
+      # place, is reported and never fatal -- see the SEVERITY block in the checker. The
+      # ejection it used to cause had no satisfying move: the correct number depends on
+      # which entries the queue groups you with, so an entry prepared perfectly against
+      # its own base is wrong against the group head, and the remedy -- re-enqueue after
+      # correcting -- costs a human enqueue act and converges on nothing. Measured
+      # 2026-11-14: #3715 evicted three times, #3476 once, #3774 red on 8 anchors.
       #
       # `--base-kind queue` on merge_group says PR_BASE_SHA is the QUEUE's base -- master's
       # tip at the moment the entry was built -- and not the tree this head was written

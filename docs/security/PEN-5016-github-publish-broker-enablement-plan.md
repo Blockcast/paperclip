@@ -136,6 +136,18 @@ will catch the next drift.
 When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix` — it rewrites any
 anchor whose construct it can place unambiguously, and reports the rest rather than guessing.
 
+**A stale number does not fail your pull request either, and you are not expected to run `--fix`
+before landing** (PEN-6674). Where the construct is still in the file at exactly one place, the
+checker reports `STALE NUMBER` with the line it found and moves on: the citation is the construct,
+and the checker is holding the right number while it decides. Only rot is fatal — the construct
+gone from the file, sitting at several candidate sites, or pinned by a range, which `--fix` refuses
+to relocate. The reason is concurrency, not leniency. Requiring the number made `--fix` a WRITE to
+this shared document that every PR moving a cited file had to make, so two such PRs rewrote the
+same lines to different numbers and conflicted on merge-queue staging; and an entry whose numbers
+were right against its own base was wrong against the merge-group head, which carries the entries
+queued ahead of it. On 2026-11-14 that evicted `#3715` three times and `#3476` once, each eviction
+spending a human enqueue act, for a number no side could have held.
+
 **A drift already on `master` does not fail your pull request.** CI passes `--base $PR_BASE_SHA`,
 and an anchor that was already failing against the base is reported as `INHERITED` rather than
 enforced; only an anchor this PR broke fails it — either because the PR touches the cited file,
