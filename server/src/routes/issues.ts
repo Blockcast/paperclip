@@ -17613,9 +17613,14 @@ export function issueRoutes(
         // missing term silently drops a side effect.
         //
         //  - `!reopened` / `!scheduledRetrySupersededByComment`: both mean
-        //    `svc.update(id, {status:"todo"})` already ran, and both add
-        //    `reopened`/`scheduledRetry*` keys to the activity details and swap
-        //    the assignee wake for `issue_reopened_via_comment`.
+        //    `svc.update(id, {status:"todo"})` already ran, and each adds its
+        //    own keys to the activity details — `reopened`/`reopenedFrom`, or
+        //    `scheduledRetrySupersededByComment` plus its run ids. ⚠ The
+        //    assignee wake swaps to `issue_reopened_via_comment` on the
+        //    `reopened` arm ONLY: that branch is keyed on `reopened` alone, so
+        //    a `scheduledRetrySupersededByComment` request still raises a
+        //    plain `issue_commented` wake. Both terms stay excluded anyway —
+        //    the activity keys alone are past what the builder can express.
         //  - `!interruptRequested`: `interruptedRunId` rides the activity row
         //    and every wake payload; the builder carries neither.
         //  - `!isClosedIssueStatus(currentIssue.status)`: BEHAVIOUR-PRESERVING
@@ -17654,8 +17659,14 @@ export function issueRoutes(
         //    retry is that case, and #3770 (PEN-6645) pins this term on it in
         //    `issue-comment-unkeyed-outbox-routes.test.ts`. Excluding it
         //    anyway is the NARROWING declared above: whenever the block DOES
-        //    run it writes `reopened`/`reopenedFrom` and swaps the assignee
-        //    wake, and nothing here rests on the term matching the block.
+        //    run it sets `reopened` or `scheduledRetrySupersededByComment` —
+        //    the first two conjuncts here — and nothing rests on the term
+        //    matching the block. Those two are EXHAUSTIVE over the ways the
+        //    guard can be true, because
+        //    `shouldHumanCommentResumeInProgressScheduledRetry` returns false
+        //    unless the status is `in_progress`, so the guard's third
+        //    disjunct already implies the `in_progress` conjunct of
+        //    `scheduledRetrySupersededByComment`.
         //
         // Not in the predicate because the arm itself excludes them: the
         // auto-approval transition (this is its `else`), and the blocked-reopen
