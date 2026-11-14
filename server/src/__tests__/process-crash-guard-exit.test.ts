@@ -48,15 +48,59 @@ const tsx = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
  * reports backpressure instead of guessing.
  */
 const PIPE_PRESSURE_BYTES = 200_000;
-/** Child startup is outside the measured crash deadline and can lag on loaded CI runners. */
-const FIXTURE_STARTUP_TIMEOUT_MS = 10_000;
+/**
+ * How long the parent waits for PREFILL_RUN — the only consumer — to announce stderr
+ * backpressure before the startup watchdog SIGKILLs the child.
+ *
+ * PLUMBING, and that is what makes its size cheap: the watchdog is cleared by the first
+ * BACKPRESSURE chunk, so on the passing path this budget never elapses and adds nothing to
+ * the shard's wall clock. It is paid only on a run that is already failing. Contrast
+ * STALL_DIAGNOSTIC_TIMEOUT_MS below, whose two runs are built never to announce, so its
+ * value is spent in full on every green run of this file. The two are in opposite
+ * positions and must not be reasoned about together.
+ *
+ * What it covers is the child reaching backpressure: `node` boot, the tsx load of the
+ * fixture's dependency closure, then the fixture filling stderr. The tsx load is WARM in a
+ * whole-file run — the `it.each` cases above spawn this same fixture first, so the
+ * transform cache is populated before this budget is ever used. Cold tsx is the
+ * `-t`-filtered case the file header tells you not to run, and it is NOT what this budget
+ * is sized against.
+ *
+ * Derived from its own measured ceiling rather than left a bare literal. It is deliberately
+ * NOT spelled in terms of STALL_DIAGNOSTIC_TIMEOUT_MS even though both cover `node` boot:
+ * that constant is declared ~250 lines below this one, so referencing it here is a temporal
+ * dead zone error at module evaluation. Measured warm, 4-CPU cgroup, n=6/arm, spawn ->
+ * closure loaded (PEN-3381):
+ *
+ *     spinners   warm start -> closure loaded (min / med / max)
+ *            0       311ms /   331ms /   334ms
+ *           24      2002ms /  2200ms /  3001ms
+ *           48      8520ms / 10889ms / 14817ms   <- over the old 10_000
+ *          128     13996ms / 18690ms / 23191ms   <- over it in 6 of 6
+ *          384     not completed; calibration is the 128 arm, see below
+ *
+ * NOT in that table: the fixture's own stderr fill. It is therefore a FLOOR on what this
+ * budget must cover, which is why the allowance is generous rather than tight — generosity
+ * is free here.
+ */
+/** Worst warm start measured at the 128-spinner arm above, rounded. */
+const FIXTURE_WARM_START_CEILING_MS = 24_000;
+/**
+ * Multiple of that ceiling a contended runner is allowed. Bounded at the top by vitest's
+ * `testTimeout` (60_000): FIXTURE_RUN_WATCHDOG_MS derives from this constant and both are
+ * backstops whose entire value is producing an informative error, so if their sum passes
+ * that timeout vitest kills the test first and the message never appears. At 1.5x the
+ * watchdog lands 1.46x clear of it.
+ */
+const FIXTURE_STARTUP_HEADROOM = 1.5;
+const FIXTURE_STARTUP_TIMEOUT_MS = FIXTURE_WARM_START_CEILING_MS * FIXTURE_STARTUP_HEADROOM;
 /**
  * Harness backstop for `runFixture`, never the thing under test: those tests assert
  * exit code and stderr content and never elapsed time, so unlike the stalled-exit
  * watchdog below this one competes with no assertion. It is derived rather than
  * literal because at a bare 5_000 it contradicted the constant directly above — this
  * budget spans spawn through child exit, a superset of the startup that
- * FIXTURE_STARTUP_TIMEOUT_MS already says can take 10s on a loaded runner, and it
+ * FIXTURE_STARTUP_TIMEOUT_MS above already budgets for on a loaded runner, and it
  * additionally has to cover the crash and draining PIPE_PRESSURE_BYTES through the
  * stderr socket. Deriving it keeps the two watchdogs in this file from disagreeing
  * again about how slow a loaded runner is allowed to be.
@@ -72,12 +116,19 @@ const FIXTURE_RUN_WATCHDOG_MS = FIXTURE_STARTUP_TIMEOUT_MS + 5_000;
  * (BLO-55723) against the guard's own crash-to-exit time inside the child, on a
  * 4-CPU cgroup, 20 samples per saturated arm:
  *
- *     load     spinners   guard crash->exit (med / max)   stretch (max)
- *     idle            0            207ms /  208ms              1.00x
- *     ~13           24             224ms /  296ms              1.43x
- *     ~13           48             300ms /  499ms              2.41x
- *     ~12          128             402ms /  595ms              2.87x
- *     ~98          384             490ms /  703ms              3.40x
+ *     spinners   guard crash->exit (med / max)   stretch (max)
+ *            0            207ms /  208ms              1.00x
+ *           24            224ms /  296ms              1.43x
+ *           48            300ms /  499ms              2.41x
+ *          128            402ms /  595ms              2.87x
+ *          384            490ms /  703ms              3.40x
+ *
+ * (This table carried a `load` column — idle / ~13 / ~13 / ~12 / ~98 — with no unit and
+ * no sampling point, and it did not track the spinner count: equal at 24 and 48, lower
+ * at 128 than at 48. Dropped rather than relabelled. Under a CPU-capped cgroup the load
+ * average is a nonlinear proxy for the spinner count, because throttled spinners are not
+ * runnable — re-measured 2026-11-14, a 24-spinner arm read 8.66-10.55 across one arm's
+ * own samples. The spinner count is the controlled variable; read that.)
  *
  * 6x clears the worst of those by 1.71x, at a contention level well past the one
  * that produced the 2206ms report this bound was re-derived for (PEN-3381). It is
@@ -165,13 +216,22 @@ const STALLED_EXIT_DEADLINE_MS = MAX_WRITE_WAIT_MS * 2 * STALLED_EXIT_STRETCH_AL
  * which 9_000 clears by 2.5x. Tying it to the deadline would have shrunk it to 6_000
  * as a side effect of narrowing a bound on a different quantity.
  *
+ * It is a LITERAL for the same reason. The argument above is an absolute one about a
+ * kernel teardown, which has nothing to do with the write budget, yet this was spelled
+ * `MAX_WRITE_WAIT_MS * 2 * 45` and so silently rescaled with it: at a 10x write budget
+ * it became 90_000 while the teardown it must clear had not moved. The pin below names
+ * only STALLED_EXIT_DEADLINE_MS and STALLED_EXIT_STRETCH_ALLOWANCE as the pair to move
+ * together, so an editor following its remedy would have left this one rescaled and
+ * unexamined. 9_000 === MAX_WRITE_WAIT_MS * 2 * 45 at today's budget, so this is a
+ * no-op now and a divergence the moment that budget changes, which is the point.
+ *
  * It must stay well clear of the deadline in the other direction too: a
  * slow-but-working exit has to fail the assertion with a measured elapsed time, not get
  * SIGKILLed into "did not exit" — a claim this harness cannot support, because it
  * killed the child rather than watching it fail to die. The startup watchdog next door
- * needed 5x headroom for loaded runners; at 2s this one had 500ms.
+ * carries its headroom as a named multiple for the same reason; at 2s this one had 500ms.
  */
-const STALLED_EXIT_WATCHDOG_MS = MAX_WRITE_WAIT_MS * 2 * 45;
+const STALLED_EXIT_WATCHDOG_MS = 9_000;
 /**
  * How long `readRemainingStderr` waits for the dead child's stderr to reach `end`
  * before reporting whatever it has so far.
@@ -301,12 +361,51 @@ const STARTUP_STALL_SENTINEL = "STARTUP_STALL_SENTINEL";
  * the fixture under `tsx`, because this budget has to clear process startup and `node`
  * boots in tens of milliseconds where a cold `tsx` compile is measured in seconds.
  *
- * 2_000ms is therefore ~50x the time the sentinel needs to reach us, and it bounds
- * diagnostic assertions rather than the thing under test: a runner slow enough to miss it
- * reports `its stdout said: <nothing>` and fails loudly with the full context, which is
- * precisely the property those tests pin. They cannot fail silently or pass wrongly.
+ * THE ONE BUDGET IN THIS FILE WHOSE VALUE IS SPENT IN FULL ON THE PASSING PATH, and it is
+ * spent twice. Both runs below are built never to announce BACKPRESSURE, so the watchdog
+ * firing IS the behaviour under test: "carries the captured stdout into the
+ * startup-watchdog failure" waits one budget for it, and "ignores backpressure that
+ * arrives after the startup watchdog fired" blocks the event loop for this budget + 200ms.
+ * The green-path cost of this file is therefore `2 x this constant + 200ms`. Every other
+ * budget here is cleared when the child reports in, so widening those is free; widening
+ * this one is not, and that asymmetry is why it is calibrated the way it is below.
+ *
+ * It also must not be too SMALL, which is what it was. Past the budget the child is
+ * SIGKILLed before it runs its first statement, so the sentinel is never written, the
+ * failure reads `its stdout said: <nothing>`, and BOTH assertions below fail on a runner
+ * that is merely slow — the PEN-3381 defect class, inside the file that owns it. The
+ * previous value of 2_000 came with the claim "~50x the time the sentinel needs to reach
+ * us", which is a ratio against an IDLE boot. Measured, 4-CPU cgroup, n=6/arm, spawn ->
+ * first byte of the sentinel at the parent, which is exactly what the watchdog races:
+ *
+ *     spinners   node boot -> sentinel (min / med / max)
+ *            0        60ms /    75ms /    84ms
+ *           24       311ms /   480ms /   500ms
+ *           48      1006ms /  1604ms /  2089ms   <- over the old 2_000 in 1 of 6
+ *          128      2814ms /  4090ms /  6015ms   <- over it in 6 of 6
+ *          384      8096ms / 10205ms / 11295ms
+ *
+ * Calibrated to the 128 arm, not 384, and the residual is named rather than hidden. The
+ * cost is measured, not estimated: this file runs in 9.5s at the old 2_000 and 23.3s at
+ * this value (9 tests, same machine), i.e. the +14s the arithmetic above predicts.
+ * Calibrating to the 384 arm instead would make it ~34s.
+ * The structural fix — arming the startup watchdog on the child's first sign of life, so
+ * neither budget has to cover process boot at all — is the right answer to that and is
+ * deliberately not in this change.
+ *
+ * Honest bound on the numbers above: those are STRESS arms. The real-CI contention
+ * multipliers measured for this file are 6.6x-9.4x, around the 24-spinner arm, where even
+ * 2_000 held 4x margin. No CI failure has been attributed to these two tests; this is
+ * preventive, and it removes a headroom claim that was false.
+ *
+ * Do not shrink it back toward the idle number to reclaim the tax without re-measuring
+ * this table, and move the two tests' cost deliberately when you do.
  */
-const STALL_DIAGNOSTIC_TIMEOUT_MS = 2_000;
+/** Worst `node` boot -> sentinel measured at the 128-spinner arm above, rounded. */
+const DIAGNOSTIC_BOOT_CEILING_MS = 6_000;
+/** Multiple of that ceiling a contended runner is allowed. */
+const DIAGNOSTIC_BOOT_HEADROOM = 1.5;
+const STALL_DIAGNOSTIC_TIMEOUT_MS = DIAGNOSTIC_BOOT_CEILING_MS * DIAGNOSTIC_BOOT_HEADROOM;
 /**
  * Drives the startup-watchdog branch: announces itself on stdout, then stays alive
  * without ever writing BACKPRESSURE, so the watchdog is the only thing that can end
@@ -548,9 +647,9 @@ describe("process crash guard — real process exit", () => {
   /**
    * Pins the input STALLED_EXIT_DEADLINE_MS is calibrated against, not the guard.
    *
-   * Both that deadline and STALLED_EXIT_WATCHDOG_MS are multiples of MAX_WRITE_WAIT_MS,
-   * so without this assertion a change to the write budget widens every bound in the
-   * file and the slowdown it causes goes unnoticed — measured at 1_000 the guard takes
+   * That deadline is a multiple of MAX_WRITE_WAIT_MS, so without this assertion a change
+   * to the write budget widens it and the slowdown it causes goes unnoticed —
+   * measured at 1_000 the guard takes
    * 2006ms against a deadline that has itself become 12_000ms, so every other test in
    * the file still passes. Failing here instead names the constant that moved; the
    * assertion message carries the remedy.
