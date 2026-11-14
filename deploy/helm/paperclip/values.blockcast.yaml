@@ -347,8 +347,55 @@ env:
     # Must be live before or in the same rollout as any adapter build carrying
     # that resolver, or every claude_k8s agent without a per-agent
     # serviceAccountName hard-fails at Job build instead of launching.
+    #
+    # PEN-6307 STAGE A, 2026-11-14: this value was `paperclip` -- the control
+    # plane's OWN ServiceAccount, which holds Role/paperclip-k8s-adapters
+    # (namespace-wide `secrets` get/list over every agent's per-run `ac-...-env`
+    # Secret across BOTH companies, cluster-wide `pods/log`, and `jobs: create`,
+    # which is an escalation hop to ClusterRole/admin via the
+    # paperclip-ci-deploy SA in the same namespace). Every agent Job pod with no
+    # per-scope serviceAccountName inherited all of it.
+    #
+    # It now names an identity that is the subject of NO RoleBinding and NO
+    # ClusterRoleBinding, created in
+    # Blockcast/onprem-k8s:paperclip/paperclip-agent-unbound-automount-sa.yaml.
+    # Read that file's header before changing this line; it carries the full
+    # argument and the binding census behind "zero bindings".
+    #
+    # WHY THE `-automount` IDENTITY AND NOT `paperclip-agent-unbound`. The
+    # sibling SA drops the RBAC *and* the token in one flip. Those two failures
+    # are not alike: losing the bindings is a `403 Forbidden: User
+    # "system:serviceaccount:paperclip:<name>" cannot <verb> <resource>`, which
+    # names the identity, the verb and the resource; losing the token is a bare
+    # `401` or a client library throwing at CONFIG LOAD, the "not running in a
+    # cluster" branch that calling code routinely degrades past in silence.
+    # Stage A takes the RBAC -- the whole security win, since PEN-6307's
+    # done-when is scored on BINDINGS -- and leaves the token, so a dependent
+    # that quietly reaches the Kubernetes API breaks LOUDLY and ATTRIBUTABLY and
+    # the revert is this one line. Stage B moves on to
+    # `paperclip-agent-unbound`, dropping the token too; it is defence in depth,
+    # it is NOT time-bound, and it is gated on PEN-6307's token-reachability
+    # grep rather than on any clock or any soak.
+    #
+    # ORDERING CONSTRAINT, and it is the only fleet-wide blast radius here:
+    # no change to this value may merge until the ServiceAccount THAT VALUE
+    # NAMES is LIVE in ns `paperclip` -- established by READING THAT OBJECT, not
+    # by any PR being merged. Argo runs `prune: false` with auto-sync, so
+    # *merged* and *synced* are different instants; PEN-6307 measured the gap at
+    # 5m22s on the sibling identity. A default naming a ServiceAccount that does
+    # not exist leaves EVERY agent Job pod in the deployment Pending with
+    # `serviceaccount "<name>" not found`, across both companies.
+    #
+    # And it binds in the other direction too: if
+    # PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES is ever set on either control-
+    # plane tier, `paperclip-agent-unbound-automount` must be in it. That key is
+    # UNSET on both tiers today (measured 2026-11-14 on the serving worker
+    # StatefulSet and api Deployment, with PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
+    # present in the same enumerated env list as the positive control), and
+    # unset means NOT ENFORCED, deliberately -- which is exactly why nobody will
+    # re-check it later.
     - name: PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME
-      value: paperclip
+      value: paperclip-agent-unbound-automount
     # Isolation-workspace reaper (BLO-31222; switched on under BLO-36735).
     #
     # Shared list, NOT worker.extraEnv. The reaper only ever runs on the worker,
