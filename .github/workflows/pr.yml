@@ -421,11 +421,19 @@ jobs:
         # stops counting, so these tests re-derive the openings from the
         # source rather than trusting a hand-copied fixture.
         #
-        # Child non-zero exits are pinned as NOT observable: sendExit() frames
-        # the exit code to the socket and nothing writes it to stderr, so a
-        # query for it can only ever return 0 -- byte-identical to "no child
-        # ever failed". The test fails if anyone marks that category
-        # observable without the broker first gaining the log line.
+        # Every section 5.3 category is observable today: since PEN-5185
+        # sendExit and refuse log through one ctx.log chokepoint, so child
+        # non-zero exits are a real count rather than a dark class. The
+        # NOT OBSERVABLE rendering is retained deliberately -- the next class
+        # the broker cannot emit must be able to say so rather than report a
+        # false 0, which is byte-identical to "no child ever failed".
+        #
+        # The hard pin runs the other way: no query may ever target the
+        # child's own stderr. That is git/gh output and can carry a push URL
+        # with an embedded token, and the broker's stderr reaches Loki, which
+        # outlives the Job. The test fails if such a query appears, or if
+        # child.stderr is ever written to the container log rather than
+        # relayed to the socket.
         if: ${{ !cancelled() }}
         run: node --test ./scripts/github-publish-broker-soak-queries.test.mjs
         timeout-minutes: 1
