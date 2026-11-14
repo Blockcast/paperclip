@@ -79,6 +79,9 @@
 #                         older than PENDING_DEPLOY_ALERT_HOURS, a severity=critical
 #                         ProductionDeployApprovalStuck alert to Alertmanager plus a
 #                         RED run, so `conclusion` itself carries the signal.
+#   deferred-min-interval -> ::notice:: + step summary, green. The last dispatch was
+#                         refused by the min-interval guard and 6h have not passed since
+#                         the refusal; a later hourly slot retries (BLO-57061).
 #
 # GUARD (1) NOW HAS A BOUNDED EXIT (PEN-3315)
 # -------------------------------------------
@@ -368,6 +371,49 @@ jobs:
             DEAD_FATE="$(jq -r '.fate // "unknown"' "$DEAD_DISPATCH_JSON_PATH" 2>/dev/null || echo unknown)"
           fi
 
+          # (1d) BLO-57061: the last dispatch was REFUSED by docker.yml's BLO-49140
+          # minimum-interval guard (worker rolled < 6h ago), so it shipped nothing.
+          # Only the daily slot dispatches, so without this one same-image worker
+          # restart before 07:23Z cost a whole day. A sampling slot re-dispatches
+          # once paperclip-0 is past the interval; docker.yml's guard still has the
+          # final say on the retried run. Guard (1) above still holds:
+          # we only get here when nothing is pending, so this cannot stack.
+          RETRY_MIN_INTERVAL=false
+          if [ "$DEAD_FATE" = "refused-min-interval" ] && [ "$IS_DISPATCH_SLOT" != "true" ]; then
+            REFUSED_ID="$(jq -r '.run.databaseId // "unknown"' "$DEAD_DISPATCH_JSON_PATH")"
+            # Judged from GitHub data, NOT kubectl: this job has no kubeconfig and
+            # the runner SA has no grant in the paperclip namespace, so a pod read
+            # would fail and defer forever (Staff review of #3773). The refusal at
+            # REFUSED_AT proves paperclip-0 was < 6h old then, so by REFUSED_AT+6h
+            # it is past the interval. shortcut: waits the full 6h rather than the
+            # logged "Retry in Nm"; read the step log if same-day slack ever bites.
+            # If the worker restarted AGAIN, docker.yml's unchanged guard refuses
+            # once more and that newer refusal restarts this clock. Empty or
+            # unparseable REFUSED_AT defers (date fails -> else branch).
+            REFUSED_AT="$(jq -r '.run.refusedAt // ""' "$DEAD_DISPATCH_JSON_PATH")"
+            if [ -n "$REFUSED_AT" ] \
+               && REFUSED_EPOCH="$(date -u -d "$REFUSED_AT" +%s 2>/dev/null)" \
+               && [ "$(( ${NOW_EPOCH:-$(date -u +%s)} - REFUSED_EPOCH ))" -ge "${MIN_INTERVAL_SECONDS:-21600}" ]; then
+              RETRY_MIN_INTERVAL=true
+              echo "::notice::Retrying the dispatch: run $REFUSED_ID was refused by the BLO-49140 minimum-interval guard and paperclip-0 is now past the interval (BLO-57061)."
+              {
+                echo "### Retrying a dispatch refused by the minimum-interval guard"
+                echo
+                echo "\`docker.yml\` run \`$REFUSED_ID\` was refused at \`Minimum interval since last roll (BLO-49140)\`."
+                echo "paperclip-0 is now past the interval, so this slot (run \`$GITHUB_RUN_ID\`) re-dispatches (BLO-57061)."
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::notice::Last dispatch (run $REFUSED_ID) was refused by the minimum-interval guard; not yet 6h since the refusal (or the refusal time is unreadable). A later hourly slot retries."
+              {
+                echo "### Deferred — minimum-interval refusal not yet retryable"
+                echo
+                echo "\`docker.yml\` run \`$REFUSED_ID\` was refused by the BLO-49140 guard. A later hourly slot re-dispatches once paperclip-0 is past the interval."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "outcome=deferred-min-interval" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           # (1b) Sampling slots stop here. They exist ONLY to age a pending approval,
           # which is why this sits BELOW guard (1) rather than above it: guard (1) is
           # what emits `skipped-pending`, and `skipped-pending` is what arms the
@@ -375,7 +421,7 @@ jobs:
           # defect — a 6h threshold evaluated once per 24h — while looking like a
           # tidy-up. .github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
           # pins the order for that reason.
-          if [ "$IS_DISPATCH_SLOT" != "true" ]; then
+          if [ "$IS_DISPATCH_SLOT" != "true" ] && [ "$RETRY_MIN_INTERVAL" != "true" ]; then
             # The dead-lane branch comes FIRST, because `checked-no-pending` is
             # exactly the false green it replaces. A sampling slot cannot
             # dispatch a replacement (that is guard (1b)'s whole purpose, and

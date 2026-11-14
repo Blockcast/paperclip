@@ -31,6 +31,7 @@ import {
   detectDeadDispatch,
   findLastCompletedDispatch,
   isDeadLane,
+  MIN_INTERVAL_STEP_NAME,
 } from '../detect-dead-dispatch.mjs';
 import { laneRefilled } from '../deploy-stall-record.mjs';
 
@@ -605,4 +606,57 @@ test('detectDeadDispatch: a switched-off lane plus a positive gap is reportable 
   // The strict refill signal must still say the lane was NOT refilled, so the
   // durable stall record cannot be closed by a dispatch that shipped nothing.
   assert.equal(result.run.deployExecuted, false);
+});
+
+// ---------------------------------------------------------------------------
+// BLO-57061. Replay of docker.yml run 43571300881 (2026-11-14): build pushed
+// ac5534f2, then `deploy` failed at the BLO-49140 minimum-interval step because
+// paperclip-0 had been restarted 112m earlier. It read as `survived`, so no slot
+// retried and a day of deploys was lost.
+// ---------------------------------------------------------------------------
+const refusedDeploy = (failingStep) => [
+  { name: 'build-and-push', conclusion: 'success' },
+  { name: DEPLOY_GATE_JOB_NAME, conclusion: 'success' },
+  {
+    name: DEPLOY_JOB_NAME,
+    conclusion: 'failure',
+    steps: [
+      { name: 'Verify release tooling revision', conclusion: 'success' },
+      { name: failingStep, conclusion: 'failure', completed_at: '2026-11-14T07:41:12Z' },
+    ],
+  },
+];
+
+test('replay 2026-11-14 run 43571300881: a min-interval refusal is retryable, not survived', () => {
+  const run = { status: 'completed', conclusion: 'failure', head_branch: 'master' };
+  assert.equal(
+    classifyDispatchRun(run, refusedDeploy(MIN_INTERVAL_STEP_NAME)),
+    DISPATCH_FATE.REFUSED_MIN_INTERVAL,
+  );
+  assert.equal(MIN_INTERVAL_STEP_NAME, 'Minimum interval since last roll (BLO-49140)');
+});
+
+test('a deploy job failing at any OTHER step is still survived — that is a real deploy attempt', () => {
+  const run = { status: 'completed', conclusion: 'failure', head_branch: 'master' };
+  assert.equal(
+    classifyDispatchRun(run, refusedDeploy('Render, stamp, and validate deploy plan')),
+    DISPATCH_FATE.SURVIVED,
+  );
+});
+
+test('a refused run is not a refill for the close gate, and is not a dead lane', async () => {
+  const client = stubClient({
+    '/actions/workflows/': {
+      workflow_runs: [
+        { id: 43571300881, status: 'completed', conclusion: 'failure', head_branch: 'master',
+          created_at: '2026-11-14T07:29:07Z' },
+      ],
+    },
+    '/actions/runs/43571300881/jobs': { jobs: refusedDeploy(MIN_INTERVAL_STEP_NAME) },
+  });
+  const last = await findLastCompletedDispatch({ client });
+  assert.equal(last.fate, DISPATCH_FATE.REFUSED_MIN_INTERVAL);
+  assert.equal(last.run.deployExecuted, false);
+  assert.equal(last.run.refusedAt, '2026-11-14T07:41:12Z', 'the retry clock starts at the refusal');
+  assert.equal(LANE_FAILED_TO_DELIVER_FATES.has(DISPATCH_FATE.REFUSED_MIN_INTERVAL), false);
 });

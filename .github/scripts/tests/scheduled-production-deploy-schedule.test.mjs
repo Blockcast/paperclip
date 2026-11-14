@@ -1054,3 +1054,74 @@ test('the fate reaches the backstop, so the red run names the right lever too', 
   assert.match(backstop[0], /PAPERCLIP_CI_DEPLOY/, 'the error must name the lever for a gated lane');
   assert.match(backstop[0], /exit 1/, 'and must still make the conclusion carry it');
 });
+
+// ---------------------------------------------------------------------------
+// BLO-57061. A dispatch refused by docker.yml's BLO-49140 minimum-interval guard
+// shipped nothing, and only the daily slot dispatched, so one worker restart
+// before 07:23Z cost a day. A sampling slot now re-dispatches once paperclip-0
+// is past the interval. Run the retry block itself in bash. Retryability comes
+// from the refused step's completed_at, never kubectl: this job has no
+// kubeconfig (Staff review of #3773), so a PATH kubectl that always fails proves
+// the block never reaches for the cluster.
+// ---------------------------------------------------------------------------
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, chmodSync, readFileSync as readText } from 'node:fs';
+import os from 'node:os';
+
+const NOW = 1_763_100_000; // fixed clock via NOW_EPOCH
+
+function runRetryBlock({ fate, isDispatchSlot, refusedAgoSeconds, refusedAt }) {
+  const start = code.indexOf('RETRY_MIN_INTERVAL=false');
+  const end = code.indexOf('if [ "$IS_DISPATCH_SLOT" != "true" ] && [ "$RETRY_MIN_INTERVAL" != "true" ]');
+  assert.ok(start !== -1 && end > start, 'the retry block must sit before the sampling-slot branch');
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'blo57061-'));
+  writeFileSync(path.join(dir, 'kubectl'), '#!/bin/sh\necho KUBECTL_CALLED >&2\nexit 1\n');
+  chmodSync(path.join(dir, 'kubectl'), 0o755);
+  const at = refusedAt ?? new Date((NOW - refusedAgoSeconds) * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+  const json = path.join(dir, 'dead.json');
+  writeFileSync(json, JSON.stringify({ fate, run: { databaseId: 43571300881, refusedAt: at } }));
+  const out = path.join(dir, 'out');
+  writeFileSync(out, '');
+  const script = `set -euo pipefail\n${code.slice(start, end)}\necho "RETRY=$RETRY_MIN_INTERVAL"\n`;
+  const stdout = execFileSync('bash', ['-c', script], {
+    cwd: path.resolve(path.dirname(workflowPath), '../..'),
+    env: {
+      ...process.env,
+      PATH: `${dir}:${process.env.PATH}`,
+      NOW_EPOCH: String(NOW),
+      DEAD_FATE: fate,
+      IS_DISPATCH_SLOT: isDispatchSlot,
+      DEAD_DISPATCH_JSON_PATH: json,
+      GITHUB_OUTPUT: out,
+      GITHUB_STEP_SUMMARY: path.join(dir, 'summary'),
+      GITHUB_RUN_ID: '1',
+    },
+    encoding: 'utf8',
+  });
+  return { stdout, outputs: readText(out, 'utf8') };
+}
+
+test('BLO-57061: a sampling slot re-dispatches once 6h have passed since the refusal, without kubectl', () => {
+  const r = runRetryBlock({ fate: 'refused-min-interval', isDispatchSlot: 'false', refusedAgoSeconds: 6 * 3600 + 60 });
+  assert.match(r.stdout, /RETRY=true/);
+  assert.match(r.stdout, /Retrying the dispatch: run 43571300881/);
+  assert.doesNotMatch(r.outputs, /outcome=/);
+  assert.doesNotMatch(code.slice(code.indexOf('RETRY_MIN_INTERVAL=false')), /kubectl .*get pod paperclip-0/,
+    'the dispatch job has no kubeconfig; the retry must not read the cluster');
+});
+
+test('BLO-57061: inside 6h of the refusal, or with a missing/unparseable refusedAt, the slot defers', () => {
+  for (const args of [{ refusedAgoSeconds: 2 * 3600 }, { refusedAt: '' }, { refusedAt: 'garbage' }]) {
+    const r = runRetryBlock({ fate: 'refused-min-interval', isDispatchSlot: 'false', ...args });
+    assert.doesNotMatch(r.stdout, /RETRY=/, 'the block must exit before the dispatch path');
+    assert.match(r.outputs, /outcome=deferred-min-interval/);
+  }
+});
+
+test('BLO-57061: any other fate, or the daily slot, leaves the existing flow untouched', () => {
+  for (const [fate, slot] of [['survived', 'false'], ['refused-min-interval', 'true']]) {
+    const r = runRetryBlock({ fate, isDispatchSlot: slot, refusedAgoSeconds: 7 * 3600 });
+    assert.match(r.stdout, /RETRY=false/);
+    assert.equal(r.outputs, '');
+  }
+});
