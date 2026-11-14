@@ -14707,6 +14707,50 @@ export function buildPaperclipTaskMarkdown(input: {
     // what stops that: it converts "maybe I mistyped the repo" into "this artifact really
     // has no row here", which is the question the next line answers.
     "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every row BOUND TO THIS ARTIFACT THAT YOU MAY READ -- owning rows and mentioning ones alike -- each carrying a `relation`. **`ownerListComplete: true` is the only thing that tells you the list is whole. `ownerListComplete: false` means it is NOT verified whole, and you must not act as though you have seen every owner.** `false` spans two states, and it deliberately does not distinguish them, because your next move is the same either way. Either the answer is SHORT -- a row withheld from your seat (`withheldForAuthorizationCount`), or an owner the artifact declares that the lookup could not return (`unresolvedOwningIdentifiers` -- another company's identifier space, a deleted or mistyped one). Or completeness is UNVERIFIABLE: no authoritative row in the answer records what the artifact declared (`owningIdentifiersUnrecorded`), so there is nothing to check the rows you got against. The second says owners MAY be missing, not that they are. Do NOT read `withheldForAuthorizationCount: 0` as complete on its own; it reports only the first cause, and those two fields can describe the same owner, so do not add them up. An empty `owners` list is NOT proof the artifact is unowned. \u26d4 The `workProduct` it returns is OWNERSHIP evidence, not REVIEW evidence: `reviewState` is Paperclip board-review state, never written by the GitHub webhook, so it reads `none` on every GitHub PR for life -- including one a human has already APPROVED. Do NOT read it, or the webhook-derived `status`, to decide whether a head has been reviewed; that under-reports review in the unsafe direction and was the premise of a near-miss grant to force-push over a live human approval (PEN-5850). Ask GitHub: `gh pr view <n> --repo <owner>/<repo> --json reviewDecision` and `gh api repos/<owner>/<repo>/commits/<sha>/status`. Name artifacts as `owner/repo#123` or a full URL, never a bare `#123`: the same number is a different pull request in every repo, and the lookup answers a wrong-repo key confidently rather than emptily. CASING IN `owner/repo` DOES NOT MATTER -- the lookup folds it as GitHub does, and says so in `externalIdMatch: \"case_insensitive\"`; the number is still matched exactly. So an empty `owners` here is not a casing miss, and re-running the lookup under a different casing tells you nothing.",
+    // PEN-5778: every reason the string above gives for an empty answer is a reason
+    // INSIDE this company's data -- withheld, unresolved, unrecorded. There is one
+    // more that is none of those: the identifier was simply wrong, and the lookup
+    // cannot tell you so. No frequency is claimed for it -- the five probes below
+    // establish the SHAPE of that failure and measure nothing about how often it
+    // happens relative to a withheld row.
+    //
+    // Measured 2026-11-06 12:0xZ, five probes against this endpoint. The correct
+    // `Blockcast/penstock-llm-proxy-core#3110` returned 5 owners and a populated
+    // `workProduct`. `Blockcast/magma#3110` (real repo, no such PR),
+    // `Blockcast/this-repo-does-not-exist-zzz#1` and
+    // `Blockcast/penstock-llm-proxy-core#999999` ALL returned 200 `owners: []` --
+    // byte-identical to each other and to a genuinely untracked artifact. Only
+    // `qqqq-not-even-a-repo-shape` 400d.
+    //
+    // The 400 is what makes this sharp rather than merely annoying: it is evidence of an
+    // input validator, so it quietly argues that a 200 means the identifier was
+    // UNDERSTOOD. `listOwnersByExternalId` matches `(companyId, provider, type,
+    // externalId)` exactly, so a 200 means it PARSED and nothing more, and every error
+    // class that actually occurs -- wrong repo, wrong number, an issue number where a PR
+    // number was meant -- is shape-valid and never announced.
+    //
+    // Those five probes sampled ONE stratum: every wrong key among them named nothing
+    // tracked, so every one landed in the empty bucket. That is why the first draft of
+    // the string below generalised to "each return 200 with an empty `owners`". The
+    // stratum they missed is the one master's paragraph above is about, and exact
+    // matching is why it differs: a wrong key naming a DIFFERENT TRACKED PR returns
+    // that PR's rows, fully populated. Measured 2026-11-11, the missing stratum --
+    // `Blockcast/penstock-llm-proxy-core#3110` returns 5 owners (PEN-5455 owning) and
+    // `Blockcast/paperclip#3110` returns 4 (PEN-4932 owning); both tracked, disjoint
+    // sets, each `ownerListComplete: true` with `withheldForAuthorizationCount: 0`.
+    // Nothing in the response distinguishes it, short of checking the echoed repo/number
+    // against the PR you meant. Of 10
+    // PR numbers probed across those two repos in a band where both are active, 7 are
+    // tracked in both -- that band was chosen for overlap and is not a fleet-wide
+    // collision rate, but the collision is ordinary rather than contrived.
+    //
+    // Stated HERE, on the ownership question, because this is the dangerous half. A
+    // reader asking "has #NNNN merged" needs a populated `workProduct` to answer at all,
+    // so a false-empty presents to it as "I got nothing". Here the empty list is a
+    // LEGITIMATE answer to the question being asked, so "no owners => no constraint to
+    // honour => I may proceed" is reachable from a typo -- which is precisely the failure
+    // this rule exists to prevent.
+    "That is not the only reason an empty answer proves nothing, and not only authorization is in play. The lookup validates SHAPE only (`owner/repo#123` or a PR URL, else 400) and then matches the normalised `externalId` exactly, so a wrong repo, a wrong PR number, or an issue number passed where a PR number was meant each return 200 -- with an EMPTY `owners` when the key names nothing tracked, indistinguishable from a genuinely untracked artifact, or with a confident, fully populated list of some OTHER pull request's owners when it names one that is. Those two failure shapes look nothing alike and neither announces itself. A 200 means the identifier PARSED, never that it was understood, and the response echoes your `externalId` back normalised, which reads like confirmation and is not. Treat an answer as usable only when some owner carries a populated `workProduct` whose `metadata.repoFullName` and `metadata.prNumber` are the pull request you meant. On an empty list, re-check the identifier before concluding anything in EITHER direction.",
     // PEN-5836: `provenance: "webhook"` was documented here as "the authoritative
     // binding", and it is not one. The webhook writes a work product for every issue a
     // PR references anywhere -- deliberately, see `buildPullRequestWorkProductFields` --
@@ -14875,6 +14919,66 @@ export function buildPaperclipTaskMarkdown(input: {
     "Target, when the artifact has no external id. The lookup above is defined for artifacts that have one. For a control-plane artifact -- a row's wake reachability, a monitor, an approval card -- `by-external-id` has no answer, and 'not applicable' is not the conclusion. Name the target by asking which run could act against this constraint, and which row that run would have loaded; record it there. Write it as state and consequence ('these four statuses of PEN-5612 strand PEN-5524'), not as a prohibition: nobody needs permission to land their own work, they need to know what it costs.",
     "Placement, when the right target refuses you. A 403 on the owning row does not license writing the constraint wherever you happen to have access. Fall back in this order: (1) the artifact itself, if it carries text a later run will load -- a PR body, a card payload value; (2) your own row, PLUS a mention of the owning row's assignee naming the exact text and where it goes. A constraint recorded only on the author's own row is the depth-1 failure this directive exists to prevent: say plainly that it is unplaced, and treat it as unplaced until someone holding the grant places it.",
     "Correction. A description has no next-comment-in-thread to carry a correction -- it must be EDITED, by someone holding write access to that row, who per the clause above may not be the person who finds the error. When you place a constraint at depth 0, name who to tell if it is wrong.",
+  );
+  // PEN-5778: wake steps that name a live GitHub read, and what to do when that read 401s.
+  //
+  // Measured by the CEO 2026-11-06 11:28Z over `in_review` rows, full `parkedReason` read
+  // (the field is not clipped the way the list projection's `description` is): 97 rows,
+  // 47 carrying a park note, 35 referencing GitHub, and 21 naming a GitHub read or a `gh`
+  // write as an EXPLICIT wake step. 9 of those woke that same day, 4 at 12:00Z, into a
+  // fleet-wide credential outage (PEN-5726: the rotator minted a valid token then crashed
+  // before publishing it, so every seat's credential was REJECTED from 05:21:31Z). Each of
+  // the 21 first steps was unexecutable, and none of the notes named a substitute.
+  //
+  // UNGATED and stated HERE rather than fixed in the 21 notes, which is the whole point of
+  // the row. Rewriting parked notes is churn against rows that are correctly parked, several
+  // under explicit head freezes, and it would need redoing for every note written after
+  // today. This surface is loaded by every wake class -- including the scoped wakes that
+  // read a park note and nothing else -- so one write covers notes not yet written and costs
+  // nothing when the credential is healthy.
+  //
+  // The division of labour in the last line is the load-bearing part, and it is measured
+  // rather than asserted. PEN-4656's note survived the outage because it named the FACT to
+  // read, not the command to run -- but it was only executable because the INSTRUMENT came
+  // from somewhere else: the `Recording a constraint` block above, which names this same
+  // endpoint and is loaded by every wake. Instrument-agnostic phrasing supplies the fact; an
+  // always-loaded surface supplies the means. Neither half is sufficient alone, which is why
+  // this block states both rather than treating fact-form phrasing as a cheaper substitute
+  // for it.
+  //
+  // The failure this is really about is a run INVENTING an instrument under time pressure,
+  // not a run being briefly blind -- hence the explicit re-park branch. Keep it.
+  lines.push(
+    "",
+    "Wake steps that name a live GitHub read:",
+    "A wake step of the form \"ON WAKE read `mergedAt` on #NNNN FIRST\" names a LIVE GitHub read, and the fleet credential is NOT guaranteed at wake time -- it has been globally REJECTED for hours at a stretch, so the step 401s and the note that gave it offers no substitute. `gh paperclip-auth-check` tells a dead credential apart from a dead step; do that before concluding anything about the artifact.",
+    "The credential-free substitute is the lookup named above -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>`. It is webhook-fed and needs no GitHub credential, and each owner's `workProduct.metadata` carries `merged`, `mergedAt`, `headSha`, `branch`, `draft` and `lastEventAction`, which answers the \"has this merged\" question most such wake steps are really asking.",
+    "Read it for what it is. It reports the last DELIVERED webhook event for a narrow set of `pull_request` actions -- not current state, and not reviews or checks, which arrive as `pull_request_review`/`check_run` events and are never written here. Its `sourceEventTimestamp` dates the last event it RECEIVED, not the last time it looked, so it cannot tell \"nothing has happened since\" from \"nothing has ARRIVED since\": an unchanged entry, an undelivered event, and a mirror that has gone deaf are indistinguishable from inside it. A `merged` that is `false` or absent is therefore sufficient only for \"no merge event has been delivered\" -- which is safe, because that conclusion keeps the row parked -- and NEVER \"this has not merged\".",
+    // PEN-5778 review (#3476, native-codex): the asymmetry above used to run in BOTH
+    // directions, which left the mirror unable to answer the one question it was offered
+    // for. A run told that the mirror "answers the has-this-merged question", and then told
+    // to conclude nothing positive from it, hits a contradiction -- and a contradiction is
+    // what invites the improvisation this whole block exists to prevent.
+    //
+    // Merge is the one MONOTONE fact here, so staleness cannot falsify it. The "not current
+    // state" objection applies only to fields that can go BACKWARDS. `merged` is written by
+    // `pullRequestHasMerged` (services/pull-request-work-products.ts), whose docblock states
+    // the invariant this clause rests on: GitHub sets `merged_at` on a real merge, never
+    // clears it, and a merged PR cannot be reopened.
+    //
+    // Scoped to `webhook` provenance deliberately. `listOwnersByExternalId` stamps that only
+    // when the metadata carries the system writer's source AND the row's `sourceTrust` names
+    // the system actor; an `asserted` row carries hand-written metadata, so its `merged` is
+    // whatever someone typed. The line above tells the run to read metadata off EACH owner,
+    // which reaches those rows too, so the qualifier is load-bearing rather than decorative.
+    //
+    // The confinement in the last sentence is load-bearing too. The danger in granting a
+    // positive direction at all is that it reads as a general licence, and
+    // `headSha`/`draft`/`mergeQueueState` are exactly the snapshot fields a run reaches for
+    // next. Those CAN go backwards. Name them rather than leaving the boundary implied.
+    "One fact escapes that, and only one. A `provenance: \"webhook\"` owner whose `metadata.merged` is `true` AND whose `mergedAt` is populated IS sufficient to conclude the pull request merged, and you may release a park on it. A merge is MONOTONE -- GitHub sets `merged_at` once on a real merge, never clears it, and a merged PR cannot be reopened -- so a stale reading of it is still a true one. Nothing else in the metadata is monotone: `headSha`, `draft`, `mergeQueueState` and `lastEventAction` are point-in-time snapshots that a later event can supersede, so do NOT use them to establish that something HAS happened. `asserted` owners carry hand-written metadata and settle nothing in either direction.",
+    "If the mirror cannot answer, re-park and record why in the note. Do NOT improvise an instrument: a wake step you cannot execute is a reason to wait, not a licence to invent a substitute under time pressure.",
+    "When you WRITE a wake step, name the FACT to read (\"read `mergedAt` on #3110\"), not the command to run (\"`gh pr view` ...\"). Naming the instrument is this surface's job, not the note's -- a note in fact form survives the instrument changing, while one in command form has to be rewritten, and a parked row is exactly what nobody goes back to rewrite.",
   );
   // PEN-6271: stated BEFORE the breach rather than after it. Until this block existed the
   // only place the fleet was ever told a `triggered` monitor is an obligation was
