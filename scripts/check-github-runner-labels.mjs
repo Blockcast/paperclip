@@ -26,6 +26,26 @@ export const ALLOWED_RUNNERS = new Set([
   "arc-paperclip-dind",
 ]);
 
+// PEN-6677/PEN-6682: pools whose bare label is answered by MORE THAN ONE org
+// runner group. The bare label `arc-paperclip-buildkit` is answered both by
+// this cluster's group of that name and by `arc-paperclip-buildkit-tools`, and
+// a tools-cluster runner reaches THAT cluster's BuildKit rather than the
+// Ceph-backed one these jobs assume -- so a bare `runs-on` picks a cluster per
+// job by coin flip, which hung four image builds to their ceilings on
+// 2026-11-14. Jobs on these pools must name the group explicitly:
+//
+//   runs-on:
+//     group: arc-paperclip-buildkit
+//     labels: arc-paperclip-buildkit
+//
+// ALLOWED_RUNNERS above already rejects the `-tools` group by name, but that is
+// one entry: adding `arc-paperclip-buildkit-tools` to it for any reason would
+// un-guard every buildkit job at once (measured 2026-11-14 -- widening the list
+// by that single line takes the `-tools` substitution from caught at 7 of 7
+// sites to caught at 0 of 7). This rule keys on the FORM instead of the name,
+// so it is independent of that list and survives it being widened.
+export const GROUP_PINNED_RUNNERS = new Set(["arc-paperclip-buildkit"]);
+
 // BLO-22428: a handful of heavy jobs route merge_group traffic to the
 // dedicated arc-merge-queue pool while pull_request traffic uses the
 // repository-scoped arc-paperclip-general pool, via
@@ -125,11 +145,12 @@ function extractRunsOnEntries(lines, runsOnLineIndex, rawValue) {
       continue;
     }
 
-    const mapMatch = trimmed.match(/^[A-Za-z0-9_-]+:\s*(.*)$/);
+    const mapMatch = trimmed.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
     if (mapMatch) {
-      const mapValue = mapMatch[1] ?? "";
+      const mapKey = mapMatch[1];
+      const mapValue = mapMatch[2] ?? "";
       for (const value of valuesFromScalar(mapValue)) {
-        entries.push({ value, lineNumber: index + 1, sourceLine: line.trim() });
+        entries.push({ value, key: mapKey, lineNumber: index + 1, sourceLine: line.trim() });
       }
     }
   }
@@ -145,6 +166,7 @@ async function main() {
     .filter((file) => file.endsWith(".yml") || file.endsWith(".yaml"))
     .sort();
   const violations = [];
+  const groupPinViolations = [];
 
   for (const file of workflowFiles) {
     const lines = (await readFile(path.join(workflowsDir, file), "utf8")).split("\n");
@@ -159,6 +181,19 @@ async function main() {
           violations.push(`${file}:${entry.lineNumber}: ${entry.sourceLine}`);
         }
       }
+
+      // A `runs-on:` block satisfies the pin when it declares `group:` with the
+      // pinned pool, so the two-key map form passes on both of its lines. A
+      // bare scalar, a sequence entry, and a ternary branch all reach the pool
+      // without naming a group, and are reported with the line that does it.
+      const declaredGroups = new Set(
+        entries.filter((entry) => entry.key === "group").map((entry) => entry.value),
+      );
+      for (const entry of entries) {
+        if (!GROUP_PINNED_RUNNERS.has(entry.value)) continue;
+        if (declaredGroups.has(entry.value)) continue;
+        groupPinViolations.push(`${file}:${entry.lineNumber}: ${entry.sourceLine}`);
+      }
     }
   }
 
@@ -166,8 +201,21 @@ async function main() {
     console.error(`Runner labels must use one of: ${[...ALLOWED_RUNNERS].join(", ")}:`);
     console.error(violations.join("\n"));
     process.exitCode = 1;
-  } else {
-    console.log(`Validated ${workflowFiles.length} workflows: all runner labels use ARC.`);
+  }
+
+  if (groupPinViolations.length > 0) {
+    console.error(
+      `More than one org runner group answers these pools, so a bare label picks a group per job by coin flip. Name the group explicitly (${[...GROUP_PINNED_RUNNERS].join(", ")}):`,
+    );
+    console.error(groupPinViolations.join("\n"));
+    console.error("  runs-on:\n    group: <pool>\n    labels: <pool>");
+    process.exitCode = 1;
+  }
+
+  if (violations.length === 0 && groupPinViolations.length === 0) {
+    console.log(
+      `Validated ${workflowFiles.length} workflows: all runner labels use ARC, and every group-pinned pool names its group.`,
+    );
   }
 }
 
