@@ -105,6 +105,84 @@ describe("plugin database SQL validation", () => {
     ).not.toThrow();
   });
 
+  /**
+   * A GUC write defeats the `search_path` pins on every path in this file, so the ban
+   * sits in `assertNoBannedSql`, which all three validators already share (#3775
+   * review). The two patterns are not interchangeable and this pins which one does the
+   * work: `stripSqlForKeywordScan` empties a quoted span, so the GUC NAME is invisible
+   * inside `set_config('search_path', ...)` and only `\bset_config\b` can refuse it.
+   */
+  it("refuses a statement that writes search_path, on every plugin SQL path", () => {
+    const localScoped = "INSERT INTO plugin_test.probe (v) SELECT set_config('search_path', 'public', true)";
+    // The session-scoped variant is the worse one: it outlives the transaction and
+    // stays on the pooled connection, where core Drizzle queries resolve unqualified.
+    const sessionScoped = "INSERT INTO plugin_test.probe (v) SELECT set_config('search_path', 'plugin_test, public', false)";
+
+    for (const statement of [localScoped, sessionScoped]) {
+      expect(() =>
+        validatePluginMigrationStatement(statement, "plugin_test", [], KNOWN_SCHEMAS)
+      ).toThrow(/set_config/i);
+      // This path is NOT new in this change -- it was reachable on master too.
+      expect(() =>
+        validatePluginRuntimeExecute(statement, "plugin_test", KNOWN_SCHEMAS)
+      ).toThrow(/set_config/i);
+    }
+
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT set_config('search_path', 'public', false) FROM plugin_test.rows",
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).toThrow(/set_config/i);
+
+    // Schema-qualifying the call does not evade it: the word boundary holds after the
+    // dot. Nor does dollar-quoting the GUC name, which is emptied the same way `'...'`
+    // is -- so again it is `set_config` and not `search_path` that refuses.
+    expect(() =>
+      validatePluginMigrationStatement(
+        "INSERT INTO plugin_test.probe (v) SELECT pg_catalog.set_config($$search_path$$, $$public$$, true)",
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).toThrow(/set_config/i);
+
+    // The second pattern carries the forms where the GUC name IS code rather than a
+    // literal, so neither pattern is redundant.
+    expect(() =>
+      validatePluginMigrationStatement(
+        "ALTER DATABASE paperclip SET search_path TO public",
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).toThrow(/search_path/i);
+  });
+
+  it("does not refuse ordinary plugin SQL for the search_path ban", () => {
+    // The control for the test above: the ban is narrow enough that the statements
+    // this validator is supposed to ALLOW still pass. Without this, a ban that refused
+    // everything would score identically.
+    expect(() =>
+      validatePluginMigrationStatement(
+        "INSERT INTO plugin_test.row_copies (id) SELECT id FROM plugin_test.rows",
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT id, config FROM plugin_test.rows WHERE id = $1",
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).not.toThrow();
+  });
+
   it("keeps migration backfill writes scoped to the plugin namespace", () => {
     expect(() =>
       validatePluginMigrationStatement(
@@ -1892,6 +1970,306 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       await expect(
         unpinnable.query(pluginId, `SELECT label FROM ${namespace}.anchor`),
       ).rejects.toThrow(/transactional database client/i);
+    });
+  });
+
+  describe("migration search_path is pinned to the plugin namespace (PEN-6669)", () => {
+    /**
+     * PEN-6604 pinned `query`/`execute`. It deliberately did NOT pin this path,
+     * because `applyMigrations` interleaves the plugin's own statements with the
+     * Drizzle ledger writes (`plugin_migrations`, `plugin_database_namespaces`), which
+     * Drizzle emits UNQUALIFIED -- so a transaction-level pin breaks the ledger. The
+     * pin is therefore scoped to the statement loop and lifted before the ledger write,
+     * and these tests are what hold that scope in place: one half proves the plugin
+     * statements resolve INSIDE the namespace, the other proves the ledger still
+     * resolves OUTSIDE it.
+     *
+     * These prove RESOLUTION, not the verdict. Every migration below is ALLOWED by
+     * `validatePluginMigrationStatement` before and after -- measured at master
+     * e89b8388 -- which is exactly why a lexical fix was not available.
+     */
+    async function installPublicDecoys() {
+      // The core-schema objects an unpinned migration reached. `pen6669_shadow` exists
+      // in BOTH schemas with DIFFERENT values, so the assertions discriminate rather
+      // than matching whichever row happens to be there; `pen6669_only_public` exists
+      // in `public` alone.
+      await db.execute(sql.raw("CREATE TABLE public.pen6669_shadow (label text NOT NULL)"));
+      await db.execute(sql.raw("INSERT INTO public.pen6669_shadow (label) VALUES ('from-public')"));
+      await db.execute(sql.raw("CREATE TABLE public.pen6669_only_public (label text NOT NULL)"));
+      await db.execute(sql.raw("INSERT INTO public.pen6669_only_public (label) VALUES ('from-public')"));
+    }
+
+    afterEach(async () => {
+      await db.execute(sql.raw("DROP TABLE IF EXISTS public.pen6669_shadow CASCADE"));
+      await db.execute(sql.raw("DROP TABLE IF EXISTS public.pen6669_only_public CASCADE"));
+    });
+
+    it("resolves an unqualified backfill source inside the namespace", async () => {
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        CREATE TABLE ${namespace}.sink (label text NOT NULL);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        INSERT INTO ${namespace}.sink (label) SELECT label FROM pen6669_shadow;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+
+      // Control: the public decoy really is there and really carries the other value.
+      const decoy = await db.execute(sql.raw("SELECT label FROM public.pen6669_shadow"));
+      expect(Array.from(decoy as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const rows = await db.execute(sql.raw(`SELECT label FROM "${namespace}".sink`));
+      expect(Array.from(rows as Iterable<{ label: string }>)).toEqual([{ label: "from-namespace" }]);
+    });
+
+    it("cannot reach a core table the namespace does not shadow", async () => {
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.sink (label text NOT NULL);
+        INSERT INTO ${namespace}.sink (label) SELECT label FROM pen6669_only_public;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+
+      // Control: the table is really there, so the rejection below is `search_path`
+      // and not a missing relation.
+      const present = await db.execute(sql.raw("SELECT label FROM public.pen6669_only_public"));
+      expect(Array.from(present as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+
+      await expect(
+        pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+      ).rejects.toThrow(/pen6669_only_public/i);
+    });
+
+    it("binds a migration-created view inside the namespace, permanently", async () => {
+      // The one shape that outlives the migration. Postgres resolves a view body at
+      // CREATE and stores the OIDs, so an unpinned `CREATE VIEW` over a bare name binds
+      // to `public` for the life of the view -- every later read through it leaves the
+      // namespace, long after the migration that made it has gone.
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        CREATE VIEW ${namespace}.shadow_view AS SELECT label FROM pen6669_shadow;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const rows = await db.execute(sql.raw(`SELECT label FROM "${namespace}".shadow_view`));
+      expect(Array.from(rows as Iterable<{ label: string }>)).toEqual([{ label: "from-namespace" }]);
+    });
+
+    it("still writes the ledger, across two migration files, with the pin in force", async () => {
+      // The conjunct that makes a transaction-level pin wrong. `pg_advisory_xact_lock`
+      // runs before any pin; the `plugin_migrations` SELECT for file 002 runs AFTER
+      // file 001's statements, so it is the one the pin would have broken if the
+      // restore did not happen; the INSERT and the `plugin_database_namespaces` write
+      // run after each file. All of them name their tables unqualified.
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `CREATE TABLE ${namespace}.first (id int PRIMARY KEY);`,
+      );
+      await writeFile(
+        path.join(packageRoot, pluginManifest.database!.migrationsDir, "002_second.sql"),
+        `CREATE TABLE ${namespace}.second (id int PRIMARY KEY);`,
+        "utf8",
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const applied = await db
+        .select()
+        .from(pluginMigrations)
+        .where(and(eq(pluginMigrations.pluginId, pluginId), eq(pluginMigrations.status, "applied")));
+      expect(applied.map((row) => row.migrationKey).sort()).toEqual(["001_init.sql", "002_second.sql"]);
+
+      const [namespaceRow] = await db
+        .select()
+        .from(pluginDatabaseNamespaces)
+        .where(eq(pluginDatabaseNamespaces.pluginId, pluginId));
+      expect(namespaceRow?.namespaceName).toBe(namespace);
+    });
+
+    it("leaves no search_path behind on the pooled connection", async () => {
+      // `SET LOCAL` is scoped to the transaction `applyMigrations` opens, and the
+      // restore puts back a value CAPTURED from the session rather than one this code
+      // composes. Either failing leaks this plugin's namespace onto a shared pool.
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      await pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot);
+
+      const after = await db.execute(sql.raw("SELECT label FROM pen6669_shadow"));
+      expect(Array.from(after as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+    });
+
+    /**
+     * The pin is only worth as much as the plugin's inability to undo it, and
+     * nothing on this path stopped a statement writing the GUC itself (#3775
+     * review). Measured against this PR before the ban: a file whose second
+     * statement was `INSERT INTO ns.probe (v) SELECT set_config('search_path',
+     * 'public', true)` reset the pin transaction-locally, and the third statement
+     * then read `public` -- the sink came back `from-public`, i.e. exactly the hole
+     * the pin was added to close, reopened from inside the migration.
+     */
+    it("refuses a migration statement that writes search_path, before it can undo the pin", async () => {
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        CREATE TABLE ${namespace}.sink (label text NOT NULL);
+        CREATE TABLE ${namespace}.probe (v text);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        INSERT INTO ${namespace}.probe (v) SELECT set_config('search_path', 'public', true);
+        INSERT INTO ${namespace}.sink (label) SELECT label FROM pen6669_shadow;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+
+      await expect(
+        pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+      ).rejects.toThrow(/set_config/i);
+
+      // The whole file rolled back, so the decoy read never happened at all.
+      const [{ present }] = Array.from(
+        (await db.execute(
+          sql.raw(`SELECT to_regclass('"${namespace}".sink') IS NOT NULL AS present`),
+        )) as Iterable<{ present: boolean }>,
+      );
+      expect(present).toBe(false);
+    });
+
+    it("re-pins before every statement, not once per file", async () => {
+      // The independent second control. With the ban above in place no ADMISSIBLE
+      // statement can write the GUC, so this cannot be observed through plugin SQL --
+      // it is asserted on the client instead, and on CALL COUNT rather than on
+      // statement text, so it does not depend on how the pin is spelled.
+      //
+      // The delta between a 1-statement file and a 3-statement file is 2 under a
+      // per-file pin (the two extra statements) and 4 under a per-statement pin (two
+      // statements plus their two pins). Everything else `applyMigrations` executes --
+      // the advisory lock, the schema read, the restore -- is common to both arms and
+      // cancels out of the delta.
+      function recordingService(counter: { executes: number }) {
+        return pluginDatabaseService({
+          select: db.select.bind(db),
+          insert: db.insert.bind(db),
+          update: db.update.bind(db),
+          execute: db.execute.bind(db),
+          transaction: ((callback: (tx: unknown) => Promise<unknown>) =>
+            db.transaction(async (tx) =>
+              callback({
+                select: tx.select.bind(tx),
+                insert: tx.insert.bind(tx),
+                update: tx.update.bind(tx),
+                execute: (statement: never) => {
+                  counter.executes += 1;
+                  return tx.execute(statement);
+                },
+              }),
+            )) as never,
+        });
+      }
+
+      async function executesFor(sql_: string, pluginKey: string) {
+        const pluginManifest = manifest(pluginKey);
+        const packageRoot = await createPluginPackage(pluginManifest, sql_);
+        const pluginId = await installPluginRecord(pluginManifest);
+        const counter = { executes: 0 };
+        await recordingService(counter).applyMigrations(pluginId, pluginManifest, packageRoot);
+        return counter.executes;
+      }
+
+      const one = derivePluginDatabaseNamespace("paperclip.repin.one");
+      const three = derivePluginDatabaseNamespace("paperclip.repin.three");
+      const oneStatement = await executesFor(
+        `CREATE TABLE ${one}.a (id int PRIMARY KEY);`,
+        "paperclip.repin.one",
+      );
+      const threeStatements = await executesFor(
+        `
+        CREATE TABLE ${three}.a (id int PRIMARY KEY);
+        CREATE TABLE ${three}.b (id int PRIMARY KEY);
+        CREATE TABLE ${three}.c (id int PRIMARY KEY);
+        `,
+        "paperclip.repin.three",
+      );
+
+      // Control: the counter is live and the two arms really differ.
+      expect(oneStatement).toBeGreaterThan(0);
+      expect(threeStatements - oneStatement).toBe(4);
+    });
+
+    it("refuses to apply migrations through a client it cannot pin", async () => {
+      // `SET LOCAL` outside a transaction block is NOT an error in Postgres -- it warns
+      // and changes nothing -- so an unpinnable fallback would apply every plugin
+      // migration with the hole wide open and report success. Built by hand rather than
+      // spread: `{ ...db }` drops the prototype methods and fails on `db.select` long
+      // before it reaches the pin.
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `CREATE TABLE ${namespace}.rows (id int PRIMARY KEY);`,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      const unpinnable = pluginDatabaseService({
+        select: db.select.bind(db),
+        insert: db.insert.bind(db),
+        update: db.update.bind(db),
+        execute: db.execute.bind(db),
+      });
+
+      await expect(
+        unpinnable.applyMigrations(pluginId, pluginManifest, packageRoot),
+      ).rejects.toThrow(/transactional database client/i);
+
+      // REFUSED BEFORE ANY STATEMENT RAN, which is the half the throw alone does not
+      // pin (#3775 review). A refusal that happened AFTER `001_init.sql` applied would
+      // raise the same error and leave both of these behind.
+      const applied = await db
+        .select()
+        .from(pluginMigrations)
+        .where(eq(pluginMigrations.pluginId, pluginId));
+      expect(applied).toEqual([]);
+
+      const [{ present }] = Array.from(
+        (await db.execute(
+          sql.raw(
+            `SELECT to_regclass('"${namespace}".rows') IS NOT NULL AS present`,
+          ),
+        )) as Iterable<{ present: boolean }>,
+      );
+      expect(present).toBe(false);
     });
   });
 
