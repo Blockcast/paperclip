@@ -7,6 +7,7 @@ import {
   JOB_TIMEOUT_ANNOTATION,
   NON_PAGING_CANCELLATIONS,
   buildAlert,
+  cancellationSourceJob,
   classifyBuildCancellation,
   classifyCancellation,
   shouldPage,
@@ -190,12 +191,87 @@ test("the kill shapes page and the intended cancellations do not", () => {
   assert.equal(shouldPage({ buildResult: "success", cancellation: "n/a" }), false);
 });
 
-// A build-and-push that never ran — this workflow skips it on `pull_request`,
-// and `needs: test` skips it when the test job fails — must not page. A skipped
-// build publishes no image, but the run is already red for the real reason and
-// a second alert about it would be a duplicate.
-test("a skipped build does not page", () => {
-  assert.equal(shouldPage({ buildResult: "skipped", cancellation: "n/a" }), false);
+// `build-and-push` is gated on `needs: test`, so a failed test job SKIPS it:
+// no image is published and the build result reads `skipped`.
+//
+// This returned false until the PEN-6683 review, justified as 'the run is
+// already red for the real reason, so a second alert would duplicate it'.
+// That reasoning is circular: nothing watches this lane's red runs, which is
+// the premise of the row. There is no first alert to duplicate.
+//
+// `build-and-push` is also skipped on `pull_request`, where that is correct and
+// intended -- so the WORKFLOW excludes PR events from the alert arm entirely.
+// The script never runs there, which is why `skipped` can be treated as an
+// unpublished image here without paging on every failing PR.
+test("a build skipped behind a failed test pages", () => {
+  assert.equal(shouldPage({ buildResult: "skipped", testResult: "failure", cancellation: "n/a" }), true);
+});
+
+// A concurrency supersede kills the TEST job too, so the build is skipped
+// behind a cancelled test rather than behind a cancelled build. That is a
+// deliberate stop and stays quiet -- but only when an annotation proves it.
+// Anything the classifier cannot read still pages, as everywhere else here.
+test("a build skipped behind a cancelled test is classified, not assumed", () => {
+  const p = (cancellation) => shouldPage({ buildResult: "skipped", testResult: "cancelled", cancellation });
+  assert.equal(p("superseded"), false);
+  assert.equal(p("manual_cancel"), false);
+  assert.equal(p("job_timeout"), true);
+  assert.equal(p("step_timeout"), true);
+  assert.equal(p("unknown"), true);
+});
+
+// MUTATION: default `testResult` to anything paging-exempt, or drop the arm,
+// and an unexplained skip goes silent again. A build that did not run never
+// published an image, whatever the reason -- so the unknown case pages.
+//
+// The `superseded` input is what makes this discriminate: with `n/a` the
+// correct default and a paging-exempt one give the SAME answer, so that
+// input cannot tell them apart.
+test("a skip this classifier cannot explain still pages", () => {
+  assert.equal(shouldPage({ buildResult: "skipped", testResult: "unknown", cancellation: "n/a" }), true);
+  assert.equal(shouldPage({ buildResult: "skipped", cancellation: "n/a" }), true);
+  assert.equal(shouldPage({ buildResult: "skipped", cancellation: "superseded" }), true);
+  assert.equal(shouldPage({ buildResult: "skipped", cancellation: "manual_cancel" }), true);
+});
+
+// A skipped build has NO annotations of its own -- it never ran -- so the
+// supersede proof has to come from the test job. Reading `build-and-push`
+// there would classify `unknown` and page straight through a legitimate
+// supersede, which is the noise that gets an alert muted.
+test("the cancellation is read from the job that actually ran", () => {
+  assert.equal(cancellationSourceJob({ buildResult: "cancelled", testResult: "success" }), "build-and-push");
+  assert.equal(cancellationSourceJob({ buildResult: "skipped", testResult: "cancelled" }), "test");
+  assert.equal(cancellationSourceJob({ buildResult: "skipped", testResult: "failure" }), null);
+  assert.equal(cancellationSourceJob({ buildResult: "failure", testResult: "success" }), null);
+});
+
+// MUTATION: remove `test` from `needs`, or either test arm from the `if`, or
+// TEST_RESULT from the env, and the script cannot see the skip at all. Each
+// is pinned separately because each alone reopens the gap.
+test("the alert arm is wired to the test job, not only to the build", () => {
+  const job = getJobBlock("alert-on-failure");
+  assert.match(job, /needs: \[test, build-and-push\]/);
+  assert.match(job, /needs\.test\.result == 'failure'/);
+  assert.match(job, /needs\.test\.result == 'cancelled'/);
+  assert.match(job, /TEST_RESULT: \$\{\{ needs\.test\.result \}\}/);
+});
+
+// The resolve arm is deliberately NOT wired to `test`: it fires only on a
+// successful build, which already implies the tests passed, and adding a
+// `needs` it does not use would render `needs.test.result` empty there.
+test("the resolve arm still gates on the build alone", () => {
+  const job = getJobBlock("resolve-on-success");
+  assert.match(job, /needs: \[build-and-push\]/);
+  assert.doesNotMatch(job, /TEST_RESULT/);
+});
+
+// A failing PR must NOT page: there the build is skipped by design and the
+// test job already reports to the PR author. Pinning the exclusion because
+// adding the test arm above is exactly what would otherwise reach on-call
+// on every red pull request.
+test("a failing pull request does not page", () => {
+  const job = getJobBlock("alert-on-failure");
+  assert.match(job, /github\.event_name != 'pull_request'/);
 });
 
 // MUTATION: if `unknown` were ever added to the non-paging set, an unreadable
@@ -302,6 +378,26 @@ test("a resolved push back-dates both ends, so Alertmanager accepts it", () => {
 
 // Each image lane must own a distinct alert identity, or two lanes dedupe onto
 // one Paperclip issue and the second failure is invisible.
+// The summary becomes the TITLE of the Paperclip issue the alertmanager
+// bridge opens, so a summary naming the wrong lane points on-call at the
+// wrong workflow -- and the lane it names would then look like a duplicate
+// of it rather than a separate outage.
+//
+// These lanes are near-identical copies of one another, so this is exactly
+// the field a new lane gets wrong. PEN-6683's review found the paperclip
+// lane still saying `figma-bot`; nothing asserted on the summary in ANY of
+// the four lanes, so a full green suite said nothing about it.
+test("the alert summary names THIS lane and no sibling", () => {
+  const { summary } = buildAlert({
+    state: "firing", repo: "r", branch: "master", runUrl: "", headSha: "a",
+    buildResult: "failure", cancellation: "n/a", now: new Date(),
+  }).annotations;
+  assert.match(summary, /webflow-bot image build is failing/);
+  for (const sibling of ["figma-bot", "designer", "paperclip", "mcp-gateway", "mcp-external"]) {
+    assert.doesNotMatch(summary, new RegExp(sibling));
+  }
+});
+
 test("the alert identity is distinct from the other image lanes'", async () => {
   const gateway = await import("../.github/scripts/post-mcp-gateway-image-alert.mjs");
   const external = await import("../.github/scripts/post-mcp-external-image-alert.mjs");
