@@ -241,7 +241,7 @@ test("locateConstruct returns every occurrence", () => {
   assert.deepEqual(locateConstruct(SOURCE.split("\n"), "a"), [1, 2]);
 });
 
-test("applyFixes rewrites a drifted anchor whose construct is unique", () => {
+test("applyFixes rewrites exactly the stale-number findings", () => {
   const doc = "`parseThing` (`src/a.ts:5`)";
   const { text, fixed } = applyFixes(doc, check(doc));
   assert.equal(text, "`parseThing` (`src/a.ts:2`)");
