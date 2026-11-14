@@ -139,7 +139,13 @@ rather than guessing.
 
 **`--base` is required, and it is what keeps the remedy from widening your diff** (PEN-6680).
 `--fix` rewrites only the numbers your own change made stale: one citing a source file you
-moved, or one in a document you are already editing. Everything else is the base's drift, and
+moved, or one in a document you are already editing. **Moved and editing mean your WORKING
+TREE, not your commits** — the remedy is for the edit in front of you, so it counts unstaged,
+staged and untracked work as well as committed work. (Attribution for the PR gate is the
+committed diff, which is the right shape there and the wrong one here: narrowing the rewrite
+to it made this command a silent no-op before the first commit, which is most of the times
+anyone runs it. Passing `--head` pins the comparison back to a commit, which is what CI does
+and what you want under a merge-ref checkout; local runs should leave it off.) Everything else is the base's drift, and
 rewriting it writes a shared line in a document you never opened — which manufactures exactly
 the pairwise conflict PEN-6674 removed the mandate for, arrived at voluntarily. Measured on
 #3774: a `--fix` run also renumbered a `Dockerfile` anchor, from line 674 to line 705, in an

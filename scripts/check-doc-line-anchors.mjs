@@ -92,6 +92,17 @@
 // anchor in the corpus, which only a single writer on master can do without
 // manufacturing the conflicts PEN-6674 removed the mandate for.
 //
+// WHAT --fix OWNS IS A WORKTREE QUESTION, NOT A COMMIT ONE. `--fix` writes to the
+// worktree, so the change it is narrowed to is the one IN the worktree -- committed or
+// not. Attribution for the FAIL decision is `base...head`, which is committed-only and
+// correct for a gate; reusing it to decide what to REWRITE made `--fix --base
+// origin/master` a silent no-op before you commit, which is its most common local use:
+// an uncommitted source move is not "a file you moved" and an uncommitted doc edit is
+// not "a document you are already editing", so both ownership arms came back empty and
+// the report then recommended the same command again. See worktreeChangedSince and
+// fixScope in main. Under an explicit --head the worktree is somebody else's tree -- a
+// `pull_request` merge ref -- so the union is NOT taken there.
+//
 // SEVERITY: A STALE NUMBER IS NOT ANCHOR ROT (PEN-6674)
 //
 // Drift splits in two, and only one half is a claim this check cannot settle.
@@ -489,7 +500,7 @@ export function applyUnverified(findings, manifest, scannedDocs) {
   return { findings: out, stale };
 }
 
-function report(findings, { quiet, stale = [], inheritedStale = [] }) {
+function report(findings, { quiet, stale = [], inheritedStale = [], fixScope = null }) {
   const count = (s) => findings.filter((f) => f.status === s).length;
   const failing = findings.filter((f) => FAILING.has(f.status));
   const staleNumbers = findings.filter((f) => f.status === "stale-number");
@@ -573,12 +584,33 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
   // current line is printed beside each one, so the report carries the answer whether
   // or not anyone runs --fix, and the count below keeps the number from quietly
   // growing behind an unqualified `resolved`.
-  if (staleNumbers.length > 0) {
+  //
+  // Split by ownership, because the two halves take DIFFERENT remedies and one
+  // unconditional hint sends half the readers back to the command that just declined
+  // them: a run that WAS `--fix --base ...` and left a number alone left it alone on
+  // purpose, and recommending the same command again reads as the fix having failed.
+  // `fixScope === null` is "no base, so nothing can be attributed" -- there the single
+  // block and the single hint are both honest, and the refusal above has already said
+  // the rest.
+  const ownedStale =
+    fixScope === null ? staleNumbers : staleNumbers.filter((f) => ownsStaleNumber(f, fixScope));
+  const baseStale =
+    fixScope === null ? [] : staleNumbers.filter((f) => !ownsStaleNumber(f, fixScope));
+  if (ownedStale.length > 0) {
     console.error(
       `STALE LINE NUMBERS (the construct still resolves, uniquely, so the citation ` +
         `holds -- reported, NOT fatal; ${FIX_HINT}):`,
     );
-    for (const f of staleNumbers) explain(f, "  ");
+    for (const f of ownedStale) explain(f, "  ");
+  }
+  if (baseStale.length > 0) {
+    console.error(
+      `STALE LINE NUMBERS INHERITED FROM THE BASE (the citation holds and the drift is ` +
+        `the base's, not this change's -- reported, NOT fatal. \`--fix\` leaves these ` +
+        `alone BY DESIGN: rewriting one writes a shared line in a document this change ` +
+        `never opened. Only a single writer on master can take them, with --fix-all):`,
+    );
+    for (const f of baseStale) explain(f, "  ");
   }
 
   if (!quiet) {
@@ -665,6 +697,34 @@ export function changedSince(ref, root, head = "HEAD") {
   return r.status === 0 ? new Set(r.stdout.split("\n").filter(Boolean)) : null;
 }
 
+// Every path the WORKTREE differs from `ref` at: committed, staged, unstaged, and
+// untracked. The two-dot `git diff --name-only <ref>` already covers the first three
+// (it compares the ref against the working tree, not against HEAD); `ls-files --others`
+// adds a file this change has created and not yet added, which an anchor can cite and a
+// document can be.
+//
+// This is the FIX scope and never the attribution scope. A gate must judge a commit --
+// a worktree is not a thing CI has or a reviewer can read -- but `--fix` writes to the
+// worktree, so narrowing it to committed work refuses exactly the edit in front of you.
+//
+// --no-renames for the same reason as changedSince: with rename detection on, a
+// `git mv` lists only the destination, and an anchor still citing the old path matches
+// neither ownership arm.
+//
+// Returns null on a git failure, which main refuses on rather than silently falling
+// back to the narrow set -- a quiet fallback here is indistinguishable from the no-op
+// this function exists to remove.
+export function worktreeChangedSince(ref, root) {
+  const opts = { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 };
+  const tracked = spawnSync("git", ["diff", "--no-renames", "--name-only", ref], opts);
+  if (tracked.status !== 0) return null;
+  const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], opts);
+  if (untracked.status !== 0) return null;
+  return new Set(
+    [...tracked.stdout.split("\n"), ...untracked.stdout.split("\n")].filter(Boolean),
+  );
+}
+
 function main(argv) {
   const arg = (name, fallback) => {
     const i = argv.indexOf(name);
@@ -711,6 +771,12 @@ function main(argv) {
   // nothing the fix loop writes into the worktree can move it, and the attribution
   // below reads the same set.
   let changed = null;
+  // What `--fix` may rewrite. Deliberately a SECOND set: `changed` answers "what is this
+  // PR judged on", which has to be a commit, and fixScope answers "what is this change",
+  // which for a tool that writes to the worktree includes work not committed yet.
+  // Computed whether or not --fix was passed, so the report's hint predicts what --fix
+  // would actually do rather than what the gate would fail on.
+  let fixScope = null;
   if (baseRef) {
     // A base that cannot be read would mark every inherited failure as introduced and
     // fail the PR for drift it did not cause. Say so instead of judging on it.
@@ -731,6 +797,20 @@ function main(argv) {
     if (changed === null) {
       console.error(`cannot judge: cannot diff ${baseRef}...${headRef} in ${root}`);
       return 2;
+    }
+    // An explicit --head says "the thing being attributed is that commit, not this
+    // worktree" -- CI passes $PR_HEAD_SHA precisely because its worktree is a merge ref
+    // carrying master's changes too. Unioning that worktree in would hand every file
+    // master touched to the fix scope, which is the widening this flag exists to stop.
+    if (argv.includes("--head")) {
+      fixScope = changed;
+    } else {
+      const worktree = worktreeChangedSince(baseRef, root);
+      if (worktree === null) {
+        console.error(`cannot judge: cannot read the worktree delta against ${baseRef} in ${root}`);
+        return 2;
+      }
+      fixScope = new Set([...changed, ...worktree]);
     }
   }
 
@@ -761,7 +841,7 @@ function main(argv) {
     const abs = join(root, rel);
     const findings = checkDocument({ docPath: rel, docText: readFileSync(abs, "utf8"), readSource });
     if (fix) {
-      const { text, fixed } = applyFixes(readFileSync(abs, "utf8"), findings, fixAll ? null : changed);
+      const { text, fixed } = applyFixes(readFileSync(abs, "utf8"), findings, fixAll ? null : fixScope);
       if (fixed.length > 0) {
         writeFileSync(abs, text);
         for (const f of fixed) console.log(`fixed ${rel}:${f.docLine} \`${f.anchor}\` -> :${f.to}`);
@@ -808,7 +888,9 @@ function main(argv) {
 
   const { findings, stale } = applyUnverified(attributed, manifest, docs);
   const introducedStale = stale.filter((k) => !inheritedStale.includes(k));
-  return report(findings, { quiet, stale: introducedStale, inheritedStale }) === 0 ? 0 : 1;
+  return report(findings, { quiet, stale: introducedStale, inheritedStale, fixScope }) === 0
+    ? 0
+    : 1;
 }
 
 // Whether this module was invoked as a program, rather than imported by the tests.
