@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import { normalizeIssueIdentifier } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
-import { activityService, normalizeActivityLimit } from "../services/activity.js";
+import { activityService, normalizeActivityLimit, normalizeIssueRunsLimit } from "../services/activity.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getAccessibleResource, hasCompanyAccess } from "./authz.js";
 import { accessService, heartbeatService, issueService } from "../services/index.js";
 import { sanitizeRecord } from "../redaction.js";
@@ -32,6 +32,15 @@ const companyActivityQuerySchema = z.object({
 });
 
 const uuidQueryParamSchema = z.string().guid();
+
+// PEN-6670: `GET /issues/:id/runs` took no query parameter at all, so every call sorted and
+// returned the issue's whole run history. `limit` is opt-in — omitting it applies
+// `DEFAULT_ISSUE_RUNS_LIMIT`, a backstop set well above any observed per-issue run count, so
+// no existing caller's page changes shape.
+const ISSUE_RUNS_QUERY_PARAMS = new Set(["limit"]);
+const issueRunsQuerySchema = z.object({
+  limit: z.string().regex(/^\d+$/).optional(),
+});
 
 // Audit records that are not feed items, left off the unnarrowed page only — one that sets none of
 // `action`, `agentId`, `entityType`, `entityId` (`limit` does not narrow it). `heartbeat.run_events_streamed`
@@ -220,8 +229,21 @@ export function activityRoutes(db: Db) {
     const issue = await getAccessibleResource(req, res, resolveIssueByRef(rawId), "Issue not found");
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
-    if (!rejectUnsupportedQueryParams(req, res, new Set())) return;
-    const result = await svc.runsForIssue(issue.companyId, issue.id);
+    if (!rejectUnsupportedQueryParams(req, res, ISSUE_RUNS_QUERY_PARAMS)) return;
+    const parsedLimit = issueRunsQuerySchema.safeParse(req.query);
+    if (!parsedLimit.success) {
+      res.status(400).json({ error: "Invalid query parameter: limit" });
+      return;
+    }
+    const limit = normalizeIssueRunsLimit(
+      parsedLimit.data.limit === undefined ? undefined : Number(parsedLimit.data.limit),
+    );
+    const result = await svc.runsForIssue(issue.companyId, issue.id, { limit });
+    // Echoes the bound actually applied, so a caller holding exactly `limit` rows can tell a
+    // complete history from a capped page without the array response shape changing. Same
+    // reasoning as `X-Applied-Filters` above (BLO-21979): a truncated read must never be
+    // indistinguishable from a complete one.
+    res.setHeader("X-Applied-Limit", String(limit));
     res.json(result);
   });
 

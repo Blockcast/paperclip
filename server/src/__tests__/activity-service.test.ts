@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -18,6 +19,84 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { activityService } from "../services/activity.js";
+import {
+  DEFAULT_ISSUE_RUNS_LIMIT,
+  MAX_ISSUE_RUNS_LIMIT,
+  normalizeIssueRunsLimit,
+  runBelongsToIssue,
+} from "../services/activity.js";
+
+const SHAPE_COMPANY_ID = "11111111-1111-4111-8111-111111111111";
+const SHAPE_ISSUE_ID = "22222222-2222-4222-8222-222222222222";
+
+/**
+ * PEN-6670. Deliberately NOT gated on embedded Postgres — this renders SQL and
+ * needs no database, so it keeps guarding the shape on hosts where the suites
+ * below skip.
+ */
+describe("issue-run membership predicate shape (PEN-6670)", () => {
+  const rendered = () =>
+    new PgDialect().sqlToQuery(runBelongsToIssue(SHAPE_COMPANY_ID, SHAPE_ISSUE_ID));
+
+  it("unions two standalone id sets rather than ORing them", () => {
+    const normalized = rendered().sql.replace(/\s+/g, " ").toLowerCase();
+
+    // Two arms => exactly one UNION. Plain UNION, not UNION ALL: the arms
+    // overlap heavily (a run usually both names the issue in its context
+    // snapshot and writes activity rows against it) and the outer IN wants
+    // distinct ids.
+    expect(normalized.match(/\bunion\b/g) ?? []).toHaveLength(1);
+    expect(normalized).not.toContain("union all");
+    expect(normalized).not.toMatch(/\bor\b/);
+  });
+
+  it("keeps the activity_log arm out of a correlated semi-join", () => {
+    const { sql: text } = rendered();
+    // ⛔ THE REGRESSION THIS GUARDS. A semi-join cannot take part in a
+    // BitmapOr, so ORing `exists (... and activity_log.run_id =
+    // heartbeat_runs.id)` against the context-snapshot predicate left a per-row
+    // FILTER on a company-wide index scan as the only plan, and put
+    // heartbeat_runs_company_issueid_idx (0077) out of reach. Measured on a
+    // 905,300-run seed: 904,794 rows read and discarded, 48,522 buffers,
+    // 1,369.8ms; 2,603 buffers and 16.3ms once the arms are unioned.
+    expect(text.toLowerCase()).not.toContain("exists");
+    expect(text).toContain('"activity_log"."run_id"');
+    expect(text).toContain('"heartbeat_runs"."context_snapshot"');
+  });
+
+  it("gives each arm the predicates its index needs, and parameterises both", () => {
+    const { sql: text, params } = rendered();
+    const normalized = text.replace(/\s+/g, " ").toLowerCase();
+
+    // Arm 1 drives heartbeat_runs_company_issueid_idx (0077): (company_id,
+    // (context_snapshot->>'issueId')) WHERE that expression IS NOT NULL. Arm 2
+    // drives activity_log_entity_type_id_idx (0003): (entity_type, entity_id),
+    // with company_id applied as a filter. Both were measured as the planner's
+    // actual choices. Dropping either company_id predicate widens the arm past
+    // the tenant; dropping the issue predicate un-drives the index entirely.
+    expect(normalized).toContain(`"heartbeat_runs"."company_id" = $1`);
+    expect(normalized).toContain(`"activity_log"."company_id" = $3`);
+    expect(normalized).toContain(`"activity_log"."entity_type" = 'issue'`);
+    // `run_id` is nullable and most activity rows carry none, so this keeps the
+    // arm from emitting NULLs the outer IN can do nothing with.
+    expect(normalized).toContain(`"activity_log"."run_id" is not null`);
+
+    expect(params).toEqual([SHAPE_COMPANY_ID, SHAPE_ISSUE_ID, SHAPE_COMPANY_ID, SHAPE_ISSUE_ID]);
+    expect(text).not.toContain(SHAPE_COMPANY_ID);
+    expect(text).not.toContain(SHAPE_ISSUE_ID);
+  });
+});
+
+describe("issue runs limit helper (PEN-6670)", () => {
+  it("clamps an untrusted limit to the server bounds", () => {
+    expect(normalizeIssueRunsLimit(undefined)).toBe(DEFAULT_ISSUE_RUNS_LIMIT);
+    expect(normalizeIssueRunsLimit(Number.NaN)).toBe(DEFAULT_ISSUE_RUNS_LIMIT);
+    expect(normalizeIssueRunsLimit(0)).toBe(1);
+    expect(normalizeIssueRunsLimit(-5)).toBe(1);
+    expect(normalizeIssueRunsLimit(25.9)).toBe(25);
+    expect(normalizeIssueRunsLimit(MAX_ISSUE_RUNS_LIMIT + 10)).toBe(MAX_ISSUE_RUNS_LIMIT);
+  });
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -622,5 +701,112 @@ describeEmbeddedPostgres("activity service", () => {
       livenessReason: "Run described runnable future work without concrete action evidence",
       lastUsefulActionAt: null,
     });
+  });
+
+  it("still finds runs reachable only through activity_log, and honours the bound (PEN-6670)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const contextRunId = randomUUID();
+    const activityOnlyRunId = randomUUID();
+    const unrelatedRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Engineer",
+      role: "engineer",
+      status: "running",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values([
+      {
+        // Arm 1: named in the run's own context snapshot.
+        id: contextRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        livenessState: "advanced",
+        createdAt: new Date("2026-04-18T10:00:00.000Z"),
+      },
+      {
+        // Arm 2: the run worked a DIFFERENT issue in its snapshot and only
+        // touched this one through activity_log. Before PEN-6670 this was the
+        // correlated EXISTS; it must still be found.
+        id: activityOnlyRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        contextSnapshot: { issueId: randomUUID() },
+        livenessState: "advanced",
+        createdAt: new Date("2026-04-18T11:00:00.000Z"),
+      },
+      {
+        // Neither arm. Must not come back.
+        id: unrelatedRunId,
+        companyId,
+        agentId,
+        status: "succeeded",
+        contextSnapshot: { issueId: randomUUID() },
+        livenessState: "advanced",
+        createdAt: new Date("2026-04-18T12:00:00.000Z"),
+      },
+    ]);
+
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        action: "issue.comment_added",
+        entityType: "issue",
+        entityId: issueId,
+        runId: activityOnlyRunId,
+      },
+      {
+        // Same run id, but against another entity type — must not pull the run in.
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        action: "agent.updated",
+        entityType: "agent",
+        entityId: agentId,
+        runId: unrelatedRunId,
+      },
+    ]);
+
+    const service = activityService(db);
+    const runs = await service.runsForIssue(companyId, issueId);
+
+    // Newest first, both arms, and nothing else.
+    expect(runs.map((run) => run.runId)).toEqual([activityOnlyRunId, contextRunId]);
+
+    // The union de-duplicates: a run matching BOTH arms appears once.
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: issueId,
+      runId: contextRunId,
+    });
+    const deduped = await service.runsForIssue(companyId, issueId);
+    expect(deduped.map((run) => run.runId)).toEqual([activityOnlyRunId, contextRunId]);
+
+    // The bound applies to the ordered page, so a capped read keeps the newest.
+    const capped = await service.runsForIssue(companyId, issueId, { limit: 1 });
+    expect(capped.map((run) => run.runId)).toEqual([activityOnlyRunId]);
   });
 });
