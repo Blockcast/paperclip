@@ -235,7 +235,7 @@ The chain, read at `47d01a4bf`:
 3. The merged object becomes `executionRunConfig` at `:38336`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
-4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3290`
+4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3291`
    (`function withAgentScopedEnvProvenance(`), re-asserts agent values for
    `AGENT_SCOPE_ONLY_ENV_KEYS` — three keys, **inside `env`**. It does nothing for top-level
    `adapterConfig` keys.
@@ -246,7 +246,7 @@ the agent yields a pod with the credential back in the agent container. The over
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
-The code already knows this class of problem. The comment at `:3273`
+The code already knows this class of problem. The comment at `:3274`
 (`is issue.assigneeAdapterOverrides.adapterConfig.`) says it in as many words:
 
 > `issueAdapterConfig` is `issue.assigneeAdapterOverrides.adapterConfig`.
