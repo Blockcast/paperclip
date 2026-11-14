@@ -8,6 +8,7 @@ import {
   changedSince,
   checkDocument,
   isMainModule,
+  isRenumberable,
   locateConstruct,
   parseAnchorSpan,
   parseDirective,
@@ -122,8 +123,54 @@ test("inference never crosses a line, though the explicit form may", () => {
 
 test("a drifted anchor is reported with the construct's current line", () => {
   const f = only("`parseThing` (`src/a.ts:5`)");
+  assert.deepEqual(f.actual, [2]);
+});
+
+// PEN-6674. Drift splits by whether a human has anything to decide. The number moved
+// and the construct is still there, once: the citation holds, this tool is holding the
+// right line, and there is nothing to adjudicate -- so it must not fail a PR. Making it
+// fail was unsatisfiable in the merge queue, where the correct number is a function of
+// the whole merge group and no single entry can carry it.
+test("a single-line anchor whose construct moved to exactly one place is a stale number", () => {
+  const f = only("`parseThing` (`src/a.ts:5`)");
+  assert.equal(f.status, "stale-number");
+  assert.equal(f.actual.length, 1);
+  assert.ok(isRenumberable(f));
+});
+
+// The other half is untouched, and these are the anchor rot the check exists for.
+test("a construct that has left the file entirely stays drifted and fatal", () => {
+  const f = only("`parseThing` (`src/a.ts:5`)", "const a = 1;\nconst b = 2;");
+  assert.equal(f.status, "drifted");
+  assert.deepEqual(f.actual, []);
+  assert.ok(!isRenumberable(f));
+});
+
+test("a construct now at several places stays drifted: --fix would have to guess", () => {
+  const f = only("`return null;` (`src/a.ts:2`)", "return null;\nx\nreturn null;");
+  assert.equal(f.status, "drifted");
+  assert.deepEqual(f.actual, [1, 3]);
+});
+
+test("a drifted range stays drifted even where its construct is unique", () => {
+  // --fix never relocates a range -- re-deriving its extent is a judgement -- so the
+  // class that is never fatal must not widen to one the tool refuses to repair.
+  const f = only("`parseThing` (`src/a.ts:4-5`)");
   assert.equal(f.status, "drifted");
   assert.deepEqual(f.actual, [2]);
+});
+
+test("a stale number is never fatal, under either base kind", () => {
+  const atHead = check("`parseThing` (`src/a.ts:2`)", `// pushed down\n${SOURCE}`);
+  const atBase = check("`parseThing` (`src/a.ts:2`)");
+  assert.equal(atHead[0].status, "stale-number");
+  for (const queueBase of [false, true]) {
+    // `changed` carries the cited file: the strongest attribution arm there is, the one
+    // a merge group always satisfies. It must still not make this fatal.
+    const [f] = attributeInherited(atHead, atBase, new Set(["src/a.ts"]), { queueBase });
+    assert.equal(f.status, "stale-number", `queueBase=${queueBase}`);
+    assert.ok(!f.inherited, "not inherited either -- it is simply not a failure");
+  }
 });
 
 test("a range passes when the construct is anywhere inside it", () => {
@@ -229,9 +276,12 @@ test("applyFixes keeps offsets valid when one line carries several anchors", () 
   );
 });
 
+// The manifest carries anchors a human has to settle, so these fixtures use RANGES:
+// since PEN-6674 a drifted single-line anchor with one candidate site is a stale number
+// and not a failure at all, so it has nothing to downgrade.
 test("a manifest entry downgrades its own anchor and nothing else", () => {
-  const doc = "`parseThing` (`src/a.ts:5`) and `input: unknown,` (`src/a.ts:6`)";
-  const manifest = [{ doc: "d.md", anchor: "src/a.ts:5", construct: "parseThing" }];
+  const doc = "`parseThing` (`src/a.ts:4-5`) and `input: unknown,` (`src/a.ts:5-6`)";
+  const manifest = [{ doc: "d.md", anchor: "src/a.ts:4-5", construct: "parseThing" }];
   const { findings, stale } = applyUnverified(check(doc), manifest, ["d.md"]);
   assert.deepEqual(findings.map((f) => f.status), ["unverified", "drifted"]);
   assert.equal(findings[0].was, "drifted");
@@ -314,7 +364,7 @@ test("a manifest entry matching an anchor that now resolves is reported stale", 
 
 test("manifest entries for documents outside this run are not judged", () => {
   // A narrowed --glob must not report every other document's entries as stale.
-  const doc = "`parseThing` (`src/a.ts:5`)";
+  const doc = "`parseThing` (`src/a.ts:4-5`)";
   const manifest = [{ doc: "other.md", anchor: "x.ts:1", construct: "q" }];
   const { findings, stale } = applyUnverified(check(doc), manifest, ["d.md"]);
   assert.deepEqual(stale, []);
@@ -509,7 +559,10 @@ test("changedSince reports only the PR's files when the worktree is a merge ref"
 test("master moving a cited file under a merge-ref checkout is inherited, not fatal", async () => {
   const { root, base, head, rm } = await mergeRefFixture();
   try {
-    const doc = "`parseThing` (`src/a.ts:2`)";
+    // A RANGE, so the drift stays FATAL and there is an attribution question to ask:
+    // the same single-line anchor is a stale number since PEN-6674 and is never fatal,
+    // which would make this test pass for the wrong reason.
+    const doc = "`parseThing` (`src/a.ts:1-2`)";
     const atHead = checkDocument({
       docPath: "docs/d.md",
       docText: doc,
@@ -517,6 +570,7 @@ test("master moving a cited file under a merge-ref checkout is inherited, not fa
     });
     const atBase = checkDocument({ docPath: "docs/d.md", docText: doc, readSource: () => SOURCE });
     assert.equal(atHead[0].status, "drifted", "the fixture must actually drift");
+    assert.equal(atBase[0].status, "ok", "and must resolve at the base");
 
     const [wrong] = attributeInherited(atHead, atBase, changedSince(base, root));
     assert.ok(
@@ -546,7 +600,7 @@ test("a PR that moves the cited file still owns it under a merge-ref checkout", 
     mkdirSync(join(root, "src"));
     mkdirSync(join(root, "docs"));
     writeFileSync(join(root, "src/a.ts"), SOURCE);
-    writeFileSync(join(root, "docs/d.md"), "`parseThing` (`src/a.ts:2`)\n");
+    writeFileSync(join(root, "docs/d.md"), "`parseThing` (`src/a.ts:1-2`)\n");
     git("add", "-A");
     git("commit", "-qm", "base");
     const base = git("rev-parse", "HEAD");
@@ -567,7 +621,9 @@ test("a PR that moves the cited file still owns it under a merge-ref checkout", 
     git("checkout", "-q", "-b", "mergeref");
     git("merge", "-q", "--no-ff", "-m", "Merge pr into master", "pr");
 
-    const doc = "`parseThing` (`src/a.ts:2`)";
+    // A RANGE, for the reason given in the test above: a single-line stale number is
+    // not a failure, so it could not show that the PR still OWNS the citation.
+    const doc = "`parseThing` (`src/a.ts:1-2`)";
     const atHead = checkDocument({
       docPath: "docs/d.md",
       docText: doc,
@@ -596,7 +652,7 @@ test("end to end: --head decides whether master's drift fails the run", async ()
   try {
     // The glob the real run uses is docs/security/**; this fixture keeps its document
     // at docs/, so point the checker at it explicitly.
-    writeFileSync(join(root, "docs/d.md"), "`parseThing` (`src/a.ts:2`)\n");
+    writeFileSync(join(root, "docs/d.md"), "`parseThing` (`src/a.ts:1-2`)\n");
     const run = (...extra) =>
       spawnSync(process.execPath, [script, "--root", root, "--glob", "docs/*.md", "--quiet",
         "--base", base, ...extra], { encoding: "utf8" });
@@ -617,6 +673,87 @@ test("end to end: --head decides whether master's drift fails the run", async ()
     assert.match(bogus.stderr, /cannot judge/);
   } finally {
     rm();
+  }
+});
+
+// PEN-6674, pinned end to end because it is the command line that decides it: a
+// severity split in checkDocument that report() or main() did not carry through would
+// satisfy every unit test above and still eject the entry.
+//
+// This is the merge-queue shape, and it is the one no entry can win by being careful.
+// The entry is prepared correctly against its own base and enqueued. The group the
+// queue builds carries the entries ahead of it, which moved the same source file, so
+// the entry's numbers are wrong against a tree that did not exist when it was written.
+// `changed` holds the cited file, so attribution case 1 charges the entry for all of
+// it. Measured on Blockcast/paperclip 2026-11-14: #3715 evicted three times, #3476
+// once, #3774 red on 8 anchors, each eviction spending a human enqueue act.
+const queueFixture = async (docAnchor, queueSource) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const root = mkdtempSync(join(tmpdir(), "anchor-queue-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "master");
+  git("config", "user.email", "t@t");
+  git("config", "user.name", "t");
+  mkdirSync(join(root, "src"));
+  mkdirSync(join(root, "docs"));
+  writeFileSync(join(root, "src/a.ts"), SOURCE);
+  writeFileSync(join(root, "docs/d.md"), "x\n");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD");
+
+  // The merge-group head: this entry moved the cited file, and so did an entry queued
+  // ahead of it, so the file sits two lines lower than anything the entry could see.
+  // The document carries the number that was correct for the entry alone.
+  writeFileSync(join(root, "src/a.ts"), queueSource);
+  writeFileSync(join(root, "docs/d.md"), docAnchor);
+  git("add", "-A");
+  git("commit", "-qm", "merge group");
+  const head = git("rev-parse", "HEAD");
+  return { root, base, head, rm: () => rmSync(root, { recursive: true, force: true }) };
+};
+
+test("a stale number does not eject a merge-group entry, and real rot still does", async () => {
+  const { join, dirname } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const script = join(dirname(fileURLToPath(import.meta.url)), "check-doc-line-anchors.mjs");
+
+  const run = (f) =>
+    spawnSync(
+      process.execPath,
+      [script, "--root", f.root, "--glob", "docs/*.md", "--quiet",
+        "--base", f.base, "--head", f.head, "--base-kind", "queue"],
+      { encoding: "utf8" },
+    );
+
+  // The entry's `:3` was right against its own base; the group pushed the construct
+  // to :4. Nothing here needs a human, and it must not cost an enqueue act.
+  const stale = await queueFixture("`parseThing` (`src/a.ts:3`)\n", `// ahead\n// entry\n${SOURCE}`);
+  try {
+    const r = run(stale);
+    assert.equal(r.status, 0, `a stale number must not eject the entry: ${r.stderr}`);
+    assert.match(r.stderr, /STALE NUMBER/, "and it must still be reported, with its new line");
+    assert.match(r.stderr, /:4/);
+    assert.doesNotMatch(r.stderr, /need attention/);
+  } finally {
+    stale.rm();
+  }
+
+  // The must-fail arm. Same shape, same attribution, but the construct is GONE from
+  // the combined tree -- the anchor rot this check was built for. Without this the
+  // test above passes just as well against a checker that fails on nothing.
+  const rot = await queueFixture("`parseThing` (`src/a.ts:3`)\n", "const a = 1;\nconst b = 2;");
+  try {
+    const r = run(rot);
+    assert.equal(r.status, 1, "a construct that left the file must still eject the entry");
+    assert.match(r.stderr, /DRIFTED/);
+    assert.match(r.stderr, /no longer in the file at all/);
+  } finally {
+    rot.rm();
   }
 });
 
