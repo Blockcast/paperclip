@@ -180,3 +180,49 @@ export async function reconcilerSweepTick(
   );
   return result;
 }
+
+/**
+ * How this sweep authenticates to GitHub (PEN-6413).
+ *
+ * The reconciler enumerates merged PRs in PRIVATE repos, so it needs a token;
+ * unauthenticated it 404s on every target and reports them all as `failed`.
+ *
+ * It originally read `GITHUB_TOKEN`/`GH_TOKEN` and skipped itself when neither
+ * was set. Neither is set in this deployment and never has been: the fleet
+ * convention is the App credentials (`GITHUB_APP_ID` /
+ * `GITHUB_APP_INSTALLATION_ID` / `GITHUB_APP_PRIVATE_KEY`), which the webhook,
+ * the review gate and the rate-limit sampler all already use. So the whole
+ * subsystem logged one WARN at boot and did nothing, measured first-party on
+ * `paperclip-0` at 2026-11-14T14:39:13Z: "Merged-PR reconciler enabled but no
+ * GITHUB_TOKEN/GH_TOKEN set ... Skipping reconciler."
+ *
+ * That made #3658's work-product repair INERT -- the repair shipped into a
+ * caller that is never invoked, which is invisible from the fix's own side
+ * because the code is present, correct and deployed.
+ *
+ * Two properties are load-bearing:
+ *
+ *  - An explicit `GITHUB_TOKEN`/`GH_TOKEN` still WINS. A deployment that pins a
+ *    PAT keeps its behaviour exactly; this only adds a fallback.
+ *  - Resolution is PER TICK, never once at startup. An installation token
+ *    expires in ~1h while the sweep interval defaults to 6h, so a token
+ *    resolved at boot is already dead when the second tick fires. Resolving
+ *    once would have worked on the startup pass and then failed silently
+ *    forever -- the hardest shape to notice, because the first observation is
+ *    the one that succeeds.
+ */
+export type ReconcilerTokenResolution =
+  | { ok: true; token: string; source: "env" | "github_app" }
+  | { ok: false; reason: "no_credentials" | "github_app_token_unavailable" };
+
+export async function resolveReconcilerToken(deps: {
+  envToken: string | null;
+  appCredentialsConfigured: () => boolean;
+  getInstallationToken: () => Promise<string | null>;
+}): Promise<ReconcilerTokenResolution> {
+  if (deps.envToken) return { ok: true, token: deps.envToken, source: "env" };
+  if (!deps.appCredentialsConfigured()) return { ok: false, reason: "no_credentials" };
+  const token = await deps.getInstallationToken();
+  if (!token) return { ok: false, reason: "github_app_token_unavailable" };
+  return { ok: true, token, source: "github_app" };
+}
