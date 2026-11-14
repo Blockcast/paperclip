@@ -225,14 +225,14 @@ The chain, read at `47d01a4bf`:
 
 <!-- anchor-file: server/src/services/heartbeat.ts -->
 
-1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8697`
+1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8804`
    (`function parseIssueAssigneeAdapterOverrides(`), parses
    `issue.assigneeAdapterOverrides.adapterConfig` with `parseObject` and **no key allowlist** —
    arbitrary keys pass.
-2. `mergeModelProfileAdapterConfig`, defined at `:7461`
+2. `mergeModelProfileAdapterConfig`, defined at `:7466`
    (`export function mergeModelProfileAdapterConfig(input: {`), is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` at `:37773`
+3. The merged object becomes `executionRunConfig` at `:38336`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
 4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3290`
@@ -242,7 +242,7 @@ The chain, read at `47d01a4bf`:
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:37178`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:37737`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
@@ -1044,7 +1044,7 @@ outstanding forever. Re-verified at source on `47d01a4bf` — `AGENT_SCOPE_ONLY_
 (`server/src/services/agent-config-key-pins.ts:99`
 (`const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([`)), `withAgentScopedConfigProvenance`
 (defined `server/src/services/heartbeat.ts:3317`
-(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7471`
+(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7476`
 (`return withAgentScopedConfigProvenance(`)), `BROKERED_POD_COMPOSITION_CONFIG_KEYS`
 (`server/src/services/agent-config-key-pins.ts:272`
 (`const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([`), three keys),
