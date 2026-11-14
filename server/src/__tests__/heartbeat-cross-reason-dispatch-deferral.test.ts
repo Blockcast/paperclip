@@ -388,6 +388,31 @@ describe("describeDuplicateDispatchDeferralMiss", () => {
     expect(miss).not.toMatch(/\bowns\b/);
   });
 
+  it("does not blame the declined widening for the null-class arm being uncovered", () => {
+    // Raised by Ally on #3774 against the first cut of this helper. The
+    // widening PEN-6575 measured and declined is keyed on wake REASON. An
+    // arrival whose `wakeReason` was absent or unusable has no reason to key
+    // on, so it is uncovered WITH that widening and without it alike — the
+    // decline is not what leaves it uncovered. The conclusion was right and
+    // the attribution crossed a boundary the census did not, which is the same
+    // genus as the claim this helper exists to remove.
+    const unclassified = describeDuplicateDispatchDeferralMiss({});
+    expect(unclassified).not.toContain("measured and declined");
+    expect(unclassified).toContain("no established class");
+    // The rows stay as citations on this arm too: a reader of a cancelled run
+    // cannot reach the code comment, and they are the only address for both
+    // the census and the replacement proposal.
+    expect(unclassified).toContain("PEN-6575");
+    expect(unclassified).toContain("PEN-6625");
+
+    // Control arm. Without it this passes against a helper that dropped the
+    // attribution from BOTH arms, which would lose a true statement about the
+    // issue-local one rather than fix a false one about the null-class arm.
+    expect(describeDuplicateDispatchDeferralMiss({ wakeReason: "issue_commented" })).toContain(
+      "measured and declined",
+    );
+  });
+
   it("names no owner on ANY branch, and discriminates between them (negative control)", () => {
     // Without the second half, every assertion in this suite would also pass
     // against a helper that ignored its argument and returned one constant.

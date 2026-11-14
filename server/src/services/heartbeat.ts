@@ -2535,6 +2535,18 @@ export function contextCarriesGithubWake(
  * reader of a cancelled run cannot reach this comment, and those rows are the
  * only address for the census behind the sentence.
  *
+ * (3) The two non-github arms CITE THE SAME ROWS AND MAKE DIFFERENT CLAIMS,
+ * deliberately. The widening PEN-6575 measured and declined is keyed on wake
+ * REASON, so for a genuinely issue-local arrival the decline is a live
+ * explanation of why nothing covers it. An arrival whose `wakeReason` was
+ * absent has no reason to key on: it is uncovered WITH that widening and
+ * without it alike, so attributing its uncoveredness to the decline would
+ * transfer a measurement across a boundary the census did not cross — the
+ * same genus as the claim this function was written to remove, one
+ * magnitude down. PEN-6625 is cited on both arms because the rule it
+ * proposes is keyed on ORDERING rather than on reason, so it would reach
+ * both. Raised by Ally on #3774 and fixed in the same branch.
+ *
  * Exported and pure so both claims are pinned by EXECUTION. The surrounding
  * suite slices this file as text, and that window already had to be widened
  * once (2_000 -> 4_000) when the function grew past the cut; a short slice fails
@@ -2550,13 +2562,16 @@ export function describeDuplicateDispatchDeferralMiss(
   const arrivalClass = classifyHeartbeatWakeClass(arrivalSnapshot);
   const arrivalDescription =
     arrivalClass === null
-      ? "of no established class — its wakeReason was absent or unusable"
-      : "issue-local";
+      ? "of no established class — its wakeReason was absent or unusable. No rule keyed on a "
+        + "wake reason can reach it, so the cross-reason widening declined on PEN-6575 is not "
+        + "what leaves it uncovered; the ordering-keyed rule that would cover it is proposed "
+        + "but not adopted (PEN-6625)"
+      : "issue-local. Arrivals of that kind are uncovered by design, not by oversight: the "
+        + "cross-reason widening was measured and declined (PEN-6575), and the wider rule that "
+        + "would cover them is proposed but not adopted (PEN-6625)";
   return (
     "it defers only a GITHUB arrival against a non-github incumbent, and this arrival is "
-    + `${arrivalDescription}. Arrivals of that kind are uncovered by design, not by oversight: `
-    + "the cross-reason widening was measured and declined (PEN-6575), and the wider rule that "
-    + "would cover them is proposed but not adopted (PEN-6625)"
+    + arrivalDescription
   );
 }
 
