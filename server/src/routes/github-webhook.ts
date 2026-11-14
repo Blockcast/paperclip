@@ -3114,7 +3114,38 @@ const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
 // The PR-author wake keeps repo+pr+reason keys for everything except the
 // comment-scoped @ally request and merge-queue eviction; widening it is a
 // separate behavior change.
-const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
+//
+// PEN-5747: the two label reasons are the exception, and they are here for the
+// reason the scope doc above gives rather than as a registration. A stable
+// repo+pr+reason key is only sound for a reason whose SECOND occurrence on one
+// PR can only be a duplicate. Label events are the opposite: hold -> lift ->
+// hold is the lifecycle this signal exists to deliver, so the second cycle is
+// the payload rather than the noise.
+//
+// Left stable, the first placement's key collides with every later one, and
+// `coalesced` is in the BASE idempotent status list that a stable key is
+// checked against (idempotentWakeStatuses). `enqueueWakeup` writes a permanent
+// `coalesced` row carrying that same idempotencyKey whenever the assignee
+// already has an active execution run on the issue -- which is the EXPECTED
+// state when a human labels a PR its agent is already working. One coalesce
+// therefore drops every later placement AND every lift on that PR as
+// `duplicate_pr_author_wake`, with nothing logged at the call site. That is
+// the BLO-18953 self-poisoning shape the wakeIdempotencySuffix comments warn
+// about, reached here by a RECURRING event rather than by an `unknown`
+// identity.
+//
+// Delivery scoping is the remedy `ready_for_review` already takes in
+// REVIEWER_DELIVERY_SCOPED_WAKE_REASONS, for the same reason: a redelivery of
+// ONE placement still dedups -- request scope, so terminal statuses dedup too
+// -- while a genuinely new placement carries a new `x-github-delivery` and
+// earns its own wake. It also closes a second collision the stable key had:
+// that key carries no label name, so once the allowlist holds two entries, a
+// placement of the second label while the first's wake was still queued would
+// have deduped against it.
+const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
+  "github_pr_labeled",
+  "github_pr_unlabeled",
+]);
 
 // PEN-4114: CI-completion wake reasons, suppressed while the issue carries a
 // live deliberate park.
