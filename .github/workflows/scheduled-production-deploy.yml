@@ -146,6 +146,7 @@ on:
 permissions:
   contents: read
   actions: write # required to dispatch docker.yml, and to cancel a stale dispatch
+  checks: read # BLO-57091: read the build job's timeout annotation before retrying it
   # PEN-3315: the escalation ATTEMPTS a durable GitHub issue alongside the
   # Alertmanager push. It needed no new credential, which is why a GitHub issue
   # was chosen over any external store. Retained for repositories with Issues
@@ -421,15 +422,19 @@ jobs:
           # ordinal 0 (the hang was most likely the default ordinal 1, BLO-49674).
           # `precededByRecentDispatch` bounds it: a retry that hangs again was
           # created < 6h after the run it retried, so it is reported, not retried.
+          # `buildRetryable` scopes it to THIS dispatcher's own master run whose
+          # build TIMED OUT: a manual cancel, a human rollback (older target_sha)
+          # or a branch dispatch is reported, never replaced by a master deploy.
           # Missing/unreadable => "null" => no retry. Guard (1) still holds.
           RETRY_BUILD_CANCELLED=false
           BUILDKIT_ORDINAL=1
           if [ "$DEAD_FATE" = "build-cancelled" ] && [ "$IS_DISPATCH_SLOT" != "true" ] \
+             && [ "$(jq -r '.run.buildRetryable | tostring' "$DEAD_DISPATCH_JSON_PATH")" = "true" ] \
              && [ "$(jq -r '.run.precededByRecentDispatch | tostring' "$DEAD_DISPATCH_JSON_PATH")" = "false" ]; then
             CANCELLED_ID="$(jq -r '.run.databaseId // "unknown"' "$DEAD_DISPATCH_JSON_PATH")"
             RETRY_BUILD_CANCELLED=true
             BUILDKIT_ORDINAL=0
-            echo "::notice::Retrying the dispatch: run $CANCELLED_ID's build-and-push was cancelled or timed out before deploy, so nothing shipped. Re-dispatching once on BuildKit ordinal 0 (BLO-57091)."
+            echo "::notice::Retrying the dispatch: run $CANCELLED_ID's build-and-push timed out before deploy, so nothing shipped. Re-dispatching once on BuildKit ordinal 0 (BLO-57091)."
             {
               echo "### Retrying a dispatch whose build was cancelled"
               echo

@@ -154,8 +154,9 @@ export const DISPATCH_FATE = Object.freeze({
    * with `deploy` never executed. BLO-57091: on `workflow_dispatch` that job runs
    * with `cancel-in-progress: false`, so no push or supersede can cancel it — it
    * is a `timeout-minutes` expiry (a hung BuildKit build, run 43592047585) or a
-   * manual cancel. It used to read as `survived`, so nothing retried. Retryable:
-   * a sampling slot re-dispatches once, on the other BuildKit daemon.
+   * manual cancel. It used to read as `survived`, so nothing retried. Always
+   * REPORTED; RETRIED only when `run.buildRetryable` (see buildRetryable below) —
+   * never a human's cancel, a rollback, or a branch dispatch.
    */
   BUILD_CANCELLED: 'build-cancelled',
   /** No completed dispatch run in the window, or the window is empty. */
@@ -208,6 +209,38 @@ export const BUILD_RETRY_QUIET_MS = 6 * 3600 * 1000;
 export function buildJobCancelled(jobs) {
   const build = (jobs ?? []).find((job) => job?.name === BUILD_JOB_NAME);
   return build?.conclusion === 'cancelled' || build?.conclusion === 'timed_out';
+}
+
+/**
+ * The identity this repo's scheduled dispatcher dispatches docker.yml with
+ * (the dispatch call runs under GITHUB_TOKEN). BLO-57091: only ITS runs are retried —
+ * a human's dispatch (a rollback with an older `target_sha`, a branch build, a
+ * deliberate cancel) must never be replaced by a roll-forward to master.
+ */
+export const DISPATCHER_ACTOR = 'github-actions[bot]';
+
+/** The check-run annotation GitHub writes when a job hits `timeout-minutes`. */
+export const TIMEOUT_ANNOTATION = /exceeded the maximum execution time/i;
+
+/**
+ * BLO-57091: may a sampling slot re-dispatch this `build-cancelled` run? Only
+ * when it is the dispatcher's own master run AND the build TIMED OUT. A manual
+ * cancel carries no timeout annotation, so it is reported, never retried; an
+ * unreadable annotation list is treated the same (report-only).
+ */
+export async function buildRetryable({ client, run, jobs }) {
+  if (run?.head_branch !== DEPLOY_BRANCH) return false;
+  if (run?.actor?.login !== DISPATCHER_ACTOR) return false;
+  if (run?.triggering_actor?.login !== DISPATCHER_ACTOR) return false;
+  const build = (jobs ?? []).find((job) => job?.name === BUILD_JOB_NAME);
+  if (build?.conclusion === 'timed_out') return true;
+  if (build?.conclusion !== 'cancelled' || !build?.id) return false;
+  try {
+    const annotations = await client.request('GET', `/check-runs/${build.id}/annotations?per_page=100`);
+    return annotations.some((a) => TIMEOUT_ANNOTATION.test(a?.message ?? ''));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -431,8 +464,9 @@ export async function findLastCompletedDispatch({
     return { fate: DISPATCH_FATE.UNKNOWN, run };
   }
 
+  const fate = classifyDispatchRun(run, jobs);
   return {
-    fate: classifyDispatchRun(run, jobs),
+    fate,
     run: {
       databaseId: run.id,
       headSha: run.head_sha ?? '',
@@ -455,6 +489,9 @@ export async function findLastCompletedDispatch({
         const gap = Date.parse(run.created_at) - Date.parse(other?.created_at ?? '');
         return gap > 0 && gap < BUILD_RETRY_QUIET_MS;
       }),
+      // BLO-57091: the dispatcher's own master run whose build TIMED OUT. Only
+      // fetched for that fate; false everywhere else, which is report-only.
+      buildRetryable: fate === DISPATCH_FATE.BUILD_CANCELLED && (await buildRetryable({ client, run, jobs })),
     },
   };
 }

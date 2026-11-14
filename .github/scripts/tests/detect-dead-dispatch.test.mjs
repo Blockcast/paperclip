@@ -33,6 +33,7 @@ import {
   isDeadLane,
   MIN_INTERVAL_STEP_NAME,
   BUILD_JOB_NAME,
+  DISPATCHER_ACTOR,
 } from '../detect-dead-dispatch.mjs';
 import { laneRefilled } from '../deploy-stall-record.mjs';
 
@@ -721,4 +722,63 @@ test('BLO-57091: an unreadable created_at reads as preceded — no retry, fail-q
   const last = await findLastCompletedDispatch({ client });
   assert.equal(last.fate, DISPATCH_FATE.BUILD_CANCELLED);
   assert.equal(last.run.precededByRecentDispatch, true);
+});
+
+// ---------------------------------------------------------------------------
+// BLO-57091 (code-owner screen of paperclip#3782 @ 29502091). Only the
+// dispatcher's OWN master run whose build TIMED OUT is retryable. A manual
+// cancel, a human rollback dispatch and a branch dispatch are reported only.
+// Annotation text is verbatim from check run 132438652068 (run 43592047585).
+// ---------------------------------------------------------------------------
+const BOT = { login: DISPATCHER_ACTOR };
+const HUMAN = { login: 'kkroo' };
+const TIMEOUT_NOTE = [{ annotation_level: 'failure', message: 'The job has exceeded the maximum execution time of 1h30m0s' },
+  { annotation_level: 'failure', message: 'The operation was canceled.' }];
+const MANUAL_NOTE = [{ annotation_level: 'failure', message: 'The operation was canceled.' }];
+
+async function retryableFor({ actor = BOT, triggering = actor, branch = 'master', annotations }) {
+  const client = stubClient({
+    '/actions/workflows/': { workflow_runs: [{ id: 9, status: 'completed', conclusion: 'cancelled', head_branch: branch,
+      actor, triggering_actor: triggering, created_at: '2026-11-14T13:30:00Z' }] },
+    '/actions/runs/9/jobs': { jobs: [{ id: 77, name: 'build-and-push', conclusion: 'cancelled' }, { id: 78, name: 'deploy', conclusion: 'skipped' }] },
+    '/check-runs/77/annotations': annotations instanceof Error ? () => { throw annotations; } : annotations,
+  });
+  const last = await findLastCompletedDispatch({ client });
+  assert.equal(last.fate, DISPATCH_FATE.BUILD_CANCELLED, 'every shape here is still REPORTED');
+  return last.run.buildRetryable;
+}
+
+test('BLO-57091: replay 43592047585 — the dispatcher\'s own master run that timed out is retryable', async () => {
+  assert.equal(await retryableFor({ annotations: TIMEOUT_NOTE }), true);
+});
+
+test('BLO-57091: a manual cancel of the dispatcher\'s run is NOT retried (no timeout annotation)', async () => {
+  assert.equal(await retryableFor({ annotations: MANUAL_NOTE }), false);
+  assert.equal(await retryableFor({ annotations: [] }), false);
+});
+
+test('BLO-57091: an unreadable annotation list stays report-only', async () => {
+  assert.equal(await retryableFor({ annotations: new Error('403') }), false);
+  assert.equal(await retryableFor({ annotations: { message: 'Resource not accessible by integration' } }), false);
+});
+
+test('BLO-57091: a human rollback dispatch is NOT retried, even if its build timed out', async () => {
+  assert.equal(await retryableFor({ actor: HUMAN, annotations: TIMEOUT_NOTE }), false);
+  // A human re-running the bot's run is the human's run too.
+  assert.equal(await retryableFor({ actor: BOT, triggering: HUMAN, annotations: TIMEOUT_NOTE }), false);
+  assert.equal(await retryableFor({ actor: HUMAN, triggering: BOT, annotations: TIMEOUT_NOTE }), false);
+});
+
+test('BLO-57091: a branch dispatch is NOT retried, even by the dispatcher identity', async () => {
+  assert.equal(await retryableFor({ branch: 'feature/x', annotations: TIMEOUT_NOTE }), false);
+});
+
+test('BLO-57091: a non-build-cancelled fate never reads annotations and is never retryable', async () => {
+  const client = stubClient({
+    '/actions/workflows/': { workflow_runs: [{ id: 5, status: 'completed', conclusion: 'success', head_branch: 'master', actor: BOT, triggering_actor: BOT, created_at: '2026-11-14T13:30:00Z' }] },
+    '/actions/runs/5/jobs': { jobs: jobs(['build-and-push', 'success'], ['deploy', 'success']) },
+  });
+  const last = await findLastCompletedDispatch({ client });
+  assert.equal(last.run.buildRetryable, false);
+  assert.equal(client.calls.some((c) => c.includes('/annotations')), false);
 });
