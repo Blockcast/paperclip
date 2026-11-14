@@ -86,6 +86,45 @@
 // ONCE in the file. An ambiguous construct is left alone and reported: picking one
 // of several matches would silently re-point a security citation at the wrong one.
 //
+// SEVERITY: A STALE NUMBER IS NOT ANCHOR ROT (PEN-6674)
+//
+// Drift splits in two, and only one half is a claim this check cannot settle.
+//
+// A single-line anchor whose construct is still in the file at exactly ONE place is
+// STALE-NUMBER. The citation holds -- the construct names the code, and by the time
+// the finding is built this tool is holding the correct line in a variable. It is
+// reported on every run, with that line, and it is never fatal. Everything else --
+// the construct GONE from the file, several candidate sites, or a RANGE whose extent
+// cannot be re-derived -- stays DRIFTED and stays fatal. That is the rot the check was
+// built for, and it is exactly the set `--fix` refuses to touch.
+//
+// Failing the stale-number half was unsatisfiable in the merge queue, not merely
+// strict. The correct number is a function of the WHOLE merge group, so no entry can
+// carry it: it is fixed against the tree the author had and wrong against the tree the
+// queue builds. Measured 2026-11-14 on Blockcast/paperclip -- #3715 evicted
+// `merge_conflict` three times (10:50:36Z attributed first-party to this document),
+// #3476 at 10:25:33Z with ours :38414 / theirs :38336 / correct :38440, a number
+// neither side held; #3774 red in 3s on 8 anchors; #3760 clean -> conflicting on the
+// single event of #3751 merging. Every eviction cost one human enqueue act that no
+// agent seat may replace.
+//
+// Both failure modes come from the same root -- the fix is a WRITE to a shared
+// document -- so making the gate demand it made every concurrent editor of a hot
+// source file pairwise-conflicting:
+//
+//   1. Two PRs that each move a cited construct must each rewrite the same doc lines
+//      to DIFFERENT numbers, because each computes against a tree carrying only its
+//      own insertions. They conflict textually and the queue evicts on staging.
+//   2. An entry whose numbers are right against its own base is wrong against the
+//      merge-group head, which carries the entries queued ahead of it. `changed`
+//      holds the cited file, so case 1 of attributeInherited makes it fatal and the
+//      entry is ejected having done nothing wrong.
+//
+// Neither is reachable once the number is not load-bearing: nothing forces the write,
+// so there is nothing to conflict on and nothing to be stale at a tree the author
+// could not see. Nothing about ROT is relaxed -- a construct that stops resolving
+// still fails, which is the assertion this module exists to make.
+//
 // Exit 0 clean, 1 anchors need attention, 2 cannot judge.
 
 import { readFileSync, writeFileSync, existsSync, globSync, realpathSync } from "node:fs";
@@ -179,6 +218,12 @@ export function locateConstruct(sourceLines, construct) {
   return hits;
 }
 
+// The repairable half of drift: a single-line anchor whose construct is still in the
+// file at exactly one place. One predicate, read by both the status assignment and
+// --fix, so the class that is never fatal and the class the tool can rewrite with no
+// judgement in it cannot drift apart. Widening this widens what `--fix` will rewrite.
+export const isRenumberable = (f) => f.lo === f.hi && f.actual?.length === 1;
+
 export function checkDocument({ docPath, docText, readSource }) {
   const findings = [];
 
@@ -261,25 +306,27 @@ export function checkDocument({ docPath, docText, readSource }) {
       findings.push({ ...base, status: ambiguous ? "ambiguous" : "ok", file, construct, sites });
       return;
     }
+    const actual = locateConstruct(sourceLines, construct);
     findings.push({
       ...base,
-      status: "drifted",
+      status: isRenumberable({ lo: anchor.lo, hi: anchor.hi, actual })
+        ? "stale-number"
+        : "drifted",
       file,
       construct,
-      actual: locateConstruct(sourceLines, construct),
+      actual,
     });
   });
 
   return findings;
 }
 
-// Rewrite drifted anchors whose construct occurs exactly once. Single-line anchors
-// only: relocating a RANGE means re-deriving its extent, which is a judgement about
-// what the citation covers and not something to guess.
+// Rewrite the stale-number findings -- isRenumberable, i.e. a single-line anchor whose
+// construct occurs exactly once. Relocating a RANGE means re-deriving its extent, which
+// is a judgement about what the citation covers and not something to guess, so a drifted
+// range is reported and left alone. This set is exactly the set that is never fatal.
 export function applyFixes(docText, findings) {
-  const fixable = findings.filter(
-    (f) => f.status === "drifted" && f.lo === f.hi && f.actual?.length === 1,
-  );
+  const fixable = findings.filter((f) => f.status === "stale-number");
   if (fixable.length === 0) return { text: docText, fixed: [] };
 
   let text = docText;
@@ -408,6 +455,7 @@ export function applyUnverified(findings, manifest, scannedDocs) {
 function report(findings, { quiet, stale = [], inheritedStale = [] }) {
   const count = (s) => findings.filter((f) => f.status === s).length;
   const failing = findings.filter((f) => FAILING.has(f.status));
+  const staleNumbers = findings.filter((f) => f.status === "stale-number");
   const failures = failing.filter((f) => !f.inherited);
   const inherited = failing.filter((f) => f.inherited && !f.driftedSinceBase);
   const driftedSinceBase = failing.filter((f) => f.inherited && f.driftedSinceBase);
@@ -415,12 +463,21 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
   for (const key of stale) {
     const [doc, anchor, construct] = key.split("\t");
     console.error(`STALE MANIFEST ENTRY  ${doc}  \`${anchor}\` (\`${construct}\`)`);
-    console.error(`         this anchor now resolves, or no longer exists. Remove the entry.`);
+    console.error(
+      `         this anchor now resolves, carries only a stale number, or no longer ` +
+        `exists. Remove the entry.`,
+    );
   }
 
   const explain = (f, prefix) => {
     const where = `${f.docPath}:${f.docLine}`;
-    if (f.status === "drifted") {
+    if (f.status === "stale-number") {
+      console.error(`${prefix}STALE NUMBER  ${where}  \`${f.anchor}\` -> ${f.file}`);
+      console.error(
+        `         construct \`${f.construct}\` is now at :${f.actual[0]}; the citation ` +
+          `holds and only the cached number moved`,
+      );
+    } else if (f.status === "drifted") {
       const actual = f.actual.length === 0
         ? "the construct is no longer in the file at all"
         : `now at ${f.actual.map((n) => `:${n}`).join(", ")}`;
@@ -473,6 +530,18 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
     }
   }
 
+  // Reported on every run and never fatal -- see the SEVERITY block at the top. The
+  // current line is printed beside each one, so the report carries the answer whether
+  // or not anyone runs --fix, and the count below keeps the number from quietly
+  // growing behind an unqualified `resolved`.
+  if (staleNumbers.length > 0) {
+    console.error(
+      `STALE LINE NUMBERS (the construct still resolves, uniquely, so the citation ` +
+        `holds -- reported, NOT fatal; ${FIX_HINT}):`,
+    );
+    for (const f of staleNumbers) explain(f, "  ");
+  }
+
   if (!quiet) {
     const externals = findings.filter((f) => f.status === "external");
     for (const f of externals) {
@@ -485,6 +554,7 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
     console.log(
       `anchors: ${findings.length} total, ${count("ok")} resolved` +
         (loose > 0 ? ` (${loose} on a construct with several sites)` : "") +
+        (staleNumbers.length > 0 ? `, ${staleNumbers.length} with a stale number` : "") +
         `, ${failures.length} need attention` +
         (inherited.length > 0 ? `, ${inherited.length} inherited from the base` : "") +
         (driftedSinceBase.length > 0
