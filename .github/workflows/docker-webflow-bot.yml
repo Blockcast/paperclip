@@ -174,6 +174,27 @@ jobs:
             type=raw,value=buildcache-inline,enable=${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
 
       - name: Build and push
+        # PEN-6683. STRICTLY BELOW the job's `timeout-minutes: 30`, so an
+        # overrun here concludes `failure` ON THE STEP instead of `cancelled`
+        # on the job. That distinction is the whole point: this job's own
+        # `cancel-in-progress: true` produces `cancelled` on every routine
+        # supersede, so a ceiling kill recorded that way is indistinguishable
+        # from one, and the alert arm below would have to guess.
+        #
+        # Sized off the SUCCESSFUL population, never the killed runs, because a
+        # kill's elapsed time measures the CEILING and not the build. Measured
+        # first-party against the Actions API on 2026-11-14 over all 58 runs
+        # this workflow has ever had: 9 builds of `build-and-push` succeeded.
+        # Six retain step detail -- 6.07 min (run #7), 4.85 (#2), 2.82 (#79),
+        # 0.58 (#84), 0.50 (#3), 0.18 (#5) -- and three are old enough that
+        # GitHub has aged their step array out, so their JOB durations bound the
+        # step from above at 12.03 (#39), 1.10 (#13) and 0.97 (#43).
+        #
+        # 12.03 min is therefore an UPPER BOUND on the longest build that has
+        # ever completed here: the step is strictly shorter than the job that
+        # contains it. 20 clears that bound by 66% and still leaves 10 min of
+        # headroom under the ceiling.
+        timeout-minutes: 20
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -197,3 +218,96 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.base.name=${{ steps.base.outputs.image }}
+
+  # PEN-6683. A `master` push that publishes no image must reach somebody.
+  #
+  # This lane was ceiling-killed on a master PUSH and told nobody: run #81
+  # (2026-11-14T14:53:16Z) ran 30.08 min against its own 30-minute ceiling,
+  # with the build step alone at 29.77 min, on runner scale set
+  # `arc-paperclip-buildkit-n7zlf`. It published nothing and was recorded
+  # `cancelled`, not `failure` -- the gap PEN-6034 named.
+  #
+  # It is load-bearing for a second lane: docker-figma-bot.yml builds FROM
+  # `harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:latest`, and both
+  # were killed at the same master push that day.
+  #
+  # Nothing else covers this lane, checked rather than assumed on 2026-11-14:
+  # `master-health.yml` censuses runs filtered on
+  # `.path == ".github/workflows/pr.yml"` and so cannot see a `docker-*` run;
+  # `scheduled_workflow_last_verdict_failed` carries no `docker-*` series and
+  # keys on the CRON verdict, so it cannot see a push build; and this workflow
+  # has no outcome job of its own.
+  #
+  # Same shape as docker-mcp-external.yml, docker-mcp-gateway.yml and
+  # docker-agent.yml: a separate job, firing on `failure` OR `cancelled`, routed
+  # to Alertmanager (NOT GitHub Issues, which are disabled on this repo -
+  # BLO-33382) and fanned to the paperclip-plugin-alertmanager webhook, which
+  # dedupes on the alert fingerprint and refreshes one issue in place.
+  alert-on-failure:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled')
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    # actions: read + checks: read are what let the script tell a timeout kill
+    # from a concurrency supersede and from a human cancel. All three report
+    # `cancelled`; only the annotations separate them, and without these scopes
+    # every cancellation classifies `unknown` and pages (fail-closed, but
+    # uselessly noisy - and a noisy alert gets muted, which is the silence this
+    # row exists to end).
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Report the unpublished image to Alertmanager
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: firing
+          GH_REPO: ${{ github.repository }}
+          # Collapsed to a single value for tags so the label set stays bounded:
+          # the fingerprint hashes every label, and one identity per tag would
+          # fragment the alert the bridge dedupes on (BLO-28616).
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-webflow-bot-image-alert.mjs
+
+  # The other half of an honest alert: without it `endsAt` is the only thing
+  # retiring the firing alert, so the lane goes quiet on a TIMER rather than on
+  # a fix. Pushing the identical label set with a past `endsAt` makes
+  # Alertmanager send `resolved`, which cancels the issue.
+  #
+  # It is also the continuous capability probe. This lane is sparse - 9
+  # successful builds across the 58 runs it has ever had - so a channel that
+  # rotted here would otherwise be discovered by the next outage. Every green
+  # build exercises the exact delivery path the failure path depends on.
+  #
+  # A separate job rather than a step inside build-and-push, deliberately: a
+  # delivery failure here must not flip `build-and-push.result` to `failure`
+  # and fire a spurious "the build is failing" alert about itself.
+  resolve-on-success:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      needs.build-and-push.result == 'success'
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Resolve the image-delivery alert (and prove the channel still works)
+        env:
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: resolved
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-webflow-bot-image-alert.mjs
