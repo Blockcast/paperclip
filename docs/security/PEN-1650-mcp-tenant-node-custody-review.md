@@ -172,6 +172,14 @@ Results:
 
 ## Disposition
 
-PEN-1650 remains blocked on `PEN-1656`, `PEN-1657`, `PEN-1658`, `PEN-1659`, `PEN-1660`, and `PEN-1661`, plus publication of the node-worker implementation PR.
+As of this review (2026-07-15), PEN-1650 was blocked on `PEN-1656`, `PEN-1657`, `PEN-1658`, `PEN-1659`, `PEN-1660`, and `PEN-1661`, plus publication of the node-worker implementation PR.
 
 Security Engineering must re-review the final immutable gateway and node heads and the MCP-specific two-tenant conformance output. No merge or production enablement of tenant credential-bearing MCP routes is approved before that re-review passes.
+
+### Status since this review - not part of the 2026-07-15 verdict
+
+Recorded 2026-11-14. The verdict, acceptance table and disposition above are the review as it stood on 2026-07-15 and are not amended by this note.
+
+All six tracking issues named above have since closed `done`: `PEN-1656` 2026-07-19, `PEN-1657` 2026-07-16, `PEN-1658` 2026-07-23, `PEN-1659` 2026-07-17, `PEN-1660` 2026-07-17, `PEN-1661` 2026-07-17. The gate issue `PEN-1650` itself closed `done` 2026-07-23.
+
+That is a statement about those tracking issues only. It is not an attestation that the re-review required in the paragraph above was performed, and this document records no such re-review.
