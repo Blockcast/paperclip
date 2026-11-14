@@ -133,8 +133,23 @@ branch this record describes. `--fix` never relocates a range either — re-deri
 is a judgement about what the citation covers — so the unique construct is the only thing that
 will catch the next drift.
 
-When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix` — it rewrites any
-anchor whose construct it can place unambiguously, and reports the rest rather than guessing.
+When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix --base origin/master`
+— it rewrites any anchor whose construct it can place unambiguously, and reports the rest
+rather than guessing.
+
+**`--base` is required, and it is what keeps the remedy from widening your diff** (PEN-6680).
+`--fix` rewrites only the numbers your own change made stale: one citing a source file you
+moved, or one in a document you are already editing. Everything else is the base's drift, and
+rewriting it writes a shared line in a document you never opened — which manufactures exactly
+the pairwise conflict PEN-6674 removed the mandate for, arrived at voluntarily. Measured on
+#3774: a `--fix` run also renumbered a `Dockerfile` anchor, from line 674 to line 705, in an
+unrelated security document, over drift the same run's own report had scored as the base's.
+(Written out in prose on purpose — an anchor quoted as an EXAMPLE inside a code span is
+indistinguishable from one meant as a citation, and this check has no quotation register, so
+the illustration becomes a live claim that then has to be maintained.) A bare `--fix`
+with no base now refuses rather than guessing wide. `--fix-all` is the wide mode and is named
+so that taking it is a decision — it is safe for a single writer on `master` and not for a
+pull request.
 
 **A stale number does not fail your pull request either, and you are not expected to run `--fix`
 before landing** (PEN-6674). Where the construct is still in the file at exactly one place, the
