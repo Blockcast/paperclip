@@ -629,6 +629,18 @@ jobs:
         run: node --test ./scripts/check-mcp-external-image-alert-channel.test.js
         timeout-minutes: 1
 
+      # PEN-6683: the last of the seven image lanes to get an arm, and the
+      # quietest -- which is the argument FOR covering it. `build-and-push` has
+      # failed on a master push three times in this lane's life (#4, #3, #2)
+      # and none reached anybody. Those were `failure`; its siblings
+      # webflow-bot #81 and figma-bot #98 showed the `cancelled` shape on
+      # 2026-11-14 with the identical ceiling and concurrency, so the arm
+      # covers both.
+      - name: Validate designer image alert channel and timeout budgets (PEN-6683)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-designer-image-alert-channel.test.js
+        timeout-minutes: 1
+
       # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
       # approval holds a lock until its rollout lands, so a deploy dying between
       # the approval step and `helm upgrade` strands a lock nothing can clear
