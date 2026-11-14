@@ -56,6 +56,64 @@ function jsonResponse(data: unknown, ok = true, status = 200, headers: Record<st
 
 const FUTURE_ISO = "2999-01-01T00:00:00Z";
 
+/**
+ * PEN-6341 item 2: model GitHub's GraphQL `reviews` connection from the
+ * REST-shaped rows these fixtures are written in.
+ *
+ * The translation lives in ONE audited place because it is not cosmetic. A Bot
+ * actor's `login` is the BARE slug over GraphQL where REST returns
+ * `<slug>[bot]` -- measured first-party on Blockcast/paperclip#3694 on
+ * 2026-11-13, where REST `merged_by.login` read `allyblockcast[bot]` against
+ * GraphQL `mergedBy.login` `allyblockcast`, every other field agreeing. So this
+ * helper STRIPS the suffix on the way out and tags `__typename: "Bot"`, and an
+ * assertion that expects `allyblockcast[bot]` BACK is therefore testing the
+ * reader's re-attachment rather than echoing its own fixture.
+ */
+function graphQlReviewsEnvelope(
+  restRows: unknown[],
+  opts: { hasNextPage?: boolean; endCursor?: string | null } = {},
+): unknown {
+  const nodes = restRows.map((row) => {
+    const r = row as {
+      user?: { login?: string | null } | null;
+      body?: string | null;
+      state?: string | null;
+      commit_id?: string | null;
+      submitted_at?: string | null;
+    };
+    const login = r.user?.login ?? null;
+    const isBot = typeof login === "string" && login.endsWith("[bot]");
+    return {
+      state: r.state ?? null,
+      body: r.body ?? null,
+      submittedAt: r.submitted_at ?? null,
+      author:
+        typeof login === "string"
+          ? { login: isBot ? login.slice(0, -"[bot]".length) : login, __typename: isBot ? "Bot" : "User" }
+          : null,
+      commit: typeof r.commit_id === "string" ? { oid: r.commit_id } : null,
+    };
+  });
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          reviews: {
+            pageInfo: { hasNextPage: opts.hasNextPage ?? false, endCursor: opts.endCursor ?? null },
+            nodes,
+          },
+        },
+      },
+    },
+  };
+}
+
+/** True when this GraphQL POST is the reviews pager rather than a field read. */
+function isReviewsQuery(init?: unknown): boolean {
+  const body = (init as { body?: unknown } | undefined)?.body;
+  return typeof body === "string" && body.includes("reviews(first:");
+}
+
 function setCreds() {
   h.cfg.githubAppId = "3966421";
   h.cfg.githubAppInstallationId = "12345678";
@@ -1152,6 +1210,10 @@ describe("githubHasReviewerEvidenceForPr", () => {
 
   function stubGithub(routes: {
     reviews?: unknown[];
+    /** A hand-written GraphQL envelope, for the shapes `reviews` cannot express. */
+    reviewsEnvelope?: unknown;
+    /** Every reviews page reports another one, to exercise the page cap. */
+    reviewsAlwaysMore?: boolean;
     reviewsStatus?: number;
     reviewsBody?: unknown;
     reviewsHeaders?: Record<string, string>;
@@ -1161,7 +1223,7 @@ describe("githubHasReviewerEvidenceForPr", () => {
   }) {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: string | URL) => {
+      vi.fn(async (url: string | URL, init?: unknown) => {
         const u = String(url);
         if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
         if (u.includes("/compare/")) {
@@ -1169,22 +1231,27 @@ describe("githubHasReviewerEvidenceForPr", () => {
           const status = routes.compares?.[segment];
           return status ? jsonResponse({ status }) : jsonResponse({}, false, 404);
         }
-        if (u.includes("/pulls/") && u.includes("/reviews")) {
-          if (routes.reviewsStatus && routes.reviewsStatus >= 400) {
+        // PEN-6341 item 2: the reviews pager is GraphQL now, alongside the
+        // pull-request FIELD read the previous slice moved. Both arrive on
+        // `/graphql` and are told apart by the document, not the URL.
+        if (u.endsWith("/graphql")) {
+          if (isReviewsQuery(init)) {
+            if (routes.reviewsEnvelope !== undefined) return jsonResponse(routes.reviewsEnvelope);
+            if (routes.reviewsStatus && routes.reviewsStatus >= 400) {
+              return jsonResponse(
+                routes.reviewsBody ?? {},
+                false,
+                routes.reviewsStatus,
+                routes.reviewsHeaders,
+              );
+            }
             return jsonResponse(
-              routes.reviewsBody ?? [],
-              false,
-              routes.reviewsStatus,
-              routes.reviewsHeaders,
+              graphQlReviewsEnvelope(routes.reviews ?? [], {
+                hasNextPage: routes.reviewsAlwaysMore === true,
+                endCursor: routes.reviewsAlwaysMore === true ? "cursor" : null,
+              }),
             );
           }
-          return jsonResponse(routes.reviews ?? []);
-        }
-        // PEN-6341: only the pull-request FIELD read moved to GraphQL. The
-        // reviews pagination above is still REST and is deliberately untouched
-        // by this change -- `commit_id`/`submitted_at` carry their own
-        // semantics and get their own migration.
-        if (u.endsWith("/graphql")) {
           return jsonResponse({
             data: { repository: { pullRequest: { headRefOid: routes.prHead ?? null } } },
           });
@@ -1652,7 +1719,16 @@ describe("githubHasReviewerEvidenceForPr", () => {
     });
   });
 
-  it("classifies rate-limited review fetches distinctly so callers can retry", async () => {
+  // PEN-6341 item 2 narrowed this, deliberately and with nothing load-bearing
+  // behind it. The REST pager told a rate-limited 403 from any other 403 by
+  // reading the response headers; `ghGraphQlQuery` does not hand back the
+  // `Response`, so a rate limit now records `reviews_http_403`. Nothing
+  // consumed the distinction: the REST path computed a `retryable` flag beside
+  // the reason and `listReviewerSurface` DISCARDED it, returning only
+  // `{ error: reason }`, and every caller of this predicate fails closed on ANY
+  // `{error}`. What is still asserted is the part that matters -- a refused
+  // read is an error, never a `{found:false}` that reads as "nobody reviewed".
+  it("reports a rate-limited review fetch as an error rather than a negative", async () => {
     setCreds();
     stubGithub({
       reviewsStatus: 403,
@@ -1660,7 +1736,7 @@ describe("githubHasReviewerEvidenceForPr", () => {
       reviewsHeaders: { "retry-after": "30" },
     });
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha })).resolves.toEqual({
-      error: "reviews_rate_limited",
+      error: "reviews_http_403",
     });
   });
 
@@ -1758,15 +1834,65 @@ describe("githubHasReviewerEvidenceForPr", () => {
     // status — reproducing BLO-28920, gated on thread length instead of state.
     it("(f) errors rather than reporting a truncated negative when reviews paginate past the cap", async () => {
       setCreds();
-      const fullPage = Array.from({ length: 100 }, () => ({
-        user: { login: "someone-else" },
-        commit_id: AMT_STALE_HEAD,
-        state: "COMMENTED",
-      }));
-      stubGithub({ reviews: fullPage, comments: [] });
+      // GraphQL reports another page through `pageInfo.hasNextPage` rather than
+      // by returning a full one, so the cap is exercised by a connection that
+      // never says it is finished.
+      stubGithub({
+        reviews: [{ user: { login: "someone-else" }, commit_id: AMT_STALE_HEAD, state: "COMMENTED" }],
+        reviewsAlwaysMore: true,
+        comments: [],
+      });
       await expect(
         githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
       ).resolves.toEqual({ error: "reviews_pagination_exhausted" });
+    });
+
+    // (f3)-(f5) PEN-6341 item 2. The GraphQL pager has three ways to hand back
+    // nothing that are NOT "this pull request has no reviews", and every one of
+    // them must reach the caller as `{error}`. An `{found:false}` here is the
+    // BLO-28920 shape again: it reads as "the reviewer never finished" and
+    // re-raises `pr_review_output_missing` on a PR that may well be reviewed.
+    // Each was confirmed reachable by inverting the production branch and
+    // watching exactly these tests red.
+    it("(f3) errors when the pull request node is absent rather than reporting no reviews", async () => {
+      setCreds();
+      stubGithub({
+        reviewsEnvelope: { data: { repository: { pullRequest: null } } },
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_pull_request_absent" });
+    });
+
+    it("(f4) errors when the connection carries no node array", async () => {
+      setCreds();
+      stubGithub({
+        reviewsEnvelope: {
+          data: { repository: { pullRequest: { reviews: { pageInfo: { hasNextPage: false }, nodes: null } } } },
+        },
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_payload_malformed" });
+    });
+
+    it("(f5) errors when another page is promised but no cursor can reach it", async () => {
+      setCreds();
+      stubGithub({
+        reviewsEnvelope: {
+          data: {
+            repository: {
+              pullRequest: { reviews: { pageInfo: { hasNextPage: true, endCursor: null }, nodes: [] } },
+            },
+          },
+        },
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_cursor_missing" });
     });
 
     it("(f2) errors rather than reporting a truncated negative when comments paginate past the cap", async () => {
@@ -2118,7 +2244,7 @@ describe("githubListPrReviewsWithTimestamps", () => {
         if (String(url).includes("/access_tokens")) {
           return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
         }
-        return jsonResponse(reviews);
+        return jsonResponse(graphQlReviewsEnvelope(reviews));
       }),
     );
   }
@@ -2192,20 +2318,20 @@ describe("githubListReviewerSurfacesAtPr", () => {
   }) {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: string | URL) => {
+      vi.fn(async (url: string | URL, init?: unknown) => {
         const u = String(url);
         if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-        if (u.includes("/reviews")) {
+        if (u.endsWith("/graphql") && isReviewsQuery(init)) {
           if (routes.throwOn === "reviews") throw new Error("socket hang up");
-          if (routes.reviewsStatus) return jsonResponse([], false, routes.reviewsStatus);
-          return jsonResponse(routes.reviews ?? []);
+          if (routes.reviewsStatus) return jsonResponse({}, false, routes.reviewsStatus);
+          return jsonResponse(graphQlReviewsEnvelope(routes.reviews ?? []));
         }
         if (u.includes("/issues/") && u.includes("/comments")) {
           if (routes.throwOn === "comments") throw new Error("socket hang up");
           if (routes.commentsStatus) return jsonResponse([], false, routes.commentsStatus);
           return jsonResponse(routes.comments ?? []);
         }
-        if (u.includes("/pulls/")) return jsonResponse({ head: { sha: head } });
+        if (u.includes("/pulls/")) throw new Error(`REST pull-request read regressed: ${u}`);
         throw new Error(`unexpected url ${u}`);
       }),
     );
@@ -2298,15 +2424,17 @@ describe("githubHasReviewerEvidenceForPr after delegating to the shared grammar"
   function stub(routes: { reviews?: unknown[]; comments?: unknown[]; commentsStatus?: number }) {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: string | URL) => {
+      vi.fn(async (url: string | URL, init?: unknown) => {
         const u = String(url);
         if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-        if (u.includes("/reviews")) return jsonResponse(routes.reviews ?? []);
+        if (u.endsWith("/graphql") && isReviewsQuery(init)) {
+          return jsonResponse(graphQlReviewsEnvelope(routes.reviews ?? []));
+        }
         if (u.includes("/issues/") && u.includes("/comments")) {
           if (routes.commentsStatus) return jsonResponse([], false, routes.commentsStatus);
           return jsonResponse(routes.comments ?? []);
         }
-        if (u.includes("/pulls/")) return jsonResponse({ head: { sha: head } });
+        if (u.includes("/pulls/")) throw new Error(`REST pull-request read regressed: ${u}`);
         throw new Error(`unexpected url ${u}`);
       }),
     );
@@ -2331,11 +2459,13 @@ describe("githubHasReviewerEvidenceForPr after delegating to the shared grammar"
 
   it("does not fetch the comments surface when a review already matched", async () => {
     setCreds();
-    const fetchMock = vi.fn(async (url: string | URL) => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: unknown) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-      if (u.includes("/reviews")) {
-        return jsonResponse([{ user: { login: "allyblockcast[bot]" }, commit_id: head, state: "COMMENTED" }]);
+      if (u.endsWith("/graphql") && isReviewsQuery(init)) {
+        return jsonResponse(
+          graphQlReviewsEnvelope([{ user: { login: "allyblockcast[bot]" }, commit_id: head, state: "COMMENTED" }]),
+        );
       }
       throw new Error(`unexpected url ${u}`);
     });

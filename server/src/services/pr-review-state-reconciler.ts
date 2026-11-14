@@ -42,7 +42,7 @@
 import { and, eq, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueWorkProducts, pullRequestReviewState } from "@paperclipai/db";
-import { getInstallationTokenResult } from "./github-app-auth.js";
+import { getInstallationTokenResult, ghGraphQlPullRequestReviews } from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   emptyGateRedriveResult,
@@ -267,38 +267,30 @@ export async function fetchPullRequestReviews(input: {
   prNumber: number;
   token: string;
 }): Promise<Array<{ authorLogin: string | null; submittedAt: string; state: string }> | null> {
-  const apiBase = gitHubApiBase(GITHUB_HOST);
-  const headers = githubHeaders(input.token);
+  // PEN-6341 item 2: GraphQL, through the reader shared with the two
+  // `github-app-auth.ts` consumers of this route. `null` still means
+  // "unreadable" and is carried through as `reviewsReadable: false` rather
+  // than coerced to `[]`, which this module refuses everywhere else.
+  const result = await ghGraphQlPullRequestReviews({
+    token: input.token,
+    repoFullName: input.repoFullName,
+    prNumber: input.prNumber,
+    maxPages: MAX_TIMELINE_PAGES,
+  });
+  if (!result.ok) return null;
+
   const reviews: Array<{ authorLogin: string | null; submittedAt: string; state: string }> = [];
-  try {
-    for (let page = 1; page <= MAX_TIMELINE_PAGES; page += 1) {
-      const url = `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/reviews?per_page=100&page=${page}`;
-      const response = await ghFetch(url, { headers });
-      if (!response.ok) return null;
-      const payload = await response.json();
-      if (!Array.isArray(payload)) return null;
-      const batch = payload as Array<{
-        user?: { login?: string | null } | null;
-        state?: string | null;
-        submitted_at?: string | null;
-      }>;
-      for (const review of batch) {
-        // No `submitted_at` means an unsubmitted PENDING draft review. Skipping
-        // it is correct rather than lossy — it is not a review anyone has given.
-        if (typeof review.submitted_at !== "string") continue;
-        reviews.push({
-          authorLogin: review.user?.login ?? null,
-          submittedAt: review.submitted_at,
-          state: (review.state ?? "").toUpperCase(),
-        });
-      }
-      if (batch.length < 100) return reviews;
-      if (page === MAX_TIMELINE_PAGES) return null;
-    }
-    return reviews;
-  } catch {
-    return null;
+  for (const review of result.reviews) {
+    // No `submittedAt` means an unsubmitted PENDING draft review. Skipping it
+    // is correct rather than lossy -- it is not a review anyone has given.
+    if (review.submittedAt === null) continue;
+    reviews.push({
+      authorLogin: review.login,
+      submittedAt: review.submittedAt,
+      state: review.state,
+    });
   }
+  return reviews;
 }
 
 /**
