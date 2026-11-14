@@ -1878,6 +1878,58 @@ describe("githubHasReviewerEvidenceForPr", () => {
       ).resolves.toEqual({ error: "reviews_payload_malformed" });
     });
 
+    // PEN-6341 item 2 (deferred nit, `#3768`). An unknown PR number answers
+    // HTTP 200 with an `errors` entry, so it never reaches the `http_*` arms;
+    // `ghGraphQlQuery` folds every entry into one `graphql_errors` reason. An
+    // all-`NOT_FOUND` set is the one shape that means what REST's 404 meant.
+    it("(f6) names an all-NOT_FOUND error set rather than folding it into graphql_errors", async () => {
+      setCreds();
+      stubGithub({
+        reviewsEnvelope: {
+          data: null,
+          errors: [{ type: "NOT_FOUND", message: "Could not resolve to a PullRequest with the number of 1." }],
+        },
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_not_found" });
+    });
+
+    it("(f7) does NOT name a MIXED error set, where NOT_FOUND is only part of the story", async () => {
+      // A FORBIDDEN field alongside it means the repository may well exist and
+      // simply not be fully readable. Calling that `not_found` would be a
+      // confident claim built out of a partial one.
+      setCreds();
+      stubGithub({
+        reviewsEnvelope: {
+          data: null,
+          errors: [{ type: "NOT_FOUND", message: "nope" }, { type: "FORBIDDEN", message: "nope" }],
+        },
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_graphql_errors" });
+    });
+
+    it("(f8) does NOT name a set carrying a type it could not read", async () => {
+      // `ghGraphQlQuery` keeps a `null` for a row with no readable `type` —
+      // GitHub's query-timeout error is one — and "a type we could not read"
+      // is not "no such pull request". This is the positive-assertion arm.
+      setCreds();
+      stubGithub({
+        reviewsEnvelope: {
+          data: null,
+          errors: [{ type: "NOT_FOUND", message: "nope" }, { message: "timed out" }],
+        },
+        comments: [],
+      });
+      await expect(
+        githubHasReviewerEvidenceForPr({ repoFullName: AMT_REPO, prNumber: AMT_PR, headSha: AMT_HEAD }),
+      ).resolves.toEqual({ error: "reviews_graphql_errors" });
+    });
+
     it("(f5) errors when another page is promised but no cursor can reach it", async () => {
       setCreds();
       stubGithub({

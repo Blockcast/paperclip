@@ -1095,6 +1095,11 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       latestStatuses: [],
       reviewsStatus: 403,
       reviewsBody: { message: "You have exceeded a secondary rate limit" },
+      // PEN-6341 item 2 (deferred nit, `#3768`): DELIBERATELY INERT. This is
+      // what GitHub really sends, so it is kept for realism -- but the GraphQL
+      // reader never sees response headers, so this header is NOT what makes
+      // this test pass and removing it changes nothing. The retryability below
+      // comes from the default in `classifyReviewerEvidenceError`.
       reviewsHeaders: { "retry-after": "60" },
     });
 

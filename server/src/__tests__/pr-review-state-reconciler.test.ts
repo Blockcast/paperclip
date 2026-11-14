@@ -79,6 +79,69 @@ function graphQlVariables(init?: unknown): Record<string, unknown> {
   }
 }
 
+/**
+ * PEN-6341 item 2: the open-PR enumeration is GraphQL now too, so it arrives as
+ * a POST to `/graphql` and pages by CURSOR rather than by `&page=N`. Told apart
+ * from the reviews document by its own field name.
+ */
+function isPullRequestsQuery(init?: unknown): boolean {
+  const body = (init as { body?: unknown } | undefined)?.body;
+  return typeof body === "string" && body.includes("pullRequests(");
+}
+
+/**
+ * Rows stay REST-shaped for legibility and are translated here -- including
+ * GitHub's bare-slug rule for a Bot actor, which is exactly what the reader
+ * under test has to put back. A fixture emitting `allyblockcast[bot]` directly
+ * would make the assertion a tautology about itself rather than a test of the
+ * re-attachment.
+ */
+function graphQlPullRequestsEnvelope(
+  rows: unknown[],
+  hasNextPage: boolean,
+  endCursor: string | null,
+): unknown {
+  return {
+    data: {
+      repository: {
+        pullRequests: {
+          pageInfo: { hasNextPage, endCursor },
+          nodes: rows.map((row) => {
+            const r = row as {
+              number?: unknown;
+              title?: unknown;
+              html_url?: unknown;
+              draft?: unknown;
+              created_at?: unknown;
+              user?: { login?: string | null } | null;
+              head?: { sha?: string | null } | null;
+            };
+            const login = r.user?.login ?? null;
+            const isBot = typeof login === "string" && login.endsWith("[bot]");
+            return {
+              number: r.number ?? null,
+              title: r.title ?? null,
+              url: r.html_url ?? null,
+              isDraft: r.draft === true,
+              createdAt: r.created_at ?? null,
+              state: "OPEN",
+              mergedAt: null,
+              headRefName: null,
+              headRefOid: r.head?.sha ?? null,
+              headRepositoryOwner: { login: "Blockcast" },
+              mergeCommit: null,
+              author:
+                typeof login === "string"
+                  ? { login: isBot ? login.slice(0, -"[bot]".length) : login, __typename: isBot ? "Bot" : "User" }
+                  : null,
+            };
+          }),
+        },
+      },
+    },
+  };
+}
+
 function graphQlReviewsEnvelope(rows: unknown[]): unknown {
   return {
     data: {
@@ -136,14 +199,22 @@ function routeGithub(handlers: {
       const result = handlers.timeline?.(prNumber);
       return result === null ? jsonResponse(null, false) : jsonResponse(result ?? []);
     }
-    // Open-PR list page.
-    const pageMatch = /[?&]page=(\d+)/.exec(url);
-    const page = pageMatch ? Number(pageMatch[1]) : 1;
-    const pages = handlers.openPrPages ?? [[]];
-    const body = pages[page - 1];
-    if (body === undefined) return jsonResponse([]);
-    if (body === null) return jsonResponse(null, false);
-    return jsonResponse(body);
+    // Open-PR enumeration. Cursor-paged: the reader sends `cursor: null` for
+    // the first page and whatever `endCursor` it was handed thereafter, so the
+    // page INDEX is carried in the cursor rather than in a query parameter.
+    if (url.endsWith("/graphql") && isPullRequestsQuery(init)) {
+      const rawCursor = graphQlVariables(init).cursor;
+      const index = typeof rawCursor === "string" ? Number(rawCursor) : 0;
+      const pages = handlers.openPrPages ?? [[]];
+      const body = pages[index];
+      if (body === undefined) return jsonResponse(graphQlPullRequestsEnvelope([], false, null));
+      if (body === null) return jsonResponse(null, false);
+      const hasNextPage = index + 1 < pages.length;
+      return jsonResponse(
+        graphQlPullRequestsEnvelope(body, hasNextPage, hasNextPage ? String(index + 1) : null),
+      );
+    }
+    return jsonResponse(null, false);
   });
 }
 
@@ -176,6 +247,26 @@ describe("open-PR enumeration: head sha capture (BLO-39871)", () => {
     routeGithub({ openPrPages: [[openPr(2022, { head: { sha: "0ad8773c" } })]] });
     const listed = await listOpenPullRequests({ repoFullName: REPO, token: "t", maxPullRequests: 10 });
     expect(listed?.pullRequests[0]?.headSha).toBe("0ad8773c");
+  });
+
+  // PEN-6341 item 2. GraphQL returns the BARE slug for an App actor where REST
+  // returned `<slug>[bot]`, and this value is PERSISTED to
+  // `pull_request_review_state.author_login`. Nothing asserted it before, so
+  // dropping the re-attachment would have changed the spelling of a stored
+  // identity with no test, no error and no metric -- the same silent failure
+  // this migration has now hit three times, in `author`, in `mergedBy` and here.
+  it("re-attaches the [bot] suffix GraphQL strips, so the persisted login keeps REST's spelling", async () => {
+    routeGithub({ openPrPages: [[openPr(2024)]] });
+    const listed = await listOpenPullRequests({ repoFullName: REPO, token: "t", maxPullRequests: 10 });
+    expect(listed?.pullRequests[0]?.authorLogin).toBe("allyblockcast[bot]");
+  });
+
+  it("leaves a human login alone, because the rule is __typename and not the name", async () => {
+    // The mutation this catches is re-attaching unconditionally, which would
+    // mint `kkroo[bot]` -- a principal that does not exist.
+    routeGithub({ openPrPages: [[openPr(2025, { user: { login: "kkroo" } })]] });
+    const listed = await listOpenPullRequests({ repoFullName: REPO, token: "t", maxPullRequests: 10 });
+    expect(listed?.pullRequests[0]?.authorLogin).toBe("kkroo");
   });
 
   it("keeps a PR with no readable head sha, and does not call it malformed", async () => {
@@ -402,8 +493,18 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
 
     // An object body would iterate as empty and report a complete enumeration of
     // zero — pruning the entire repo.
-    ghFetchMock.mockImplementation(async (url: string) => {
-      if (url.includes("/pulls?state=open")) return jsonResponse({ message: "Bad credentials" });
+    ghFetchMock.mockImplementation(async (url: string, init?: unknown) => {
+      if (url.endsWith("/graphql") && isPullRequestsQuery(init)) {
+        // A 200 whose `nodes` is not an array would iterate as empty and report
+        // a complete enumeration of zero -- pruning the entire repo.
+        return jsonResponse({
+          data: {
+            repository: {
+              pullRequests: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: { message: "Bad credentials" } },
+            },
+          },
+        });
+      }
       return jsonResponse([]);
     });
     await expect(
@@ -495,18 +596,25 @@ describeEmbeddedPostgres("pr-review-state reconciler", () => {
     // passes. Reviews stay empty, which makes every candidate skip before the
     // status read — `considered` is counted up front, so the aggregation is
     // observable without driving a gate evaluation or a single extra fetch.
-    ghFetchMock.mockImplementation(async (url: string) => {
-      const repo = url.includes(REPO_B) ? REPO_B : REPO;
+    ghFetchMock.mockImplementation(async (url: string, init?: unknown) => {
+      // PEN-6341 item 2: the repository moved OUT of the URL and into the
+      // GraphQL variables, so a double that keys on `url.includes(repo)` routes
+      // every repo to the same branch and the asymmetry above stops
+      // discriminating. Read the variables.
+      if (url.endsWith("/graphql") && isPullRequestsQuery(init)) {
+        const repo = `Blockcast/${String(graphQlVariables(init).name ?? "")}`;
+        return jsonResponse(graphQlPullRequestsEnvelope(
+          repo === REPO
+            ? [openPr(11, { head: { sha: "aaa1" } }), openPr(12, { head: null })]
+            : [openPr(21, { head: { sha: "bbb1" } }), openPr(22, { head: null })],
+          false,
+          null,
+        ));
+      }
       if (url.endsWith("/graphql")) return jsonResponse(graphQlReviewsEnvelope([]));
       if (url.includes("/requested_reviewers")) return jsonResponse({ users: [], teams: [] });
       if (url.includes("/timeline")) return jsonResponse([]);
-      const page = Number(/[?&]page=(\d+)/.exec(url)?.[1] ?? 1);
-      if (page > 1) return jsonResponse([]);
-      return jsonResponse(
-        repo === REPO
-          ? [openPr(11, { head: { sha: "aaa1" } }), openPr(12, { head: null })]
-          : [openPr(21, { head: { sha: "bbb1" } }), openPr(22, { head: null })],
-      );
+      return jsonResponse(null, false);
     });
 
     try {
