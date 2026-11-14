@@ -414,7 +414,7 @@ jobs:
       # token is not spent while a missing stable runtime image is prepared.
       - name: Mint read-only Penstock runtime token
         id: penstock-runtime-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           app-id: ${{ vars.COMMITPERCLIP_APP_ID }}
           private-key: ${{ secrets.COMMITPERCLIP_KEY }}
