@@ -23,11 +23,21 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
 
+// Mirrors `services/activity.ts` (PEN-6670). This suite mocks that module, so the
+// real constants are unreachable here; `activity-service.test.ts` asserts against
+// the real exports and is where a divergence shows up.
+const DEFAULT_ISSUE_RUNS_LIMIT = 500;
+const MAX_ISSUE_RUNS_LIMIT = 1000;
+
 vi.mock("../services/activity.js", () => ({
   activityService: () => mockActivityService,
   normalizeActivityLimit: (limit: number | undefined) => {
     if (!Number.isFinite(limit)) return 100;
     return Math.max(1, Math.min(500, Math.floor(limit ?? 100)));
+  },
+  normalizeIssueRunsLimit: (limit: number | undefined) => {
+    if (!Number.isFinite(limit)) return 500;
+    return Math.max(1, Math.min(1000, Math.floor(limit ?? 500)));
   },
 }));
 
@@ -339,8 +349,51 @@ describe.sequential("activity routes", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.getByIdentifier).toHaveBeenCalledWith("PC1A2-475");
     expect(mockIssueService.getById).not.toHaveBeenCalled();
-    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1");
+    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1", {
+      limit: DEFAULT_ISSUE_RUNS_LIMIT,
+    });
     expect(res.body).toEqual([{ runId: "run-1", adapterType: "codex_local" }]);
+    expect(res.headers["x-applied-limit"]).toBe(String(DEFAULT_ISSUE_RUNS_LIMIT));
+  });
+
+  it("passes an opt-in runs limit through, clamped to the server maximum (PEN-6670)", async () => {
+    mockIssueService.getByIdentifier.mockResolvedValue({ id: "issue-uuid-1", companyId: "company-1" });
+    mockActivityService.runsForIssue.mockResolvedValue([]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get(`/api/issues/pc1a2-475/runs?limit=${MAX_ISSUE_RUNS_LIMIT + 50}`));
+
+    expect(res.status).toBe(200);
+    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1", {
+      limit: MAX_ISSUE_RUNS_LIMIT,
+    });
+    // The caller asked for more than the server will serve; the echo is what it
+    // actually got, so a capped page is never indistinguishable from a whole one.
+    expect(res.headers["x-applied-limit"]).toBe(String(MAX_ISSUE_RUNS_LIMIT));
+  });
+
+  it("rejects a non-numeric runs limit rather than silently applying the default", async () => {
+    mockIssueService.getByIdentifier.mockResolvedValue({ id: "issue-uuid-1", companyId: "company-1" });
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/issues/pc1a2-475/runs?limit=all"));
+
+    expect(res.status).toBe(400);
+    expect(mockActivityService.runsForIssue).not.toHaveBeenCalled();
+  });
+
+  it("still rejects an unsupported query parameter on the runs route", async () => {
+    mockIssueService.getByIdentifier.mockResolvedValue({ id: "issue-uuid-1", companyId: "company-1" });
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).get("/api/issues/pc1a2-475/runs?offset=10"));
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("offset");
+    expect(mockActivityService.runsForIssue).not.toHaveBeenCalled();
   });
 
   it("requires company access before creating activity events", async () => {
