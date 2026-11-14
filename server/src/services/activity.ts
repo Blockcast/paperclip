@@ -39,23 +39,40 @@ export function normalizeActivityLimit(limit: number | undefined) {
 }
 
 /**
- * Second, independent bound on `runsForIssue` (PEN-6670).
+ * Opt-in bound on `runsForIssue` (PEN-6670). ⛔ THERE IS DELIBERATELY NO DEFAULT
+ * LIMIT, and that is a correction, not an oversight — read this before adding one.
  *
- * The union arms below make the query's cost scale with the ISSUE's run count
- * rather than the COMPANY's, which is the fix. This cap exists so the route
- * degrades — returns a capped page — rather than 503ing, if some row ever
- * accumulates a run history large enough to matter again. It is set well above
- * the observed per-issue maximum on purpose: it is a backstop, not a page size.
+ * The union arms below are the fix: they make the query's cost scale with the
+ * ISSUE's run count rather than the COMPANY's, so the thing that was growing
+ * without bound no longer reaches this query at all. A default cap is therefore
+ * not needed for the 57014 timeout, and it is actively WRONG here, because this
+ * route's first-party consumer AGGREGATES the rows rather than displaying them:
+ * `ui/src/pages/IssueDetail.tsx` sums `cost`, input/output/cached tokens,
+ * `runtimeMs` and `runCount` over every row it gets back, and
+ * `ui/src/api/activity.ts` sends no `limit` and reads no response header. A
+ * default cap would have made an issue's cost and token summary silently
+ * UNDER-REPORT past the cap, with nothing visible to the user. Caught in review
+ * on #3777; the first version of this change shipped the cap.
  *
- * A caller that gets exactly `limit` rows back may be looking at a capped page;
- * the route echoes the bound actually applied in `X-Applied-Limit`.
+ * ⭐ The second reason not to guess a default: a cap is only safe if it sits
+ * above the real per-issue maximum, and NOBODY CAN MEASURE THAT — no
+ * engineering seat holds a production SQL path. Rather than pick a number that
+ * cannot be checked, remove the dependence on it. That is the same move the
+ * union arms make one layer down.
+ *
+ * A caller that wants a page asks for one with `?limit=`, is clamped to
+ * `MAX_ISSUE_RUNS_LIMIT`, and gets the bound actually applied echoed back in
+ * `X-Applied-Limit`. A caller that asks for nothing still gets everything.
  */
-export const DEFAULT_ISSUE_RUNS_LIMIT = 500;
 export const MAX_ISSUE_RUNS_LIMIT = 1000;
 
-export function normalizeIssueRunsLimit(limit: number | undefined) {
-  if (!Number.isFinite(limit)) return DEFAULT_ISSUE_RUNS_LIMIT;
-  return Math.max(1, Math.min(MAX_ISSUE_RUNS_LIMIT, Math.floor(limit ?? DEFAULT_ISSUE_RUNS_LIMIT)));
+/**
+ * Clamp an explicitly requested limit. Returns `null` for "no limit requested",
+ * which is NOT the same as 0 — the caller must branch on it rather than coerce.
+ */
+export function normalizeIssueRunsLimit(limit: number | undefined): number | null {
+  if (limit === undefined || !Number.isFinite(limit)) return null;
+  return Math.max(1, Math.min(MAX_ISSUE_RUNS_LIMIT, Math.floor(limit)));
 }
 
 /**
@@ -75,7 +92,7 @@ export function normalizeIssueRunsLimit(limit: number | undefined) {
  * be applied as a per-row FILTER — and the only access path left for the outer
  * query is `heartbeat_runs_company_created_at_desc_idx` under
  * `Index Cond: (company_id = ...)` alone. Measured: 904,794 of 905,300 rows
- * read and thrown away by that filter, 48,522 buffers, 1,369.8ms, to return
+ * read and thrown away by that filter, 48,522 buffers, 1,383.4ms, to return
  * 506 rows. The partial expression index that exists for arm 1
  * (`heartbeat_runs_company_issueid_idx`, migration 0077) is never chosen,
  * because the OR puts it out of reach. Cost scaled with the COMPANY's total
@@ -84,7 +101,9 @@ export function normalizeIssueRunsLimit(limit: number | undefined) {
  *
  * With the arms unioned, both are index-driven — `heartbeat_runs_company_issueid_idx`
  * for arm 1, `activity_log_entity_type_id_idx` for arm 2 — and the outer query
- * becomes a pk lookup per surviving id: 2,603 buffers, 16.3ms, same rows. ~84x.
+ * becomes a pk lookup per surviving id: 2,603 buffers, 14.6ms, same rows. ~95x.
+ * ⭐ Measured with AND without a LIMIT and the two agree to within noise: the
+ * union is the whole fix, which is why this route has no default bound.
  *
  * Resolving each arm into its own id set first is the same transformation
  * PEN-3596 applied to the issues-list search (`issueSearchArmsSubquery`), for
@@ -503,7 +522,7 @@ export function activityService(db: Db) {
     runsForIssue: async (companyId: string, issueId: string, options?: { limit?: number }) => {
       scheduleRunLivenessBackfill(companyId, issueId);
       const limit = normalizeIssueRunsLimit(options?.limit);
-      const runs = await db
+      const runsQuery = db
         .select({
           runId: heartbeatRuns.id,
           status: heartbeatRuns.status,
@@ -542,8 +561,10 @@ export function activityService(db: Db) {
             runBelongsToIssue(companyId, issueId),
           ),
         )
-        .orderBy(desc(heartbeatRuns.createdAt))
-        .limit(limit);
+        .orderBy(desc(heartbeatRuns.createdAt));
+      // `null` means no limit was requested, and the default is UNBOUNDED on
+      // purpose — see `normalizeIssueRunsLimit`.
+      const runs = await (limit === null ? runsQuery : runsQuery.limit(limit));
 
       if (runs.length === 0) return runs;
       const runIds = runs.map((run) => run.runId);

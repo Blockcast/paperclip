@@ -20,7 +20,6 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { activityService } from "../services/activity.js";
 import {
-  DEFAULT_ISSUE_RUNS_LIMIT,
   MAX_ISSUE_RUNS_LIMIT,
   normalizeIssueRunsLimit,
   runBelongsToIssue,
@@ -58,7 +57,7 @@ describe("issue-run membership predicate shape (PEN-6670)", () => {
     // FILTER on a company-wide index scan as the only plan, and put
     // heartbeat_runs_company_issueid_idx (0077) out of reach. Measured on a
     // 905,300-run seed: 904,794 rows read and discarded, 48,522 buffers,
-    // 1,369.8ms; 2,603 buffers and 16.3ms once the arms are unioned.
+    // 1,383.4ms; 2,603 buffers and 14.6ms once the arms are unioned (~95x).
     expect(text.toLowerCase()).not.toContain("exists");
     expect(text).toContain('"activity_log"."run_id"');
     expect(text).toContain('"heartbeat_runs"."context_snapshot"');
@@ -88,9 +87,17 @@ describe("issue-run membership predicate shape (PEN-6670)", () => {
 });
 
 describe("issue runs limit helper (PEN-6670)", () => {
-  it("clamps an untrusted limit to the server bounds", () => {
-    expect(normalizeIssueRunsLimit(undefined)).toBe(DEFAULT_ISSUE_RUNS_LIMIT);
-    expect(normalizeIssueRunsLimit(Number.NaN)).toBe(DEFAULT_ISSUE_RUNS_LIMIT);
+  it("reports 'no limit requested' as null rather than defaulting to a cap", () => {
+    // ⛔ THE REGRESSION THIS GUARDS. The first version of #3777 returned a default
+    // cap of 500 here. `ui/src/pages/IssueDetail.tsx` SUMS cost, tokens and runtime
+    // over every row this endpoint returns and sends no `limit`, so a default cap
+    // makes those totals silently under-report on any issue past the cap. `null`
+    // forces the caller to branch instead of coercing a bound into existence.
+    expect(normalizeIssueRunsLimit(undefined)).toBeNull();
+    expect(normalizeIssueRunsLimit(Number.NaN)).toBeNull();
+  });
+
+  it("clamps an explicitly requested limit to the server bounds", () => {
     expect(normalizeIssueRunsLimit(0)).toBe(1);
     expect(normalizeIssueRunsLimit(-5)).toBe(1);
     expect(normalizeIssueRunsLimit(25.9)).toBe(25);
@@ -805,8 +812,16 @@ describeEmbeddedPostgres("activity service", () => {
     const deduped = await service.runsForIssue(companyId, issueId);
     expect(deduped.map((run) => run.runId)).toEqual([activityOnlyRunId, contextRunId]);
 
-    // The bound applies to the ordered page, so a capped read keeps the newest.
+    // No bound unless one is asked for: the default read returns everything, which
+    // is what keeps the UI's cost/token/runtime totals correct (#3777).
+    expect(deduped).toHaveLength(2);
+
+    // When a bound IS asked for it applies to the ORDERED page, so truncation drops
+    // the OLDEST run and never the newest. Ally asked for this direction to be
+    // pinned, because the finding above turns on which end gets dropped.
     const capped = await service.runsForIssue(companyId, issueId, { limit: 1 });
     expect(capped.map((run) => run.runId)).toEqual([activityOnlyRunId]);
+    const cappedToTwo = await service.runsForIssue(companyId, issueId, { limit: 2 });
+    expect(cappedToTwo.map((run) => run.runId)).toEqual([activityOnlyRunId, contextRunId]);
   });
 });

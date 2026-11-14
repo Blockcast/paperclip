@@ -43,9 +43,20 @@
  *
  * ── RESULT, measured 2026-11-14 at the defaults below ──────────────────────
  *
- *   BEFORE  1,369.8 ms   48,522 buffers (576 hit + 47,946 read)
- *   AFTER      16.3 ms    2,603 buffers (all hit)
- *                         ~84x faster, ~19x fewer buffers
+ *   BEFORE                        1,383.4 ms   48,522 buffers (582 hit + 47,940 read)
+ *   AFTER, no LIMIT (shipped)        14.6 ms    2,603 buffers (all hit)
+ *   AFTER, LIMIT 500 (opt-in)        13.4 ms    2,603 buffers (all hit)
+ *                                    ~95x faster, ~19x fewer buffers
+ *
+ * ⭐ THE TWO `AFTER` ARMS ARE THE SAME NUMBER, AND THAT IS THE POINT. The union
+ * is the entire fix; the `LIMIT` contributes nothing measurable. The first
+ * version of this change shipped a DEFAULT cap of 500 on the route, and review
+ * (#3777) caught that it would silently truncate the rows
+ * `ui/src/pages/IssueDetail.tsx` AGGREGATES — it sums cost, tokens and runtime
+ * over every row and sends no `limit` — so an issue past the cap would have
+ * under-reported its own costs with nothing shown to the user. These two arms
+ * are why dropping the default costs nothing: measure before you add a bound,
+ * and do not pay a correctness price for a speed-up that is not there.
  *
  * BEFORE (`or(context match, exists(correlated))`, no LIMIT):
  *
@@ -54,7 +65,7 @@
  *     Filter: ((context_snapshot ->> 'issueId') = ... OR (ANY (id = (hashed SubPlan 2).col1)))
  *     Rows Removed by Filter: 904,794                    <- of 905,300, to return 506
  *
- * AFTER (union arms + LIMIT 500):
+ * AFTER (union arms; the plan is the same with or without the LIMIT node):
  *
  *   HashAggregate  (506 rows, 578 buffers)
  *     ->  Append
@@ -62,9 +73,9 @@
  *           ->  Index Scan using activity_log_entity_type_id_idx       (987 rows, 380 buf)
  *     ->  Index Scan using heartbeat_runs_pkey  (506 loops, 2,024 buf)
  *
- * ⚠️ Note the AFTER row count: 500, not 506. The seed gave the target issue
- * more runs than `DEFAULT_ISSUE_RUNS_LIMIT`, so the cap is visibly doing its
- * job here. That is the second, independent bound, not the fix.
+ * ⚠️ The LIMIT-500 arm returns 500 rows, not 506 — the seed deliberately gives
+ * the target issue more runs than that bound, so the opt-in `?limit=` path is
+ * exercised rather than merely configured. The SHIPPED default returns all 506.
  *
  * ⭐ THE MECHANISM IS NOT THE ONE THE SHAPE SUGGESTS, and the plan says so.
  * PostgreSQL PULLS THE CORRELATED `exists(...)` UP into an uncorrelated
@@ -80,7 +91,7 @@
  *
  * ⚠️ THIS DOES NOT REPRODUCE THE 30 s PRODUCTION TIMEOUT, and the gap is not
  * explained here. 1.4 s seeded against a 30 s `statement_timeout` leaves a
- * ~22x constant factor in bloat, cache occupancy, concurrency, the real
+ * ~21x constant factor in bloat, cache occupancy, concurrency, the real
  * `activity_log` size, and the full 27-column TOAST-heavy projection (this
  * bench selects a 5-key subset of the `usage_json` reconciliation, so its
  * milliseconds are a LOWER bound on the real statement's). The fix ships
@@ -313,7 +324,12 @@ async function main() {
     }
 
     await explain("BEFORE — or + correlated exists, no LIMIT", statement(BEFORE_WHERE, ""));
-    await explain("AFTER — union arms + LIMIT 500", statement(AFTER_WHERE, " limit 500"));
+    // THE SHIPPED DEFAULT. There is no default LIMIT on this route: the union is the
+    // fix, and a default cap would silently truncate the rows the UI aggregates
+    // (`ui/src/pages/IssueDetail.tsx` sums cost/tokens/runtime over all of them).
+    await explain("AFTER — union arms, NO LIMIT (the shipped default)", statement(AFTER_WHERE, ""));
+    // The opt-in `?limit=` path, for comparison only.
+    await explain("AFTER — union arms + LIMIT 500 (opt-in path)", statement(AFTER_WHERE, " limit 500"));
 
     // The control arm. See the header: this is why the backfill was left alone.
     const backfillSelect = "select hr.id, hr.status, hr.context_snapshot from heartbeat_runs hr";
