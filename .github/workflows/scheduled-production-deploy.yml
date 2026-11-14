@@ -228,6 +228,8 @@ jobs:
           REPO: ${{ github.repository }}
           PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
           DEAD_DISPATCH_JSON_PATH: ${{ runner.temp }}/dead-dispatch.json
+          # BLO-57061 retry pre-check reads paperclip-0's age, as docker.yml's deploy job does.
+          PAPERCLIP_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           # True only for the daily cron and a manual kick. Keyed on WHICH cron
           # entry fired, not on the wall clock: GitHub delays scheduled runs under
           # load (5-17min late on this repo's own history), and an hour check would
@@ -368,6 +370,41 @@ jobs:
             DEAD_FATE="$(jq -r '.fate // "unknown"' "$DEAD_DISPATCH_JSON_PATH" 2>/dev/null || echo unknown)"
           fi
 
+          # (1d) BLO-57061: the last dispatch was REFUSED by docker.yml's BLO-49140
+          # minimum-interval guard (worker rolled < 6h ago), so it shipped nothing.
+          # Only the daily slot dispatches, so without this one same-image worker
+          # restart before 07:23Z cost a whole day. A sampling slot re-dispatches
+          # once paperclip-0 is past the interval, judged by the SAME unchanged
+          # guard script so the two cannot disagree. Guard (1) above still holds:
+          # we only get here when nothing is pending, so this cannot stack.
+          RETRY_MIN_INTERVAL=false
+          if [ "$DEAD_FATE" = "refused-min-interval" ] && [ "$IS_DISPATCH_SLOT" != "true" ]; then
+            REFUSED_ID="$(jq -r '.run.databaseId // "unknown"' "$DEAD_DISPATCH_JSON_PATH")"
+            # A failed read defers rather than dispatching blind: an empty
+            # POD_CREATED means "pod absent, allow" to the guard script.
+            if POD_CREATED="$(kubectl -n "${PAPERCLIP_NAMESPACE:-paperclip}" get pod paperclip-0 \
+                                --ignore-not-found -o jsonpath='{.metadata.creationTimestamp}')" \
+               && POD_CREATED="$POD_CREATED" OVERRIDE=none .github/scripts/check-deploy-min-interval.sh >/dev/null 2>&1; then
+              RETRY_MIN_INTERVAL=true
+              echo "::notice::Retrying the dispatch: run $REFUSED_ID was refused by the BLO-49140 minimum-interval guard and paperclip-0 is now past the interval (BLO-57061)."
+              {
+                echo "### Retrying a dispatch refused by the minimum-interval guard"
+                echo
+                echo "\`docker.yml\` run \`$REFUSED_ID\` was refused at \`Minimum interval since last roll (BLO-49140)\`."
+                echo "paperclip-0 is now past the interval, so this slot (run \`$GITHUB_RUN_ID\`) re-dispatches (BLO-57061)."
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::notice::Last dispatch (run $REFUSED_ID) was refused by the minimum-interval guard; paperclip-0 is still inside the interval (or unreadable). A later hourly slot retries."
+              {
+                echo "### Deferred — minimum-interval refusal not yet retryable"
+                echo
+                echo "\`docker.yml\` run \`$REFUSED_ID\` was refused by the BLO-49140 guard. A later hourly slot re-dispatches once paperclip-0 is past the interval."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "outcome=deferred-min-interval" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           # (1b) Sampling slots stop here. They exist ONLY to age a pending approval,
           # which is why this sits BELOW guard (1) rather than above it: guard (1) is
           # what emits `skipped-pending`, and `skipped-pending` is what arms the
@@ -375,7 +412,7 @@ jobs:
           # defect — a 6h threshold evaluated once per 24h — while looking like a
           # tidy-up. .github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
           # pins the order for that reason.
-          if [ "$IS_DISPATCH_SLOT" != "true" ]; then
+          if [ "$IS_DISPATCH_SLOT" != "true" ] && [ "$RETRY_MIN_INTERVAL" != "true" ]; then
             # The dead-lane branch comes FIRST, because `checked-no-pending` is
             # exactly the false green it replaces. A sampling slot cannot
             # dispatch a replacement (that is guard (1b)'s whole purpose, and
