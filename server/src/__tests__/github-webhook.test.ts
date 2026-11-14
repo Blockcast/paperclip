@@ -4789,6 +4789,20 @@ describeEmbeddedPostgres("github-webhook route", () => {
     // -- because the whole design is that those two move independently, and a
     // test that only looked at one of them could not tell the split from its
     // absence.
+    // The keys the author-wake precheck reads. A placement the precheck drops
+    // never writes one, which is what makes this the surface that can see a
+    // dropped wake -- the reason column cannot, because a coalescing wake is
+    // recorded under `github_state_change_queued_coalesced`.
+    async function labelWakeKeys(agentId: string) {
+      const rows = await db
+        .select({ idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      return rows
+        .map((r) => r.idempotencyKey ?? "")
+        .filter((k) => k.includes("github_pr_labeled") || k.includes("github_pr_unlabeled"));
+    }
+
     async function labelWakes(agentId: string) {
       return db
         .select({
@@ -4835,12 +4849,15 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(wakes).toHaveLength(1);
       expect(wakes[0]?.payload).toMatchObject({ prNumber: 4250 });
 
-      // The label and the actor are asserted on the RUN's contextSnapshot,
-      // which is the surface the woken agent actually reads -- the wakeup
-      // request's own payload is a narrower routing projection and carries
-      // neither. A wake that reached the right agent without saying which
-      // label moved, or who moved it, would be the non-attestation defect
-      // this change exists to close, so it is pinned where it is consumed.
+      // The label and the actor are asserted on the RUN's contextSnapshot --
+      // the wakeup request's own payload is a narrower routing projection and
+      // carries neither. contextSnapshot is where they are STORED; the
+      // companion assertion that they also reach the woken run's prompt lives
+      // with the renderer, in heartbeat's generic PR-event directive (PEN-5747
+      // projects both fields onto prReview for exactly that). Storing them
+      // without rendering them would leave the actor attestation this change
+      // argues for unreachable from inside the run, so neither half stands
+      // alone and both are pinned.
       const runs = await db
         .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
         .from(heartbeatRuns)
@@ -4883,6 +4900,109 @@ describeEmbeddedPostgres("github-webhook route", () => {
       const wakes = await labelWakes(agentId);
       expect(wakes).toHaveLength(1);
       expect(wakes[0]?.reason).toBe("github_pr_unlabeled");
+    });
+
+    // PEN-5747, on Ally's review of #3459. A label is a RECURRING event --
+    // hold -> lift -> hold is the lifecycle this signal exists to deliver --
+    // so the author wake cannot key on a stable repo+pr+reason suffix. The
+    // first wake coalescing is the ORDINARY case (a human labels a PR whose
+    // agent is already running), and `coalesced` is idempotent for a stable
+    // key, so one coalesce would drop every later placement on that PR
+    // forever as `duplicate_pr_author_wake`. Both halves are asserted here
+    // because they pull in opposite directions: a genuinely NEW placement
+    // must wake, and a REDELIVERY of one placement must still not.
+    it("wakes on a second placement after the first wake coalesced, and still dedups a redelivery", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-40013");
+      const app = buildApp();
+
+      await postPr(
+        app,
+        prPayload({
+          action: "labeled",
+          identifier: "BLO-40013",
+          number: 4253,
+          label: "landing-hold",
+          sender: "a-human",
+          updatedAt: "2026-11-06T09:00:00Z",
+        }),
+        "wp-label-cycle-1",
+      );
+      expect(await labelWakes(agentId)).toHaveLength(1);
+
+      // Drive the first wake to the status enqueueWakeup writes when the
+      // assignee already holds an active execution run on the issue. That row
+      // is permanent and carries the wake's idempotencyKey, which is what
+      // makes a stable key self-poisoning rather than merely noisy.
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "coalesced" })
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.reason, "github_pr_labeled"),
+          ),
+        );
+
+      // The lift, then the second hold -- the second cycle IS the payload.
+      await postPr(
+        app,
+        prPayload({
+          action: "unlabeled",
+          identifier: "BLO-40013",
+          number: 4253,
+          label: "landing-hold",
+          sender: "a-human",
+          updatedAt: "2026-11-06T09:05:00Z",
+        }),
+        "wp-label-cycle-2",
+      );
+      await postPr(
+        app,
+        prPayload({
+          action: "labeled",
+          identifier: "BLO-40013",
+          number: 4253,
+          label: "landing-hold",
+          sender: "a-human",
+          updatedAt: "2026-11-06T09:10:00Z",
+        }),
+        "wp-label-cycle-3",
+      );
+
+      // Assert on the WAKE KEYS, not on the wake reasons. Once the first
+      // placement has queued a run, every later wake for this agent coalesces
+      // INTO it and the row enqueueWakeup writes carries the reason
+      // `github_state_change_queued_coalesced` -- so a reason filter cannot
+      // see the lift or the second hold at all. The key is the surface the
+      // precheck actually reads, and it is what this fix changes: a dropped
+      // placement is one whose key never reaches the table.
+      const keysAfterCycle = await labelWakeKeys(agentId);
+      // Three distinct keys: the first hold, the lift, and the second hold.
+      // On a stable repo+pr+reason key the second hold is exactly the one
+      // that disappears -- it rebuilds the first hold's key, finds its
+      // permanent `coalesced` row, and is dropped as duplicate_pr_author_wake.
+      expect(keysAfterCycle).toHaveLength(3);
+      expect(keysAfterCycle.filter((k) => k.includes("github_pr_labeled"))).toHaveLength(2);
+      expect(keysAfterCycle.filter((k) => k.includes("github_pr_unlabeled"))).toHaveLength(1);
+      // Each placement is scoped to its own delivery, which is what makes the
+      // two holds distinct rather than colliding.
+      expect(new Set(keysAfterCycle).size).toBe(3);
+
+      // The other half: delivery scoping must not have turned a GitHub
+      // REDELIVERY into a second run. Same x-github-delivery, same key.
+      await postPr(
+        app,
+        prPayload({
+          action: "labeled",
+          identifier: "BLO-40013",
+          number: 4253,
+          label: "landing-hold",
+          sender: "a-human",
+          updatedAt: "2026-11-06T09:10:00Z",
+        }),
+        "wp-label-cycle-3",
+      );
+      expect(await labelWakeKeys(agentId)).toHaveLength(3);
     });
 
     // THE NEGATIVE CASE, and the one that pins the containment. `labeled` fires

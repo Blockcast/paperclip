@@ -473,6 +473,78 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(unknownMarkdown).not.toContain("GitHub PR review feedback directive:");
   });
 
+  // PEN-5747, on Ally's review of #3459. Carrying the label and the actor on
+  // contextSnapshot is only half the claim: a wake that named neither in the
+  // prompt would send the woken run back to the PR to find out what moved,
+  // and that re-fetch can never recover WHO moved it -- `sender.login` is on
+  // the event, not on the PR. Pin the rendering, and pin that nothing else
+  // reaching this directive changed.
+  it("names the label and the actor in the PR event directive (PEN-5747)", () => {
+    const placed = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_labeled",
+        prNumber: 3459,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+        prLabelName: "landing-hold",
+        prSenderLogin: "a-human",
+      },
+    });
+    expect(placed).toContain("GitHub PR event directive:");
+    expect(placed).toContain('Label "landing-hold" was PLACED on this pull request by "a-human"');
+
+    // The LIFT is as load-bearing as the placement -- a blocked row is
+    // waiting to learn the hold is over -- and must not read as a placement.
+    const lifted = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_unlabeled",
+        prNumber: 3459,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+        prLabelName: "landing-hold",
+        prSenderLogin: "a-human",
+      },
+    });
+    expect(lifted).toContain('Label "landing-hold" was REMOVED from this pull request by "a-human"');
+    expect(lifted).not.toContain("PLACED on");
+
+    // An event that named no actor must still render, saying so rather than
+    // asserting an actor it does not have.
+    const anonymous = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_labeled",
+        prNumber: 3459,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+        prLabelName: "landing-hold",
+      },
+    });
+    expect(anonymous).toContain("an account the event did not name");
+
+    // The regression guard: every OTHER reason reaching this directive is
+    // byte-unchanged, so the label line must be absent, not empty.
+    const lifecycle = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_opened",
+        prNumber: 3459,
+        repoFullName: "Blockcast/paperclip",
+        event: "pull_request",
+        prRole: "author",
+      },
+    });
+    expect(lifecycle).toContain("GitHub PR event directive:");
+    expect(lifecycle).not.toContain("was PLACED on");
+    expect(lifecycle).not.toContain("was REMOVED from");
+    expect(lifecycle).not.toContain("That label change is the signal");
+  });
+
   // Real review content must still get the author-shaped directive -- this
   // fix narrows WHEN "YOUR pull request" fires, it doesn't remove it.
   it("still asserts 'YOUR pull request' for an actionable review-feedback comment wake", () => {
@@ -885,6 +957,9 @@ describe("derivePaperclipPrReview", () => {
       // BLO-23395: only populated on a github_pr_merge_queue_evicted wake.
       mergeQueueEvictionBody: null,
       prAuthorLogin: null,
+      // PEN-5747: populated only on the two label wake reasons.
+      prLabelName: null,
+      prSenderLogin: null,
       // BLO-38816: review-feedback classification. Absent from this snapshot,
       // so the run reads "unclassified" -- not "declined".
       reviewFeedbackActionable: null,
@@ -904,6 +979,25 @@ describe("derivePaperclipPrReview", () => {
         githubPrAuthorLogin: "allyblockcast[bot]",
       }),
     ).toMatchObject({ prAuthorLogin: "allyblockcast[bot]" });
+  });
+
+  // PEN-5747: the label that moved and the account that moved it. Both are
+  // projected for the directive below -- storing them on contextSnapshot
+  // without projecting them would leave the actor attestation unreachable
+  // from inside the woken run, which is the defect the placement signal
+  // exists to close.
+  it("surfaces the label name and the actor that moved it (PEN-5747)", () => {
+    expect(
+      derivePaperclipPrReview({
+        wakeReason: "github_pr_labeled",
+        githubPrNumber: 3459,
+        githubRepoFullName: "Blockcast/paperclip",
+        reviewKind: "pr_review",
+        prRole: "author",
+        githubPrLabelName: "landing-hold",
+        githubPrSenderLogin: "a-human",
+      }),
+    ).toMatchObject({ prLabelName: "landing-hold", prSenderLogin: "a-human" });
   });
 
   it("surfaces prRole='author' + review body/state/login on assignee wakes (BLO-6300)", () => {

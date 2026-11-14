@@ -12172,6 +12172,15 @@ export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown>
     // self-review, so the gate must confirm the PR was genuinely bot-authored
     // before accepting a "skipped as self-review" summary.
     prAuthorLogin: readNonEmptyString(contextSnapshot.githubPrAuthorLogin),
+    // PEN-5747: the label that moved and the account that moved it, inlined by
+    // the webhook on a github_pr_labeled / github_pr_unlabeled wake. Projected
+    // here for the same reason mergeQueueEvictionBody is: without them the
+    // directive can only name the wake REASON, so the woken run would have to
+    // re-fetch the PR to learn which label moved -- and on a `landing-hold`
+    // that re-fetch cannot recover WHO placed it, because the actor is only on
+    // the event. Absent on every other wake reason, so nothing else changes.
+    prLabelName: readNonEmptyString(contextSnapshot.githubPrLabelName),
+    prSenderLogin: readNonEmptyString(contextSnapshot.githubPrSenderLogin),
     // BLO-38816: project the review-feedback classification so the woken run can
     // tell "the reviewer found nothing" from "the findings were lost" from
     // INSIDE the run, rather than inferring the no-op from absence. Both halves
@@ -13961,6 +13970,10 @@ export function buildPaperclipTaskMarkdown(input: {
     // the "YOUR pull request" possessive and the push instruction — see
     // resolveThirdPartyPrAuthor.
     prAuthorLogin?: string | null;
+    // PEN-5747: `label.name` and `sender.login` from the signed webhook,
+    // populated only on the two label wake reasons. See derivePaperclipPrReview.
+    prLabelName?: string | null;
+    prSenderLogin?: string | null;
     // BLO-38816: see derivePaperclipPrReview. `reviewFeedbackSuppressionReason`
     // is the positive "classifier declined this review" signal and is what the
     // closing directive keys off; `reviewFeedbackActionable` is informational
@@ -14200,9 +14213,23 @@ export function buildPaperclipTaskMarkdown(input: {
       // is what makes this hold for the next wakeReason someone introduces: a
       // new reason is reasonless until it is proven otherwise, which fails in
       // the safe direction.
+      // PEN-5747: a label wake whose directive named only the reason would send
+      // the woken run back to the PR to learn which label moved, and that
+      // re-fetch can never recover WHO moved it -- `sender.login` is on the
+      // event, not on the PR. State both. Guarded on presence, so every other
+      // reason reaching this branch (opened / reopened / ready_for_review /
+      // synchronize) renders exactly as it did before.
+      const labelMovement = prReview.prLabelName
+        ? `Label ${quoteTaskScalar(prReview.prLabelName)} was ${
+            prReview.wakeReason === "github_pr_unlabeled" ? "REMOVED from" : "PLACED on"
+          } this pull request by ${
+            prReview.prSenderLogin ? quoteTaskScalar(prReview.prSenderLogin) : "an account the event did not name"
+          }. That label change is the signal this wake carries.`
+        : null;
       lines.push(
         "",
         "GitHub PR event directive:",
+        ...(labelMovement ? [labelMovement] : []),
         `Wake reason: ${quoteTaskScalar(prReview.wakeReason)}. No review findings are recorded for this PR yet, so do not push new commits on the strength of unconfirmed feedback. If you are this PR's author, confirm current state with \`gh pr view\` / \`gh api repos/<owner>/<repo>/pulls/${prReview.prNumber}/reviews\` before acting. Do NOT close the PR or self-approve. The PR's status is your responsibility this run; don't bounce to inbox-only mode.`,
       );
     } else if (prReview.prRole === "author") {
