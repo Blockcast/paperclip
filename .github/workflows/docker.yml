@@ -433,6 +433,36 @@ jobs:
           permission-contents: read
 
       - name: Build and push
+        # PEN-6683. STRICTLY BELOW the job's `timeout-minutes: 90`, so an
+        # overrun here concludes `failure` ON THE STEP instead of `cancelled`
+        # on the job. That distinction is the whole point: this job's own
+        # `cancel-in-progress` produces `cancelled` on every routine supersede
+        # of a publish build, so a ceiling kill recorded that way is
+        # indistinguishable from one, and the alert arm below would have to
+        # guess.
+        #
+        # Sized off the SUCCESSFUL population, never the killed runs, because a
+        # kill's elapsed time measures the CEILING and not the build. Measured
+        # first-party against the Actions API on 2026-11-14 over the 60 most
+        # recent runs (2026-11-13T16:37Z .. 2026-11-14T20:03Z -- this lane is
+        # busy, so 60 runs is about a day): 44 builds of `build-and-push`
+        # succeeded, all retaining step detail. Min 4.55 min, median 9.30,
+        # p90 13.90, max 30.68 (run #3482).
+        #
+        # 50 clears that max by 63% and leaves 40 min of headroom under the
+        # ceiling. The four slowest successes (30.68, 26.83, 23.62, 22.88) all
+        # landed on `arc-paperclip-buildkit-n7zlf`, against a 19.95 min worst
+        # case on the sibling pool, and they are deliberately NOT excluded as
+        # degraded-pool outliers: they completed, so they are uncensored, and
+        # erring high costs only a slightly later signal where erring low kills
+        # healthy builds.
+        #
+        # NOTE the second build step in this job, `Build and push stable
+        # runtime image`, deliberately carries no budget of its own: it is
+        # conditional on a cache miss and has no measured population. A stall
+        # there reaches the JOB ceiling and classifies `job_timeout`, which the
+        # alert arm below still pages on.
+        timeout-minutes: 50
         id: build
         uses: docker/build-push-action@v7
         with:
@@ -1917,3 +1947,98 @@ jobs:
           FINAL_BLOCKED: ${{ needs.guard-pending-deploy-final.outputs.blocked }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
         run: .github/scripts/assert-dispatch-deploy-outcome.sh
+
+  # PEN-6683. A `master` PUSH that publishes no image must reach somebody.
+  #
+  # On a push, `build-and-push` is the ONLY job in this workflow that runs:
+  # `guard-pending-deploy`, `guard-pending-deploy-final`, `deploy` and
+  # `deploy-dispatch-outcome` are every one of them gated on
+  # `github.event_name == 'workflow_dispatch'`. So a push build that publishes
+  # nothing is silent by construction, and nothing outside the workflow covers
+  # it either: `master-health.yml` censuses runs filtered on
+  # `.path == ".github/workflows/pr.yml"` so it cannot see a `docker-*` run,
+  # and `scheduled_workflow_last_verdict_failed` carries no `docker-*` series
+  # and keys on the CRON verdict rather than a push.
+  #
+  # THE `workflow_dispatch` EXCLUSION IS A NON-DUPLICATION, not a copied
+  # default. That path already has `deploy-dispatch-outcome`, whose own `if:`
+  # pins the dispatch event (the PEN-4841 control), and
+  # `assert-dispatch-deploy-outcome.sh` handles a failed or cancelled build
+  # there explicitly -- its Cause 1, "the attempt died upstream, at the
+  # build... the run conclusion already carries that". Firing here as well
+  # would double-report one cause.
+  #
+  # Same shape as docker-mcp-external.yml, docker-mcp-gateway.yml and
+  # docker-agent.yml: a separate job, firing on `failure` OR `cancelled`, routed
+  # to Alertmanager (NOT GitHub Issues, which are disabled on this repo -
+  # BLO-33382) and fanned to the paperclip-plugin-alertmanager webhook, which
+  # dedupes on the alert fingerprint and refreshes one issue in place.
+  alert-on-failure:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled')
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    # actions: read + checks: read are what let the script tell a timeout kill
+    # from a concurrency supersede and from a human cancel. All three report
+    # `cancelled`; only the annotations separate them, and without these scopes
+    # every cancellation classifies `unknown` and pages (fail-closed, but
+    # uselessly noisy - and a noisy alert gets muted, which is the silence this
+    # row exists to end).
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Report the unpublished image to Alertmanager
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: firing
+          GH_REPO: ${{ github.repository }}
+          # Collapsed to a single value for tags so the label set stays bounded:
+          # the fingerprint hashes every label, and one identity per tag would
+          # fragment the alert the bridge dedupes on (BLO-28616).
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-paperclip-image-alert.mjs
+
+  # The other half of an honest alert: without it `endsAt` is the only thing
+  # retiring the firing alert, so the lane goes quiet on a TIMER rather than on
+  # a fix. Pushing the identical label set with a past `endsAt` makes
+  # Alertmanager send `resolved`, which cancels the issue.
+  #
+  # It is also the continuous capability probe, and on this lane it is a cheap
+  # one: 44 of the 60 most recent runs published successfully, so the delivery
+  # path is exercised many times a day and a channel that rotted here surfaces
+  # almost immediately rather than at the next outage.
+  #
+  # A separate job rather than a step inside build-and-push, deliberately: a
+  # delivery failure here must not flip `build-and-push.result` to `failure`
+  # and fire a spurious "the build is failing" alert about itself -- which on
+  # THIS workflow would also be read by `deploy-dispatch-outcome`.
+  resolve-on-success:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      needs.build-and-push.result == 'success'
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Resolve the image-delivery alert (and prove the channel still works)
+        env:
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: resolved
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-paperclip-image-alert.mjs
