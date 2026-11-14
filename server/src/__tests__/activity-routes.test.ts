@@ -24,9 +24,9 @@ const mockAccessService = vi.hoisted(() => ({
 }));
 
 // Mirrors `services/activity.ts` (PEN-6670). This suite mocks that module, so the
-// real constants are unreachable here; `activity-service.test.ts` asserts against
-// the real exports and is where a divergence shows up.
-const DEFAULT_ISSUE_RUNS_LIMIT = 500;
+// real constant is unreachable here; `activity-service.test.ts` asserts against
+// the real export and is where a divergence shows up. There is no default limit
+// by design — see `normalizeIssueRunsLimit`.
 const MAX_ISSUE_RUNS_LIMIT = 1000;
 
 vi.mock("../services/activity.js", () => ({
@@ -36,8 +36,8 @@ vi.mock("../services/activity.js", () => ({
     return Math.max(1, Math.min(500, Math.floor(limit ?? 100)));
   },
   normalizeIssueRunsLimit: (limit: number | undefined) => {
-    if (!Number.isFinite(limit)) return 500;
-    return Math.max(1, Math.min(1000, Math.floor(limit ?? 500)));
+    if (limit === undefined || !Number.isFinite(limit)) return null;
+    return Math.max(1, Math.min(1000, Math.floor(limit)));
   },
 }));
 
@@ -349,11 +349,13 @@ describe.sequential("activity routes", () => {
     expect(res.status).toBe(200);
     expect(mockIssueService.getByIdentifier).toHaveBeenCalledWith("PC1A2-475");
     expect(mockIssueService.getById).not.toHaveBeenCalled();
-    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1", {
-      limit: DEFAULT_ISSUE_RUNS_LIMIT,
-    });
+    // No `?limit=` => no bound passed and no bound applied. The service is called with
+    // TWO arguments, not three: the whole run history still comes back, because the UI
+    // aggregates these rows and a silent cap would make its totals under-report (#3777).
+    expect(mockActivityService.runsForIssue).toHaveBeenCalledWith("company-1", "issue-uuid-1");
     expect(res.body).toEqual([{ runId: "run-1", adapterType: "codex_local" }]);
-    expect(res.headers["x-applied-limit"]).toBe(String(DEFAULT_ISSUE_RUNS_LIMIT));
+    // The header's ABSENCE is the positive signal that nothing was capped.
+    expect(res.headers["x-applied-limit"]).toBeUndefined();
   });
 
   it("passes an opt-in runs limit through, clamped to the server maximum (PEN-6670)", async () => {

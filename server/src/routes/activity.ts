@@ -33,10 +33,11 @@ const companyActivityQuerySchema = z.object({
 
 const uuidQueryParamSchema = z.string().guid();
 
-// PEN-6670: `GET /issues/:id/runs` took no query parameter at all, so every call sorted and
-// returned the issue's whole run history. `limit` is opt-in — omitting it applies
-// `DEFAULT_ISSUE_RUNS_LIMIT`, a backstop set well above any observed per-issue run count, so
-// no existing caller's page changes shape.
+// PEN-6670: `GET /issues/:id/runs` took no query parameter at all, so a caller who wanted a page
+// could not ask for one. `limit` is opt-in and there is NO default — omitting it returns the whole
+// run history exactly as before. A default cap was in the first version of this change and was
+// removed in review (#3777): this route's own UI consumer AGGREGATES the rows (cost, tokens,
+// runtime), so a silent cap would make those totals under-report with nothing shown to the user.
 const ISSUE_RUNS_QUERY_PARAMS = new Set(["limit"]);
 const issueRunsQuerySchema = z.object({
   limit: z.string().regex(/^\d+$/).optional(),
@@ -238,12 +239,20 @@ export function activityRoutes(db: Db) {
     const limit = normalizeIssueRunsLimit(
       parsedLimit.data.limit === undefined ? undefined : Number(parsedLimit.data.limit),
     );
-    const result = await svc.runsForIssue(issue.companyId, issue.id, { limit });
-    // Echoes the bound actually applied, so a caller holding exactly `limit` rows can tell a
-    // complete history from a capped page without the array response shape changing. Same
-    // reasoning as `X-Applied-Filters` above (BLO-21979): a truncated read must never be
-    // indistinguishable from a complete one.
-    res.setHeader("X-Applied-Limit", String(limit));
+    // `null` is "no limit asked for" and must not be coerced to a number — it is the difference
+    // between a complete history and a capped page.
+    const result =
+      limit === null
+        ? await svc.runsForIssue(issue.companyId, issue.id)
+        : await svc.runsForIssue(issue.companyId, issue.id, { limit });
+    if (limit !== null) {
+      // Echoes the bound actually applied — a caller holding exactly `limit` rows can tell a
+      // complete history from a capped page without the array response shape changing, and sees
+      // the clamp when it asked for more than the server serves. Same reasoning as
+      // `X-Applied-Filters` above (BLO-21979). Set only when a limit was requested, so its
+      // ABSENCE is the positive signal that the response is complete.
+      res.setHeader("X-Applied-Limit", String(limit));
+    }
     res.json(result);
   });
 
