@@ -794,6 +794,32 @@ function assertNoBannedSql(statement: string): void {
     /\bcopy\b/,
     /\bcall\b/,
     /\bdo\s+(?:\$\$|language\b)/,
+    // A GUC write inside a plugin statement defeats the `search_path` pins on EVERY
+    // path in this file, so it is banned here -- the one place all three validators
+    // already share -- rather than on the migration path alone (#3775 review).
+    //
+    // `set_config` is the pattern that catches the reachable form, and the two
+    // patterns are NOT interchangeable. `stripSqlForKeywordScan` replaces a quoted
+    // span with an EMPTY one, so `set_config('search_path', 'public', true)`
+    // normalises to `set_config('', '', true)` and `\bsearch_path\b` never sees the
+    // GUC name at all. The function name is code, not a literal, so `set_config`
+    // does -- including `pg_catalog.set_config(...)`, where the word boundary holds
+    // after the dot, and a dollar-quoted `$$search_path$$`, whose body is erased the
+    // same way.
+    //
+    // `search_path` is kept for the forms where the GUC name IS code: `SET
+    // search_path TO ...`, `RESET search_path`, `ALTER ROLE/DATABASE ... SET
+    // search_path`. Most of those are already refused upstream by the leading-keyword
+    // whitelists, but those whitelists exist to classify statements, not to defend
+    // the pin, and this does not depend on them.
+    //
+    // Measured over the shipped plugin corpus -- 18 migration files across the 3
+    // plugins that ship any, plus every `ctx.db.query`/`ctx.db.execute` statement in
+    // `packages/plugins` -- ZERO statements match either pattern, so no shipped
+    // statement changes verdict. (Positive control: the same scan finds `create
+    // table` in 8 files; a minted nonce finds 0.)
+    /\bset_config\b/,
+    /\bsearch_path\b/,
   ];
   const matched = banned.find((pattern) => pattern.test(normalized));
   if (matched) {
@@ -1357,25 +1383,25 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
             if (statements.length === 0) {
               throw new Error(`Plugin migration ${migrationKey} is empty`);
             }
-            // PIN, for exactly the plugin-authored statements and nothing else
-            // (PEN-6669). The validators in this file adjudicate SCHEMA-QUALIFIED
-            // names; an UNQUALIFIED relation name is not one, so a migration that
-            // qualifies ONE object satisfies every lexical test and the bare name is
-            // resolved by Postgres through `search_path`, which nothing on this path
-            // set -- so it reached `public`. PEN-6604 closed that on `query`/`execute`
-            // and deliberately did not reach here, because this path interleaves the
-            // plugin's statements with the ORM ledger writes below and a
-            // transaction-level pin breaks those.
+            // PIN, scoped to the plugin-authored statements and LIFTED before the
+            // ledger write below (PEN-6669). The validators here adjudicate
+            // SCHEMA-QUALIFIED names only, so a migration that qualifies ONE object
+            // satisfies every lexical test while a bare name beside it is resolved by
+            // Postgres through `search_path` -- which nothing on this path set. The
+            // scope is the statement loop and not the transaction because
+            // `applyMigrations` interleaves these statements with the Drizzle ledger
+            // writes, which name their tables unqualified; a transaction-level pin
+            // breaks those. The measurements behind it are in the PR and on PEN-6669.
             //
-            // So the pin is scoped to the statement loop and LIFTED before the ledger
-            // write. Measured ALLOW on the migration path at master e89b8388 before
-            // this change: `INSERT INTO ns.t SELECT ... FROM secrets`, `UPDATE ns.t ...
-            // FROM secrets`, a `WITH` CTE over a bare name, `CREATE TABLE ns.t AS
-            // SELECT ... FROM secrets`, `CREATE VIEW ns.v AS SELECT ... FROM secrets`
-            // and `ALTER TABLE ns.t ... REFERENCES secrets(id)`. The view is the one
-            // that outlives the migration: Postgres resolves a view body at CREATE and
-            // stores the OIDs, so an unpinned `CREATE VIEW` binds to `public`
-            // permanently.
+            // Re-pinned before EVERY statement, not once per file (#3775 review). A
+            // statement can write the GUC itself and undo the pin for the rest of the
+            // file -- measured, `INSERT INTO ns.probe (v) SELECT set_config(
+            // 'search_path', 'public', true)` then read `public` from the next
+            // statement. `assertNoBannedSql` now refuses that statement outright and
+            // is the control that also covers the session-scoped `false` variant,
+            // which outlives this transaction; this re-pin is the independent second
+            // control, so a GUC-write form the lexical ban does not anticipate costs
+            // at most the one statement that performs it.
             //
             // There is NO `finally` here on purpose. A failed statement ABORTS the
             // transaction, and every later command in it is refused until rollback, so
@@ -1384,7 +1410,6 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
             // whole reason it is `SET LOCAL`. (The `catch` below writes its failure row
             // through `db` rather than `client`, which predates this change -- stated as
             // what the code does, not as a motive this change established.)
-            await pinSearchPath(client, namespace.namespaceName);
             for (const statement of statements) {
               validatePluginMigrationStatement(
                 statement,
@@ -1392,6 +1417,7 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
                 coreReadTables,
                 knownSchemas,
               );
+              await pinSearchPath(client, namespace.namespaceName);
               await client.execute(sql.raw(statement));
             }
             await restoreSearchPath(client, priorSearchPath);
