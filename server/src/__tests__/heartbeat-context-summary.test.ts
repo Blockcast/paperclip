@@ -3683,6 +3683,34 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
       })).toBeNull();
     });
 
+    // PEN-6476 review round 4. The note test below pins the TRIGGERED branch on both
+    // persisted sources; this pins the CLAIMED one, which PEN-6553 added after that
+    // test was written. The asymmetry is exactly how the note was lost once already:
+    // a rebase auto-merged the `notes:` passthrough onto whichever branch existed in
+    // both trees and left the other silently without it, and no textual check could
+    // see that because the patch had not changed. A branch with no test is a branch
+    // the next rebase may drop. Both sources again, for the same precedence reason.
+    it("carries the monitor note through on the claimed branch as well", () => {
+      expect(triggeredMonitorForPrompt(claimedFireRow)).toMatchObject({
+        phase: "claimed",
+        notes: "waiting on the merge",
+      });
+
+      // Second source, reached only with the policy note absent: the precedence in
+      // `derivePersistedMonitorState` is POLICY first, then the `monitorNotes`
+      // column, then the JSON state -- one `notes` const shared by every branch it
+      // returns. A claimed row always has an armed policy monitor, so the policy arm
+      // is the one that carries here in practice and the column is the fallback.
+      expect(triggeredMonitorForPrompt({
+        ...claimedFireRow,
+        executionPolicy: scheduledPolicy({ notes: undefined }),
+        monitorNotes: "HOLD: the armer owns the re-enqueue; do not push.",
+      })).toMatchObject({
+        phase: "claimed",
+        notes: "HOLD: the armer owns the re-enqueue; do not push.",
+      });
+    });
+
     // A claim marker alone is not an obligation. Nothing writes this shape today
     // -- the cleared patch nulls both columns together -- but the branch is
     // keyed on `scheduled`, not on the marker, and this pins that.
@@ -3698,8 +3726,11 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     // PEN-6476. `derivePersistedMonitorState` resolves `notes` for every branch it
     // returns; this helper simply did not copy it out, so the note never reached a
     // caller. Pinned on BOTH persisted sources because they are resolved in a
-    // precedence (`monitorNotes` column, then policy, then JSON state) and a fix
-    // that reads only one of them passes half of this.
+    // precedence (the armed POLICY monitor's note, then the `monitorNotes` column,
+    // then the JSON state -- `issue-execution-policy.ts`, the single `notes` const in
+    // `derivePersistedMonitorState`) and a fix that reads only one of them passes
+    // half of this. This case reaches the column and the state arms because it
+    // supplies no policy; the claimed-branch case above reaches the policy arm.
     it("carries the monitor note through from the JSON state and from the column", () => {
       expect(triggeredMonitorForPrompt({
         ...base,
