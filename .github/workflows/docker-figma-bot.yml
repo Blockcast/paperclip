@@ -145,6 +145,17 @@ jobs:
           driver: remote
           endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}
 
+      # Name the base by digest instead of letting the build date decide it
+      # (PEN-5927). Fails the build when the base cannot be resolved — see
+      # scripts/resolve-base-digest.sh for why that is the cheap failure.
+      - name: Resolve base image digest
+        id: base
+        run: |
+          set -euo pipefail
+          resolved="$(scripts/resolve-base-digest.sh 'harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:latest')"
+          echo "image=${resolved}" >> "$GITHUB_OUTPUT"
+          echo "Base pinned to ${resolved}"
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
@@ -166,6 +177,8 @@ jobs:
           push: true
           provenance: false
           sbom: false
+          build-args: |
+            WEBFLOW_BOT_IMAGE=${{ steps.base.outputs.image }}
           cache-from: |
             type=registry,ref=harbor.blockcast.net/paperclip-figma-bot/figma-bot:buildcache-inline
             type=registry,ref=harbor.blockcast.net/paperclip-figma-bot/figma-bot:latest
@@ -176,4 +189,6 @@ jobs:
           # The old registry/GHA entries remain read-only migration fallbacks.
           cache-to: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=inline' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.base.name=${{ steps.base.outputs.image }}
