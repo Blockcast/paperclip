@@ -124,7 +124,8 @@
     "src/__tests__/routine-pipeline-workspace-command-authz.test.ts",
     "src/__tests__/pr-reconciler-work-product-repair.test.ts",
     "src/__tests__/plugin-database.test.ts",
-    "src/__tests__/issue-parked-disposition.test.ts"
+    "src/__tests__/issue-parked-disposition.test.ts",
+    "src/__tests__/heartbeat-destroyed-park-recovery.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

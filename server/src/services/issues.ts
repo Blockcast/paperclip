@@ -12898,6 +12898,13 @@ export function issueService(db: Db) {
         // reader-facing guidance all live in `runbooks/deliberate-park-release-edge.md`
         // and the module doc of `services/issue-park-expiry.ts`, not restated here.
         patch.parkedWakeFiredAt = null;
+        // PEN-6556: re-arm the park's HANDOFF edge on both arms too, for exactly the
+        // reasons above — the marker describes a park, not a row, so a re-park owes a
+        // fresh handoff and an un-park leaves nothing for it to describe. Kept beside its
+        // sibling rather than folded into it because the two edges are independent: a
+        // park can fire its release wake and never need a handoff (the ordinary case), or
+        // be handed off having never fired one (the `cancelled` case this exists for).
+        patch.parkedRecoveryEmittedAt = null;
       }
 
       const nextAssigneeAgentId =

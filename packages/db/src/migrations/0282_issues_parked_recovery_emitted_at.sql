@@ -1,0 +1,79 @@
+-- PEN-6556: give the deliberate park a HANDOFF edge, as 0262 gave it a RELEASE edge.
+--
+-- 0262 added `parked_wake_fired_at` and the sweep that fires an expired park. That sweep
+-- is gated on `ISSUE_PARK_EXPIRY_WAKE_STATUSES`, which excludes `done` and `cancelled` --
+-- correctly, because "the row got closed before its deadline" is ordinary and waking a
+-- closed row is the BLO-23206 shape that `issue-park-expiry-sweep.test.ts` pins.
+--
+-- That reading is true of an ordinary cancel and FALSE of a RECYCLE. The alertmanager
+-- plugin cancels an origin row when its alert resolves and reopens it when the alert
+-- re-fires, so its cancel is not a close at all. The park's four columns survive that
+-- cancel intact, which is exactly what makes the loss invisible: a dead park is
+-- byte-identical to a healthy one on every surface, and no field is cleared, no error
+-- raised and no comment posted. Measured 2026-11-12 on PEN-4881 -- parked 10-30T06:12:22Z
+-- until 10-31T01:00:00Z, cancelled 10-30T07:41:11Z, and the park fired 12 d 21 h late,
+-- 15 s after an unrelated alert re-fire happened to restore the row to `todo`.
+--
+-- The park is therefore the only one of the row's two attendance mechanisms with no
+-- handoff. The MONITOR half of this same cancel is detected
+-- (`reconcileUndeliverableIssueMonitors`), recorded (`clearReason: "cancelled"`,
+-- PEN-5343), recovered (`reconcileCancelledIssueMonitorRecoveries`, PEN-5346) and
+-- documented. PEN-4729 carries the whole asymmetry on one row from one cancel: its
+-- monitor was handed back to PEN-6538 and worked, while its park is still unfired 16.9
+-- days later.
+--
+-- `parked_recovery_emitted_at` is the fire-once marker for the sweep that closes that
+-- gap, and it is modelled on `parked_wake_fired_at` three columns above rather than on
+-- the monitor's `executionState` stamp. That siting is load-bearing and was reached by
+-- refutation, not by preference. `issueExecutionStateSchema` is a plain `z.object`
+-- (`packages/shared/src/validators/issue.ts`), so an unregistered `park` key is STRIPPED
+-- on every parse. Registering it as OPTIONAL does not rescue it either, because
+-- `blankExecutionState`, `buildCompletedState`, `buildStateWithCompletedStages` and
+-- `buildChangesRequestedState` each ENUMERATE the fields they carry, and an absent
+-- optional field is legal -- so no type error is reachable and tsc cannot force a builder
+-- to preserve it. Registering it as REQUIRED does force the builders, and still does not
+-- rescue it: `clearExecutionStatePatch` assigns `executionState = null` outright, which
+-- is legal against any shape. A column is immune to that whole state machine.
+--
+-- NULL means "no handoff has been emitted for this row's current park" -- the correct
+-- reading for every pre-existing row, so there is no backfill. The already-destroyed
+-- population is picked up by the first sweep after deploy and handed back exactly once,
+-- which is the intended migration behaviour rather than a side effect. Its size is
+-- measured rather than estimated: over all 5982 company rows on 2026-11-12, 84 parks sit
+-- on a status that cannot wake them -- `done` 55 (benign, the work finished first) and
+-- `blocked` 22 (dormant by design: the stranded-blocked reconciler drains such a row to
+-- `todo`, after which the expiry sweep covers it on `todo`). Only the `cancelled` cell is
+-- a defect, it is 7 rows, and 5 of those are past their deadline and so selected by the
+-- first pass.
+--
+-- The park writer (`services/issues.ts`) resets this to NULL on every `parkedDisposition`
+-- write, beside the `parked_wake_fired_at` reset and for the same reason: the marker
+-- describes a PARK, not a row, so a re-park must re-arm the handoff edge. The sweep
+-- additionally treats `parked_recovery_emitted_at < parked_at` as unstamped, so a future
+-- writer that forgets the reset degrades to a late handoff rather than to permanent
+-- silence. As with 0262 the two guards are redundant for THIS writer and independent only
+-- against a different writer's bug; do not delete the reset on the strength of the
+-- backstop.
+ALTER TABLE "issues" ADD COLUMN "parked_recovery_emitted_at" timestamp with time zone;
+--
+-- ⛔ NO INDEX, deliberately -- the same trade 0262 made, for the same reasons, and on a
+-- strictly smaller population than the one it declined an index for.
+--
+-- The sweep's candidate query filters on `status = 'cancelled' AND parked_until <= now()
+-- AND parked_recovery_emitted_at IS NULL`, which a partial index would serve well. But
+-- building ANY index on `issues` takes an ACCESS EXCLUSIVE lock for a full heap scan,
+-- because drizzle migrations run inside a transaction and `CREATE INDEX CONCURRENTLY`
+-- cannot. The repo's answer is the concurrent-index guard (`concurrent-index-guard.ts`,
+-- worked example 0243), which RAISEs unless an operator precreated the index
+-- CONCURRENTLY first -- and that adds an operator step that must land BEFORE migrations,
+-- which is precisely the unapplied-operator-half failure PEN-4404 measured. A poor thing
+-- to make a reliability fix depend on.
+--
+-- The index is also an optimisation and never a correctness requirement: the SQL is a
+-- deliberately sound over-approximation and `issueParkOwesDestroyedHandoff` is the
+-- decision, so an unindexed scan returns the same rows, more slowly. `tickExpiredIssueParks`
+-- already runs this same per-tick shape over `issues` on `parked_until` with no index at
+-- all, on this same timer.
+--
+-- If this scan ever shows up in `pg_stat_statements`, add the index through the guard as a
+-- separate migration with its own precreation step. Do not add a bare `CREATE INDEX` here.
