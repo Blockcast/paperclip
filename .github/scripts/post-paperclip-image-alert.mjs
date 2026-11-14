@@ -81,9 +81,18 @@ export const STEP_TIMEOUT_ANNOTATION = /has timed out after/i;
 /**
  * `cancel-in-progress: true` on this job's concurrency group, so a newer master
  * commit kills a RUNNING build. The group name is the only field that proves
- * supersession, and it must be anchored to THIS workflow: a looser
- * `docker-` prefix would also match `docker-designer-`, `docker-webflow-bot-`
- * and the main `docker-refs/...` lane, and would suppress a real kill there.
+ * supersession, and it is anchored to THIS lane's own group: on a push the
+ * group is `docker-${{ github.ref }}-publish`, which renders as
+ * `docker-refs/heads/master-publish`. That is what the anchor below matches.
+ *
+ * A looser `docker-` prefix would instead match the SIBLING image lanes --
+ * `docker-designer-`, `docker-figma-bot-`, `docker-webflow-bot-` -- and could
+ * suppress a real kill here as though it were a supersede.
+ *
+ * The annotations read below come only from this run's own `build-and-push`
+ * check-run, so a sibling's group cannot in fact appear in them today. The
+ * narrow anchor is defence in depth against that sourcing ever widening, not
+ * the only thing standing between this lane and a false suppression.
  */
 export const SUPERSEDE_ANNOTATION = /higher priority waiting request for '?docker-refs\//;
 
@@ -183,7 +192,7 @@ export function buildAlert({ state, repo, branch, runUrl, headSha, buildResult, 
       branch,
     },
     annotations: {
-      summary: `The figma-bot image build is failing on ${branch} in ${repo}`,
+      summary: `The paperclip image build is failing on ${branch} in ${repo}`,
       description:
         `\`Docker\` did not publish an image for ${headSha} on ${branch}.` +
         `${detail}\n\n` +

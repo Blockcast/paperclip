@@ -316,6 +316,26 @@ test("a resolved push back-dates both ends, so Alertmanager accepts it", () => {
 
 // Each image lane must own a distinct alert identity, or two lanes dedupe onto
 // one Paperclip issue and the second failure is invisible.
+// The summary becomes the TITLE of the Paperclip issue the alertmanager
+// bridge opens, so a summary naming the wrong lane points on-call at the
+// wrong workflow -- and the lane it names would then look like a duplicate
+// of it rather than a separate outage.
+//
+// These lanes are near-identical copies of one another, so this is exactly
+// the field a new lane gets wrong. PEN-6683's review found the paperclip
+// lane still saying `figma-bot`; nothing asserted on the summary in ANY of
+// the four lanes, so a full green suite said nothing about it.
+test("the alert summary names THIS lane and no sibling", () => {
+  const { summary } = buildAlert({
+    state: "firing", repo: "r", branch: "master", runUrl: "", headSha: "a",
+    buildResult: "failure", cancellation: "n/a", now: new Date(),
+  }).annotations;
+  assert.match(summary, /paperclip image build is failing/);
+  for (const sibling of ["figma-bot", "webflow-bot", "designer", "mcp-gateway", "mcp-external"]) {
+    assert.doesNotMatch(summary, new RegExp(sibling));
+  }
+});
+
 test("the alert identity is distinct from the other image lanes'", async () => {
   const gateway = await import("../.github/scripts/post-mcp-gateway-image-alert.mjs");
   const external = await import("../.github/scripts/post-mcp-external-image-alert.mjs");
