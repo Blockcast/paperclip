@@ -622,7 +622,7 @@ const refusedDeploy = (failingStep) => [
     conclusion: 'failure',
     steps: [
       { name: 'Verify release tooling revision', conclusion: 'success' },
-      { name: failingStep, conclusion: 'failure' },
+      { name: failingStep, conclusion: 'failure', completed_at: '2026-11-14T07:41:12Z' },
     ],
   },
 ];
@@ -657,5 +657,6 @@ test('a refused run is not a refill for the close gate, and is not a dead lane',
   const last = await findLastCompletedDispatch({ client });
   assert.equal(last.fate, DISPATCH_FATE.REFUSED_MIN_INTERVAL);
   assert.equal(last.run.deployExecuted, false);
+  assert.equal(last.run.refusedAt, '2026-11-14T07:41:12Z', 'the retry clock starts at the refusal');
   assert.equal(LANE_FAILED_TO_DELIVER_FATES.has(DISPATCH_FATE.REFUSED_MIN_INTERVAL), false);
 });

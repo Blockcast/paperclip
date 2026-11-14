@@ -228,8 +228,6 @@ jobs:
           REPO: ${{ github.repository }}
           PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
           DEAD_DISPATCH_JSON_PATH: ${{ runner.temp }}/dead-dispatch.json
-          # BLO-57061 retry pre-check reads paperclip-0's age, as docker.yml's deploy job does.
-          PAPERCLIP_NAMESPACE: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
           # True only for the daily cron and a manual kick. Keyed on WHICH cron
           # entry fired, not on the wall clock: GitHub delays scheduled runs under
           # load (5-17min late on this repo's own history), and an hour check would
@@ -374,17 +372,25 @@ jobs:
           # minimum-interval guard (worker rolled < 6h ago), so it shipped nothing.
           # Only the daily slot dispatches, so without this one same-image worker
           # restart before 07:23Z cost a whole day. A sampling slot re-dispatches
-          # once paperclip-0 is past the interval, judged by the SAME unchanged
-          # guard script so the two cannot disagree. Guard (1) above still holds:
+          # once paperclip-0 is past the interval; docker.yml's guard still has the
+          # final say on the retried run. Guard (1) above still holds:
           # we only get here when nothing is pending, so this cannot stack.
           RETRY_MIN_INTERVAL=false
           if [ "$DEAD_FATE" = "refused-min-interval" ] && [ "$IS_DISPATCH_SLOT" != "true" ]; then
             REFUSED_ID="$(jq -r '.run.databaseId // "unknown"' "$DEAD_DISPATCH_JSON_PATH")"
-            # A failed read defers rather than dispatching blind: an empty
-            # POD_CREATED means "pod absent, allow" to the guard script.
-            if POD_CREATED="$(kubectl -n "${PAPERCLIP_NAMESPACE:-paperclip}" get pod paperclip-0 \
-                                --ignore-not-found -o jsonpath='{.metadata.creationTimestamp}')" \
-               && POD_CREATED="$POD_CREATED" OVERRIDE=none .github/scripts/check-deploy-min-interval.sh >/dev/null 2>&1; then
+            # Judged from GitHub data, NOT kubectl: this job has no kubeconfig and
+            # the runner SA has no grant in the paperclip namespace, so a pod read
+            # would fail and defer forever (Staff review of #3773). The refusal at
+            # REFUSED_AT proves paperclip-0 was < 6h old then, so by REFUSED_AT+6h
+            # it is past the interval. shortcut: waits the full 6h rather than the
+            # logged "Retry in Nm"; read the step log if same-day slack ever bites.
+            # If the worker restarted AGAIN, docker.yml's unchanged guard refuses
+            # once more and that newer refusal restarts this clock. Empty or
+            # unparseable REFUSED_AT defers (date fails -> else branch).
+            REFUSED_AT="$(jq -r '.run.refusedAt // ""' "$DEAD_DISPATCH_JSON_PATH")"
+            if [ -n "$REFUSED_AT" ] \
+               && REFUSED_EPOCH="$(date -u -d "$REFUSED_AT" +%s 2>/dev/null)" \
+               && [ "$(( ${NOW_EPOCH:-$(date -u +%s)} - REFUSED_EPOCH ))" -ge "${MIN_INTERVAL_SECONDS:-21600}" ]; then
               RETRY_MIN_INTERVAL=true
               echo "::notice::Retrying the dispatch: run $REFUSED_ID was refused by the BLO-49140 minimum-interval guard and paperclip-0 is now past the interval (BLO-57061)."
               {
