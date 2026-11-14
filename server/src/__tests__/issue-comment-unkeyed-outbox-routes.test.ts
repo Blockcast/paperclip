@@ -448,35 +448,90 @@ describe("issue comment unkeyed outbox routing", () => {
     expect(mockIssueService.addComment.mock.calls[0]).toHaveLength(4);
   });
 
-  // PEN-6645 item 2. `!interruptRequested` is the ONE remaining conjunct that
-  // is INDEPENDENTLY reachable — i.e. the only one a request can falsify while
-  // leaving all six others true, so the only one a test can pin without the
-  // pin being satisfied by a sibling term.
+  // PEN-6645 item 2. Two of the remaining four conjuncts are settled here, and
+  // the other two are recorded as findings, because a conjunct nobody can
+  // isolate is a result rather than a gap.
   //
-  // The reachability of the other four was settled by reading the route, and
-  // the finding is recorded here because a conjunct nobody can isolate is a
-  // result, not a gap:
+  // ⛔ A conjunct is PINNED only by a NEGATIVE routing assertion on a request
+  // that falsifies THAT term and no other. A positive assertion cannot pin an
+  // exclusion term at all: deleting a conjunct only WIDENS eligibility, so
+  // every positive test still passes.
   //
-  //  - `!resumeRequested` and `!effectiveMoveToTodoRequested` CO-FIRE on the
-  //    case the route's own comment names (`resume: true` on an already-`todo`
-  //    issue): `explicitMoveToTodoRequested = effectiveReopenRequested ||
-  //    effectiveResumeRequested`, so an effective resume makes BOTH false.
-  //    They separate only for a `commentOnlyGrantedPeerAgent`, where
-  //    `effectiveResumeRequested` is forced false while `resumeRequested` —
-  //    the term the predicate actually reads — stays true. That is a real
-  //    independent case and it is NOT pinned here; it needs the comment-only
-  //    peer-grant fixture, which this suite does not build.
+  //  - `!interruptRequested` is independently reachable, and is pinned below.
+  //  - `!effectiveMoveToTodoRequested` is ALSO independently reachable, and is
+  //    pinned below. `reopened` is assigned at exactly ONE site, INSIDE the
+  //    move-to-todo block, as `isClosed || (isBlocked && !hasUnresolved...)`,
+  //    and that block's guard is `effectiveMoveToTodoRequested && (isClosed ||
+  //    (isBlocked && ...) || shouldResumeInProgressScheduledRetry)`. So on a row
+  //    that is neither closed nor blocked with no in-progress scheduled retry, a
+  //    USER `reopen: true` sets `effectiveMoveToTodoRequested` while the block
+  //    never runs — `svc.update` is not called, `currentIssue` is never
+  //    reassigned, and `reopened` stays FALSE. `reopened` READS as though it
+  //    tracks `reopenRequested` and does not; that is where the two names
+  //    diverge, and it is why this case was previously recorded as unreachable.
+  //  - `!resumeRequested` is NOT independently falsifiable, and the earlier
+  //    finding that it separates via a `commentOnlyGrantedPeerAgent` is WRONG.
+  //    Every disjunct of that flag either REQUIRES `!resumeRequested`
+  //    (`mentionGrantedPeerAgentCommentOnly` carries `!reopenRequested &&
+  //    !resumeRequested` in its own definition) or 403s a `resume: true`
+  //    request before the predicate is reached (the recovery-handoff,
+  //    creator/manager and recovery-owner grants each return 403 on
+  //    `reopenRequested || resumeRequested`). So whenever a `resume: true`
+  //    request REACHES this predicate, `commentOnlyGrantedPeerAgent` is false,
+  //    hence `effectiveResumeRequested` is true, hence
+  //    `explicitMoveToTodoRequested` is true. `idempotentReplay` is false on the
+  //    unkeyed path by construction, and `isAssigneeSelfCommentOnTerminalIssue`
+  //    returns false whenever `resumeRequested` is set — so
+  //    `effectiveMoveToTodoRequested` is true too. ⇒ on this path
+  //    `!effectiveMoveToTodoRequested` STRICTLY IMPLIES `!resumeRequested`:
+  //    the term is redundant here, and any test claiming to pin it would really
+  //    be pinning its neighbour. Kept in the predicate as defence in depth, not
+  //    deleted, because it is the term that states the INTENT the builder
+  //    cannot express; the implication above is a property of the current
+  //    grant/403 layout, which is a weaker thing to rest on than the term.
   //  - `!scheduledRetrySupersededByComment` is a COMPENSATING term, not an
   //    independently reachable one: it is assigned only inside the
-  //    `effectiveMoveToTodoRequested && (isClosed || isBlocked || shouldResume)`
-  //    block, which unconditionally runs `svc.update(id, { status: "todo" })`.
-  //    So whenever it is true, `effectiveMoveToTodoRequested` is true AND
-  //    `currentIssue.status === issue.status` is false. No request can falsify
-  //    it alone, and a test claiming to pin it would really be pinning one of
-  //    those two.
+  //    `effectiveMoveToTodoRequested && (isClosed || (isBlocked && ...) ||
+  //    shouldResume)` block, which unconditionally runs
+  //    `svc.update(id, { status: "todo" })`. So whenever it is true,
+  //    `effectiveMoveToTodoRequested` is true AND `currentIssue.status ===
+  //    issue.status` is false. No request can falsify it alone, and a test
+  //    claiming to pin it would really be pinning one of those two.
   //  - `currentIssue.status === issue.status` is the re-read concurrency guard
   //    and moves only through that same block, so it inherits the same
   //    entanglement.
+  it("keeps a MOVE-TO-TODO comment on the inline path", async () => {
+    // PEN-6645 box 5. The move-to-todo block writes `reopened`/`reopenedFrom`
+    // and swaps the assignee wake, none of which the builder can express — so
+    // the request is excluded even when the block does not END UP running.
+    //
+    // This row is `in_progress` and NOT blocked, and `getCurrentScheduledRetry`
+    // resolves null, so the block's guard (`isClosed || (isBlocked && ...) ||
+    // shouldResumeInProgressScheduledRetry`) is false and `svc.update` never
+    // runs. That is what leaves every neighbour conjunct TRUE: `reopened` is
+    // assigned only inside that block, `currentIssue` is never reassigned, and
+    // `scheduledRetrySupersededByComment` stays false. A BOARD actor is used
+    // because the `assertExplicitResumeIntentAllowed` re-check on the reopen arm
+    // is `req.actor.type === "agent"` only.
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+    const { app } = await createApp();
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/comments`)
+      .send({ body: "bumping this back to the top of the queue", reopen: true });
+
+    expect(res.status).toBe(201);
+    // The ONLY conjunct this request falsifies is `!effectiveMoveToTodoRequested`.
+    // Asserting `update` was NOT called is what makes that true and what makes
+    // this a pin on the named term rather than on `!reopened` or on the re-read
+    // guard: if the block had run, those two would have moved as well and the
+    // routing assertion below would no longer say which term excluded it.
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockCommentEffects.enqueueCommentEffects).not.toHaveBeenCalled();
+    // Inserted on the default handle: four arguments, no transaction.
+    expect(mockIssueService.addComment.mock.calls[0]).toHaveLength(4);
+  });
+
   it("keeps an INTERRUPTING comment on the inline path", async () => {
     // `interruptedRunId` rides the activity row and every wake payload, and
     // `buildKeyedCommentEffectIntents` carries neither — so the interrupt is
