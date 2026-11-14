@@ -55,6 +55,7 @@ import {
 import { accessService } from "../services/access.js";
 import { authorizationService } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
+import { isMaskedEchoOfStoredWorkspaceRuntime } from "../redaction.js";
 import { assertCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -434,17 +435,20 @@ function assertPipelineCompanyAccess(req: Request, companyId: string) {
  * Non-agent actors are unaffected: `assertNoAgentHostWorkspaceCommandMutation` returns early
  * for every actor type that is not an agent, so the board and the pipeline UI keep working.
  *
- * ⛔ KNOWN RESIDUAL, AND IT IS LIVE — NOT PROSPECTIVE — SINCE 2026-11-13. This collector
- * covers the two COMMAND paths and nothing else. `POST /routines/:id/run` calls the compound
- * `assertNoAgentIssueHostControlledMutation` instead, so it inherits every future addition to
- * the issue host-controlled set automatically; THESE THREE ROUTES DO NOT — and that prediction
- * has now been borne out in both directions at once. `#3699` (PEN-6430) landed
- * `collectAgentDisallowedIssueWorkspaceRuntimePaths` on `master`: the routine route picked the
- * refusal up with no edit, while `config.{onEnter,automation}
- * .executionWorkspaceSettings.workspaceRuntime` is settable by an agent at these three routes
- * TODAY and refused at the four issue routes — the exact shape PEN-6532 was filed for. (The
- * sentence replaced here said that collector "does not exist on `master`", which is why it was
- * not called. It exists, in `./workspace-command-authz.js`, exported beside the two asserts.)
+ * ⛔ STRUCTURAL RESIDUAL — THE INHERITANCE GAP IS STILL REAL, AND IT IS NO LONGER A LIVE HOLE.
+ * This collector covers the two COMMAND paths and nothing else. `POST /routines/:id/run` calls
+ * the compound `assertNoAgentIssueHostControlledMutation`, so it inherits every future addition
+ * to the issue host-controlled set automatically; THESE THREE ROUTES DO NOT, and that is
+ * unchanged. What changed is the one instance it had already produced:
+ * `config.{onEnter,automation}.executionWorkspaceSettings.workspaceRuntime` was settable by an
+ * agent here from the day `#3699` (PEN-6430) refused it at the four issue routes, and
+ * `assertNoAgentStageConfigWorkspaceRuntimeMutation` below now refuses it here too (PEN-6595).
+ * ⚠ It is a SECOND hand-wired guard, not inheritance — so the next addition to the issue set
+ * will arrive here exactly as late as this one did, and the way to stop that recurring is to
+ * route these branches through the compound guard, which the restore ordering below is what
+ * makes awkward. (An earlier version of this paragraph said that collector "does not exist on
+ * `master`", which is why it was not called. It exists, in `./workspace-command-authz.js`,
+ * exported beside the two asserts.)
  *
  * ⛔ THE OBVIOUS FIX IS NOT FREE, AND THE REASON IS ON THIS SURFACE RATHER THAN IN THE GUARD.
  * The issue routes refuse a non-nullish `workspaceRuntime` partly to stop a withheld reader
@@ -465,12 +469,18 @@ function assertPipelineCompanyAccess(req: Request, companyId: string) {
  * round-trip. Admitting an all-sentinel echo at those two would be a HOLE rather than a
  * carve-out: it would let `REDACTED_EVENT_VALUE` be written into a fresh stage config.
  *
- * ⇒ whoever closes this: refuse OUTRIGHT at stage CREATE and at pipeline CREATE's `stages[]`;
- * at stage PATCH either admit an all-sentinel echo and refuse a fresh value, or route the
- * branch through the compound guard only after the restore has run. Do not leave it to be
- * noticed. Measured and carried on PEN-6595, graded Low there because a grant row is the only
- * way an agent reaches these routes at all. (Raised by Ally on `#3701` and accepted; it could
- * not be wired then. The PATCH/CREATE split was raised by Ally on `#3745`.)
+ * ✅ THE `workspaceRuntime` HALF IS CLOSED AT THESE THREE ROUTES, 2026-11-14 (PEN-6595), in
+ * exactly that shape — the INHERITANCE gap above is NOT closed. The prescription is kept rather
+ * than deleted because it is the specification the guard below has to keep meeting: refuse
+ * OUTRIGHT at stage CREATE and at pipeline CREATE's `stages[]`; at stage PATCH admit an
+ * unmodified echo of a masked read and refuse a fresh value. The echo test is
+ * `isMaskedWorkspaceRuntimeEcho` (`../redaction.ts`) — the mask used as its own oracle, so an
+ * identity or enum key added to the mask is honoured by the guard in the same commit. Graded
+ * Low because a grant row is the only way an agent reaches these routes at all.
+ * `__tests__/pipeline-stage-workspace-runtime-authz.test.ts` pins both arms, and the case that
+ * matters most is the one asserting the SAME echo is refused at the two CREATE paths. (Raised
+ * by Ally on `#3701` and accepted; it could not be wired then. The PATCH/CREATE split was
+ * raised by Ally on `#3745`.)
  */
 function collectStageConfigWorkspaceCommandPaths(config: unknown, prefix: string): string[] {
   if (typeof config !== "object" || config === null || Array.isArray(config)) return [];
@@ -491,6 +501,122 @@ function collectStageConfigWorkspaceCommandPaths(config: unknown, prefix: string
 function assertNoAgentStageConfigCommandMutation(req: Request, config: unknown, prefix: string) {
   assertNoAgentHostWorkspaceCommandMutation(req, collectStageConfigWorkspaceCommandPaths(config, prefix));
 }
+
+/**
+ * PEN-6595 — the `workspaceRuntime` half of the same two carriers, closed in the
+ * ASYMMETRIC shape the block above specifies. Read that block first: it records WHY
+ * this is not one more line in `collectStageConfigWorkspaceCommandPaths`.
+ *
+ * `workspaceRuntime` is a bare `z.record(z.string(), z.unknown())` at every schema that
+ * declares it, and `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` carries it
+ * onto the created issue's `config.workspaceRuntime`, from which the runtime starts
+ * operator-authored service commands. The four issue write routes have refused an agent
+ * setting it since `#3699`; these three did not.
+ *
+ * ⛔ `storedWorkspaceRuntime` IS THE WHOLE ASYMMETRY. Pass it only where a restore runs.
+ * `services/pipelines.ts` calls `restoreWithheldPipelineStageConfig` on `input.patch.config`,
+ * i.e. on stage PATCH alone, so only there can an admitted echo end with the operator's
+ * stored value back in place. At stage CREATE and at pipeline CREATE's `stages[]` there is
+ * nothing to restore FROM — pass `undefined` and every non-nullish value is refused. A plain
+ * refusal there breaks no round-trip, because there is no stored value to round-trip.
+ *
+ * ⛔ AND A CREATE-ONLY REFUSAL WOULD NOT HAVE BEEN A CLOSE: it is bypassable one route over
+ * by PATCHing the value in afterwards. Both halves are required or neither is worth having.
+ *
+ * ⛔ THE PATCH TEST COMPARES AGAINST THE STORED VALUE, NOT AGAINST THE INCOMING ONE'S OWN
+ * MASK. A fixpoint test (`mask(x)` deep-equal `x`) looks equivalent and is not: the mask
+ * passes identity keys and the in-set `kind`/`lifecycle` enums through verbatim, so an agent
+ * can author THOSE and still be a fixpoint — duplicating a stored service so its real command
+ * is restored and started twice, flipping `service`→`job` or `shared`→`ephemeral` under a
+ * restored command, or re-pointing one element's identity onto another's. None writes a fresh
+ * command string and every one changes what the host executes. `isMaskedEchoOfStoredWorkspaceRuntime`
+ * carries the full reasoning; it was caught in review on `#3764` before it landed.
+ *
+ * ⚠ The nullish admission is the issue-route rule, unchanged and for the same measured
+ * reason: `parseIssueExecutionWorkspaceSettings` drops a nullish `workspaceRuntime`
+ * entirely, so it provably cannot reach `config.workspaceRuntime` or introduce a command.
+ * ⛔ But the REMEDY differs by route and the difference is destructive, which is why the
+ * message below is a parameter rather than a constant. At a CREATE path `null` is a safe
+ * "do not set this". At stage PATCH `null` is the one thing an agent must NOT be told to
+ * send: there it DELETES the operator's stored runtime config rather than clearing a
+ * marker. The issue-route refusal's own "send `null`" text would be wrong here.
+ *
+ * ⚠ BOTH CARRIERS COMPARE AGAINST THE STORED `onEnter` BLOCK, and that is not an oversight:
+ * `restoreWithheldPipelineStageConfig` restores both from stored `onEnter` too, because
+ * `persistedStageConfig` destructures `automation` out before every write so no stored row
+ * can carry one. Keying `automation` off a stored `automation` would compare against
+ * `undefined` and refuse every faithful round-trip of that branch.
+ */
+function collectStageConfigWorkspaceRuntimePaths(
+  config: unknown,
+  prefix: string,
+  storedWorkspaceRuntime: unknown,
+): string[] {
+  if (typeof config !== "object" || config === null || Array.isArray(config)) return [];
+  const record = config as Record<string, unknown>;
+  const paths: string[] = [];
+  for (const carrier of ["onEnter", "automation"] as const) {
+    const branch = record[carrier];
+    if (typeof branch !== "object" || branch === null || Array.isArray(branch)) continue;
+    const settings = (branch as Record<string, unknown>).executionWorkspaceSettings;
+    if (typeof settings !== "object" || settings === null || Array.isArray(settings)) continue;
+    const value = (settings as Record<string, unknown>).workspaceRuntime;
+    if (value === null || value === undefined) continue;
+    if (storedWorkspaceRuntime !== undefined
+        && isMaskedEchoOfStoredWorkspaceRuntime(value, storedWorkspaceRuntime)) continue;
+    paths.push(`${prefix}.${carrier}.executionWorkspaceSettings.workspaceRuntime`);
+  }
+  return paths;
+}
+
+/** Does this body carry a non-nullish `workspaceRuntime` on either carrier? Gates the extra
+ *  stored-row read so an ordinary stage PATCH pays nothing. ⛔ It must stay a SUPERSET of what
+ *  the collector refuses, or a refusable body would skip the read and be admitted unchecked. */
+function stageConfigCarriesWorkspaceRuntime(config: unknown): boolean {
+  return collectStageConfigWorkspaceRuntimePaths(config, "config", undefined).length > 0;
+}
+
+/** The stored `onEnter` runtime block both carriers restore from. `undefined` means "no
+ *  stored config to compare against", which refuses every non-nullish incoming value. */
+function storedStageWorkspaceRuntime(storedConfig: unknown): unknown {
+  if (typeof storedConfig !== "object" || storedConfig === null || Array.isArray(storedConfig)) return undefined;
+  const onEnter = (storedConfig as Record<string, unknown>).onEnter;
+  if (typeof onEnter !== "object" || onEnter === null || Array.isArray(onEnter)) return undefined;
+  const settings = (onEnter as Record<string, unknown>).executionWorkspaceSettings;
+  if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return undefined;
+  return (settings as Record<string, unknown>).workspaceRuntime;
+}
+
+function assertNoAgentStageConfigWorkspaceRuntimeMutation(
+  req: Request,
+  config: unknown,
+  prefix: string,
+  options: { storedWorkspaceRuntime: unknown; remedy: string },
+) {
+  if (req.actor.type !== "agent") return;
+  const paths = collectStageConfigWorkspaceRuntimePaths(config, prefix, options.storedWorkspaceRuntime);
+  if (paths.length === 0) return;
+  throw forbidden(
+    `Agent keys cannot set pipeline stage execution workspace runtime config (${paths.join(", ")}). `
+      + "`executionWorkspaceSettings.workspaceRuntime` is an open record that reaches host "
+      + `process execution and is withheld from agent reads. ${options.remedy}`,
+  );
+}
+
+/**
+ * ⛔ Do not reword either of these into one shared string. The CREATE remedy names `null`
+ * and the PATCH remedy must not: at stage PATCH a `null` deletes the operator's stored
+ * runtime config, so offering it as the way out of a refusal is a destructive instruction
+ * dressed as help. They are separate constants so that the difference is visible at the
+ * point a future edit would collapse them.
+ */
+const STAGE_RUNTIME_CREATE_REMEDY =
+  "Omit the key, or send `null`, to create the stage without one.";
+const STAGE_RUNTIME_PATCH_REMEDY =
+  "Omit the key to leave the stored config untouched - only an UNMODIFIED echo of this stage's "
+  + "own masked config is admitted, and it is restored to the stored value. Do NOT send `null` "
+  + "here: on this route it DELETES the operator's runtime config rather than clearing a "
+  + "redaction marker.";
 
 function actorForMutation(req: Request): PipelineActor {
   if (req.actor.type === "agent") {
@@ -1010,6 +1136,10 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const actor = actorForMutation(req);
     for (const [index, stage] of ((req.body.stages ?? []) as { config?: unknown }[]).entries()) {
       assertNoAgentStageConfigCommandMutation(req, stage?.config, `stages[${index}].config`);
+      assertNoAgentStageConfigWorkspaceRuntimeMutation(req, stage?.config, `stages[${index}].config`, {
+        storedWorkspaceRuntime: undefined,
+        remedy: STAGE_RUNTIME_CREATE_REMEDY,
+      });
     }
     const decision = await access.decide({
       actor: req.actor,
@@ -1346,6 +1476,10 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
     assertNoAgentStageConfigCommandMutation(req, req.body.config, "config");
+    assertNoAgentStageConfigWorkspaceRuntimeMutation(req, req.body.config, "config", {
+      storedWorkspaceRuntime: undefined,
+      remedy: STAGE_RUNTIME_CREATE_REMEDY,
+    });
     const actor = actorForMutation(req);
     try {
       const stage = await svc.createStage({
@@ -1371,6 +1505,21 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
     assertNoAgentStageConfigCommandMutation(req, req.body.config, "config");
+    // The ONLY admitted `workspaceRuntime` here is the exact value a withheld read of THIS
+    // stage would have returned, so the guard needs the stored row. Read lazily: the query
+    // runs only for an agent actor that actually supplied the field, which is the rare path.
+    // ⛔ Fail CLOSED — a stage that cannot be read yields `undefined`, which refuses.
+    if (req.actor.type === "agent" && stageConfigCarriesWorkspaceRuntime(req.body.config)) {
+      const [storedStage] = await db
+        .select({ config: pipelineStages.config })
+        .from(pipelineStages)
+        .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)))
+        .limit(1);
+      assertNoAgentStageConfigWorkspaceRuntimeMutation(req, req.body.config, "config", {
+        storedWorkspaceRuntime: storedStageWorkspaceRuntime(storedStage?.config),
+        remedy: STAGE_RUNTIME_PATCH_REMEDY,
+      });
+    }
     const actor = actorForMutation(req);
     try {
       const updatedStage = await svc.updateStage({ companyId, pipelineId, stageId, patch: req.body, actor });

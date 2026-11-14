@@ -13,10 +13,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
  * `POST /routines/:id/run` calls the COMPOUND guard, so it ALSO refuses
  * `executionWorkspaceSettings.workspaceRuntime`, inherited with no edit in this file. The three
  * pipeline stage-config routes call the command-only
- * `assertNoAgentHostWorkspaceCommandMutation`, so `workspaceRuntime` stays agent-settable there
- * and NOTHING below asserts otherwise — this suite contains no `workspaceRuntime` case at all.
- * Do not read a green run here as covering that field at the pipeline routes. The gap, its
- * measured reachability bound, and the shape a close has to take are carried on PEN-6595.
+ * `assertNoAgentHostWorkspaceCommandMutation`, so NOTHING below asserts anything about
+ * `workspaceRuntime` — this suite contains no `workspaceRuntime` case at all, and that is
+ * still true. Do not read a green run here as covering that field at the pipeline routes.
+ * ⚠ What HAS changed: `workspaceRuntime` is no longer agent-settable there either. PEN-6595
+ * closed it on 2026-11-14 with a SEPARATE guard, pinned in a SEPARATE suite
+ * (`pipeline-stage-workspace-runtime-authz.test.ts`) — so a reader who needs that field's
+ * coverage must open that file, and a green run here still says nothing about it.
  *
  * Each denial case asserts BOTH the 403 AND that the service mock was never called. A bare
  * status assertion passes when the request dies at an earlier gate for an unrelated reason,

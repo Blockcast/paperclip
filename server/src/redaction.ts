@@ -1523,6 +1523,92 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
 }
 
 /**
+ * PEN-6595. Is this incoming `workspaceRuntime` the EXACT value a withheld reader
+ * would have been handed for the STORED one — i.e. an unmodified round-trip that
+ * `restoreWithheldPipelineStageConfig` will put straight back?
+ *
+ * ⛔⛔ IT TAKES THE STORED VALUE, AND THAT PARAMETER IS THE WHOLE GUARD. An earlier
+ * version of this compared the incoming value against ITS OWN mask — `mask(x)`
+ * deep-equal `x`, a FIXPOINT test — reasoning that the mask is idempotent so a
+ * fixpoint is exactly "carries nothing a withheld reader could not already see".
+ * That reasoning is WRONG and was caught in review on `#3764` before it landed.
+ * **A FIXPOINT IS NOT AN ECHO.** The mask deliberately lets identity keys
+ * (`id`/`name`/`label`/`title`) and the in-set `kind`/`lifecycle` enums through
+ * verbatim, so an agent can AUTHOR those freely and still be a fixpoint:
+ *
+ *   - DUPLICATE an operator service — `[{id:"web",…},{id:"web",…}]` against a
+ *     single stored `web`. `matchExistingArrayElement` resolves the one stored
+ *     element for BOTH, so the operator's real command is restored twice and the
+ *     runtime starts it twice.
+ *   - FLIP EXECUTION SEMANTICS — echo with `kind:"service"`→`"job"` or
+ *     `lifecycle:"shared"`→`"ephemeral"`. Both are in-set, so the fixpoint test
+ *     admits them and the stored command restores into an agent-chosen lifecycle.
+ *   - RE-POINT or INTRODUCE entries — rename an element's identity onto another
+ *     stored service's, or add `{id:"x",command:<sentinel>}` with nothing stored
+ *     to match, which persists the literal sentinel as a service command.
+ *
+ * None of those writes a fresh command string, and every one of them changes what
+ * the host executes — so "refuses a fresh value" was true of the LEAVES and false
+ * of the STRUCTURE, which is the half that matters here.
+ *
+ * Comparing against `mask(stored)` closes all of them at once, plus `{}` (admitted
+ * only when the stored value is also `{}`, where it is a true no-op) and the
+ * partial-echo deletion the fixpoint form had to carry as a documented residual.
+ * ⇒ there is no longer a second special case to keep in step.
+ *
+ * ⭐ The mask is still its own oracle for the CLASSIFICATION — which leaves survive
+ * and which are elided is read from `maskWorkspaceRuntimeForRead` rather than
+ * re-listed here, so an identity or enum key added there is honoured in the same
+ * commit. What changed is the OPERAND: the mask is applied to the stored value, not
+ * to the caller's.
+ *
+ * ⛔ A non-plain-object `incoming` is REFUSED rather than compared. The mask returns
+ * the bare sentinel STRING for every non-object shape, so a scalar `workspaceRuntime`
+ * could otherwise match a scalar stored one — the array-shaped and JSON-string-shaped
+ * bypasses this series has already shipped once each (#1574, #1583), read in the
+ * write direction. Nothing legitimate round-trips that way: the column is typed
+ * `Record<string, unknown> | null` at every schema that declares it.
+ *
+ * ⚠ THIS IS NOT AN ENTITLEMENT CHECK AND IT PROVES NOTHING ABOUT THE CALLER — the
+ * same viewer-independent reasoning `restoreWithheldPipelineStageConfig` records
+ * below. An ENTITLED reader echoes REAL values, which this refuses; that is correct
+ * for the one caller today (no agent resolves `revealRuntimeConfig`, so every agent
+ * read is masked) and it is the fail-closed direction if that ever changes.
+ *
+ * ⚠ A nullish `stored` makes every non-nullish `incoming` refuse, which is right:
+ * with nothing stored there is nothing to round-trip and any value is fresh.
+ */
+export function isMaskedEchoOfStoredWorkspaceRuntime(incoming: unknown, stored: unknown): boolean {
+  if (!isPlainObject(incoming)) return false;
+  return isSameMaskedShape(maskWorkspaceRuntimeForRead(stored), incoming);
+}
+
+/**
+ * Structural equality for the comparison above. Deliberately not
+ * `JSON.stringify` on both sides: that is key-ORDER sensitive and silently
+ * drops an `undefined` value, so it would answer a question about key order
+ * that neither the mask nor this guard is asking.
+ *
+ * `hasOwnProperty` before the read on `b`, for the reason
+ * `restoreWithheldValue` records at length: once an own `__proto__` key
+ * survives into a walk, a bare `b[key]` resolves up the chain to
+ * `Object.prototype` and compares as "present".
+ */
+function isSameMaskedShape(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((item, index) => isSameMaskedShape(item, b[index]));
+  }
+  if (!isPlainObject(a) || !isPlainObject(b)) return false;
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every((key) => (
+    Object.prototype.hasOwnProperty.call(b, key) && isSameMaskedShape(a[key], b[key])
+  ));
+}
+
+/**
  * Mask one operator-authored free-text scalar that was *promoted out of*
  * `workspaceRuntime` onto a typed column (PEN-2854, door #14).
  *
