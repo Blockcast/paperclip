@@ -174,6 +174,135 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
   // and the unfiltered gauge reads that as starvation. Measured 2026-10-18:
   // 21.8x threshold on one seat, four queued runs stacked on one `blocked`
   // issue in 17 minutes.
+  // BLO-57165. The dispatcher DEFERS a queued `github_*` wake while a
+  // non-webhook run on the same issue is running (PEN-6407,
+  // `duplicate_dispatch_cross_reason_deferred`): the row stays `queued` for the
+  // incumbent's whole runtime. `isDispatchRankReady` does not see that, so the
+  // claimable gauge aged it and paged HeartbeatRunQueueAgentOldestQueuedHigh.
+  describe("cross-reason github wake deferred behind an in-flight issue run (BLO-57165)", () => {
+    async function insertRunningRun(input: {
+      companyId: string;
+      agentId: string;
+      now: Date;
+      contextSnapshot: Record<string, unknown>;
+    }) {
+      await db.insert(heartbeatRuns).values({
+        companyId: input.companyId,
+        agentId: input.agentId,
+        invocationSource: "assignment",
+        status: "running",
+        contextSnapshot: input.contextSnapshot,
+        startedAt: new Date(input.now.getTime() - 3_000_000),
+        createdAt: new Date(input.now.getTime() - 3_000_000),
+        updatedAt: input.now,
+      });
+    }
+
+    it("excludes the deferred github wake from the claimable gauge; the raw gauge still counts it", async () => {
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-11-14T20:33:08.000Z");
+      const issueId = await insertIssue(companyId);
+      await insertRunningRun({
+        companyId,
+        agentId,
+        now,
+        contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+      });
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 2593,
+        now,
+        contextSnapshot: { issueId, wakeReason: "github_pr_ready_for_review" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      // AC3: the hold stays visible on the unfiltered gauge.
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(2593);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
+    });
+
+    it("excludes a deferred row whose wakeReason a coalesced issue-local wake overwrote", async () => {
+      // The arrival side reads `contextCarriesGithubWake` (sticky marker), as the
+      // dispatcher does, not the current `wakeReason` alone.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-11-14T20:33:08.000Z");
+      const issueId = await insertIssue(companyId);
+      await insertRunningRun({
+        companyId,
+        agentId,
+        now,
+        contextSnapshot: { issueId, wakeReason: "issue_commented" },
+      });
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 2400,
+        now,
+        contextSnapshot: { issueId, wakeReason: "issue_commented", carriesGithubWake: true },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
+    });
+
+    it("still counts the github wake when the incumbent is itself webhook-woken (dispatcher cancels, not defers)", async () => {
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-11-14T20:33:08.000Z");
+      const issueId = await insertIssue(companyId);
+      await insertRunningRun({
+        companyId,
+        agentId,
+        now,
+        contextSnapshot: { issueId, wakeReason: "github_pr_review_requested" },
+      });
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 2000,
+        now,
+        contextSnapshot: { issueId, wakeReason: "github_pr_ready_for_review" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(2000);
+    });
+
+    it("still counts the github wake when the running run is on a different issue or a different agent", async () => {
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const other = await insertCompanyAndAgent();
+      const now = new Date("2026-11-14T20:33:08.000Z");
+      const issueId = await insertIssue(companyId);
+      const otherIssueId = await insertIssue(companyId);
+      await insertRunningRun({
+        companyId,
+        agentId,
+        now,
+        contextSnapshot: { issueId: otherIssueId, wakeReason: "issue_monitor_due" },
+      });
+      await insertRunningRun({
+        companyId: other.companyId,
+        agentId: other.agentId,
+        now,
+        contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+      });
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 1900,
+        now,
+        contextSnapshot: { issueId, wakeReason: "github_pr_ready_for_review" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(1900);
+    });
+  });
+
   describe("claimable-aware gauge (PEN-4293)", () => {
     it("excludes a dependency-blocked queued run while the unfiltered gauge still counts it", async () => {
       const { companyId, agentId } = await insertCompanyAndAgent();

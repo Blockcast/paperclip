@@ -5,7 +5,10 @@ import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
 import {
   QUEUE_ENTERED_AT_CONTEXT_KEY,
+  classifyHeartbeatWakeClass,
   deferWroteQueuedAtSql,
+  type HeartbeatWakeClass,
+  isCrossReasonGithubWakeDeferral,
   isDispatchRankReady,
   queueEnteredAtSql,
 } from "./dispatch-readiness.js";
@@ -289,6 +292,60 @@ export type ClaimableSubjectLogLine = {
 
 const claimableSubjectLogState: ClaimableSubjectLogState = new Map();
 
+type InFlightIssueWakeClasses = Map<string, Set<HeartbeatWakeClass>>;
+
+function inFlightIssueKey(agentId: string | null, issueId: string): string {
+  return `${agentId ?? UNKNOWN_AGENT_ID}\u0000${issueId}`;
+}
+
+function snapshotIssueId(snapshot: Record<string, unknown> | null | undefined): string | null {
+  const value = snapshot?.issueId;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/**
+ * Per (agent, issue): the wake classes of its `running` runs, built exactly as
+ * `startNextQueuedRunForAgent` builds `inFlightIssueWakeClasses` -- an
+ * unreadable class registers the issue without claiming a class (BLO-57165).
+ */
+export function buildInFlightIssueWakeClasses(
+  runningRows: ReadonlyArray<{ agentId: string | null; contextSnapshot: unknown }>,
+): InFlightIssueWakeClasses {
+  const out: InFlightIssueWakeClasses = new Map();
+  for (const row of runningRows) {
+    const snapshot =
+      row.contextSnapshot && typeof row.contextSnapshot === "object"
+        ? (row.contextSnapshot as Record<string, unknown>)
+        : null;
+    const issueId = snapshotIssueId(snapshot);
+    if (!issueId) continue;
+    const key = inFlightIssueKey(row.agentId, issueId);
+    const classes = out.get(key) ?? new Set<HeartbeatWakeClass>();
+    const wakeClass = classifyHeartbeatWakeClass(snapshot);
+    if (wakeClass) classes.add(wakeClass);
+    out.set(key, classes);
+  }
+  return out;
+}
+
+/**
+ * True when the dispatcher would DEFER this queued run on its
+ * `duplicate_dispatch_cross_reason_deferred` arm, so it is not claimable now.
+ * A same-class duplicate is NOT excluded: the dispatcher cancels that one, so
+ * it leaves the queue on the next pass rather than aging (BLO-57165).
+ */
+export function isDeferredBehindInFlightIssueRun(
+  agentId: string | null,
+  queuedSnapshot: Record<string, unknown> | null,
+  inFlight: InFlightIssueWakeClasses,
+): boolean {
+  const issueId = snapshotIssueId(queuedSnapshot);
+  if (!issueId) return false;
+  const incumbents = inFlight.get(inFlightIssueKey(agentId, issueId));
+  if (!incumbents) return false;
+  return isCrossReasonGithubWakeDeferral(queuedSnapshot, incumbents);
+}
+
 async function refreshClaimableQueuedRunAgeMetrics(
   db: Db,
   now: Date,
@@ -339,6 +396,20 @@ async function refreshClaimableQueuedRunAgeMetrics(
     for (const [issueId, readiness] of batch) readinessByIssueId.set(issueId, readiness);
   }
 
+  // BLO-57165: the dispatcher also holds a queued `github_*` wake back while a
+  // non-webhook run on the same issue is running (PEN-6407,
+  // `duplicate_dispatch_cross_reason_deferred`). `isDispatchRankReady` does not
+  // see that, so the row aged here as "claimable" for the incumbent's whole
+  // runtime and paged HeartbeatRunQueueAgentOldestQueuedHigh. Same inputs and
+  // same predicate as `startNextQueuedRunForAgent`. The raw
+  // `paperclip_queued_run_oldest_age_seconds` gauge still counts the row, so a
+  // deferral behind a wedged incumbent stays visible there.
+  const runningRows = await db
+    .select({ agentId: heartbeatRuns.agentId, contextSnapshot: heartbeatRuns.contextSnapshot })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.status, "running"));
+  const inFlightWakeClasses = buildInFlightIssueWakeClasses(runningRows);
+
   // PEN-5316: the SUBJECT is kept beside the age, not just the age. This gauge
   // asserts "a run that is ready by the dispatcher's own definition has been
   // waiting this long", and the dispatcher simultaneously records
@@ -356,6 +427,9 @@ async function refreshClaimableQueuedRunAgeMetrics(
     const readiness =
       issueId && UUID_PATTERN.test(issueId) ? readinessByIssueId.get(issueId) ?? null : null;
     if (!isDispatchRankReady(row.context_snapshot, readiness, now)) continue;
+    if (isDeferredBehindInFlightIssueRun(row.agent_id, row.context_snapshot, inFlightWakeClasses)) {
+      continue;
+    }
     const ageSeconds = Math.max(
       0,
       (now.getTime() - new Date(row.effective_queued_at).getTime()) / 1000,
