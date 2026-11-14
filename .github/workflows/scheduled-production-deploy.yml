@@ -79,6 +79,9 @@
 #                         older than PENDING_DEPLOY_ALERT_HOURS, a severity=critical
 #                         ProductionDeployApprovalStuck alert to Alertmanager plus a
 #                         RED run, so `conclusion` itself carries the signal.
+#   deferred-min-interval -> ::notice:: + step summary, green. The last dispatch was
+#                         refused by the min-interval guard and 6h have not passed since
+#                         the refusal; a later hourly slot retries (BLO-57061).
 #
 # GUARD (1) NOW HAS A BOUNDED EXIT (PEN-3315)
 # -------------------------------------------
@@ -400,7 +403,7 @@ jobs:
                 echo "paperclip-0 is now past the interval, so this slot (run \`$GITHUB_RUN_ID\`) re-dispatches (BLO-57061)."
               } >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "::notice::Last dispatch (run $REFUSED_ID) was refused by the minimum-interval guard; paperclip-0 is still inside the interval (or unreadable). A later hourly slot retries."
+              echo "::notice::Last dispatch (run $REFUSED_ID) was refused by the minimum-interval guard; not yet 6h since the refusal (or the refusal time is unreadable). A later hourly slot retries."
               {
                 echo "### Deferred — minimum-interval refusal not yet retryable"
                 echo
