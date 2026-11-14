@@ -38,6 +38,107 @@ export function normalizeActivityLimit(limit: number | undefined) {
   return Math.max(1, Math.min(MAX_ACTIVITY_LIMIT, Math.floor(limit ?? DEFAULT_ACTIVITY_LIMIT)));
 }
 
+/**
+ * Opt-in bound on `runsForIssue` (PEN-6670). ⛔ THERE IS DELIBERATELY NO DEFAULT
+ * LIMIT, and that is a correction, not an oversight — read this before adding one.
+ *
+ * The union arms below are the fix: they make the query's cost scale with the
+ * ISSUE's run count rather than the COMPANY's, so the thing that was growing
+ * without bound no longer reaches this query at all. A default cap is therefore
+ * not needed for the 57014 timeout, and it is actively WRONG here, because this
+ * route's first-party consumer AGGREGATES the rows rather than displaying them:
+ * `ui/src/pages/IssueDetail.tsx` sums `cost`, input/output/cached tokens,
+ * `runtimeMs` and `runCount` over every row it gets back, and
+ * `ui/src/api/activity.ts` sends no `limit` and reads no response header. A
+ * default cap would have made an issue's cost and token summary silently
+ * UNDER-REPORT past the cap, with nothing visible to the user. Caught in review
+ * on #3777; the first version of this change shipped the cap.
+ *
+ * ⭐ The second reason not to guess a default: a cap is only safe if it sits
+ * above the real per-issue maximum, and NOBODY CAN MEASURE THAT — no
+ * engineering seat holds a production SQL path. Rather than pick a number that
+ * cannot be checked, remove the dependence on it. That is the same move the
+ * union arms make one layer down.
+ *
+ * A caller that wants a page asks for one with `?limit=`, is clamped to
+ * `MAX_ISSUE_RUNS_LIMIT`, and gets the bound actually applied echoed back in
+ * `X-Applied-Limit`. A caller that asks for nothing still gets everything.
+ */
+export const MAX_ISSUE_RUNS_LIMIT = 1000;
+
+/**
+ * Clamp an explicitly requested limit. Returns `null` for "no limit requested",
+ * which is NOT the same as 0 — the caller must branch on it rather than coerce.
+ */
+export function normalizeIssueRunsLimit(limit: number | undefined): number | null {
+  if (limit === undefined || !Number.isFinite(limit)) return null;
+  return Math.max(1, Math.min(MAX_ISSUE_RUNS_LIMIT, Math.floor(limit)));
+}
+
+/**
+ * The set of heartbeat-run ids belonging to one issue, as a UNION of two
+ * independently indexable arms (PEN-6670).
+ *
+ * ⛔ DO NOT COLLAPSE THIS BACK INTO `or(contextSnapshot match, exists(...))`.
+ * That shape is what this replaces, and it was 503ing `GET /api/issues/:id/runs`
+ * with `57014` at ~85 events/h on 2026-11-14.
+ *
+ * The mechanism, read off `EXPLAIN (ANALYZE, BUFFERS)` on a 905,300-run seed
+ * (`packages/db/src/runs-for-issue-plan-shape.bench.ts`) — and note it is NOT
+ * what it looks like. PostgreSQL pulls the correlated `exists(...)` UP into an
+ * uncorrelated `hashed SubPlan`, so the subquery runs ONCE, in ~4ms, not once
+ * per outer row; de-correlating it by hand buys nothing. The damage is that a
+ * semi-join cannot take part in a `BitmapOr`, so the whole disjunction can only
+ * be applied as a per-row FILTER — and the only access path left for the outer
+ * query is `heartbeat_runs_company_created_at_desc_idx` under
+ * `Index Cond: (company_id = ...)` alone. Measured: 904,794 of 905,300 rows
+ * read and thrown away by that filter, 48,522 buffers, 1,383.4ms, to return
+ * 506 rows. The partial expression index that exists for arm 1
+ * (`heartbeat_runs_company_issueid_idx`, migration 0077) is never chosen,
+ * because the OR puts it out of reach. Cost scaled with the COMPANY's total
+ * run history, a monotonically growing number, which is why this degraded over
+ * time rather than being slow from the start.
+ *
+ * With the arms unioned, both are index-driven — `heartbeat_runs_company_issueid_idx`
+ * for arm 1, `activity_log_entity_type_id_idx` for arm 2 — and the outer query
+ * becomes a pk lookup per surviving id: 2,603 buffers, 14.6ms, same rows. ~95x.
+ * ⭐ Measured with AND without a LIMIT and the two agree to within noise: the
+ * union is the whole fix, which is why this route has no default bound.
+ *
+ * Resolving each arm into its own id set first is the same transformation
+ * PEN-3596 applied to the issues-list search (`issueSearchArmsSubquery`), for
+ * the same reason. `UNION` (not `UNION ALL`) because the two arms overlap
+ * heavily — a run usually both carries the issue in its context snapshot and
+ * writes activity rows against it — and the outer `IN` wants distinct ids.
+ *
+ * ⚠️ The arms re-introduce `heartbeat_runs` and `activity_log` in their own
+ * FROM clauses, so every column reference inside binds to the INNER scope and
+ * the subquery is uncorrelated. That is load-bearing: a reference that reached
+ * the outer `heartbeat_runs` would re-correlate this and restore the defect.
+ * `issues-service.test.ts` (PEN-3596) guards the sibling query the same way;
+ * `activity-service.test.ts` guards this one.
+ */
+export function issueRunIdsSubquery(companyId: string, issueId: string) {
+  return sql`(
+      select ${heartbeatRuns.id} as run_id
+      from ${heartbeatRuns}
+      where ${heartbeatRuns.companyId} = ${companyId}
+        and ${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}
+      union
+      select ${activityLog.runId} as run_id
+      from ${activityLog}
+      where ${activityLog.companyId} = ${companyId}
+        and ${activityLog.entityType} = 'issue'
+        and ${activityLog.entityId} = ${issueId}
+        and ${activityLog.runId} is not null
+    )`;
+}
+
+/** `heartbeat_runs` row belongs to this issue — see `issueRunIdsSubquery`. */
+export function runBelongsToIssue(companyId: string, issueId: string) {
+  return sql`${heartbeatRuns.id} in ${issueRunIdsSubquery(companyId, issueId)}`;
+}
+
 export function activityService(db: Db) {
   const scheduledLivenessBackfills = new Set<string>();
   const issueIdAsText = sql<string>`${issues.id}::text`;
@@ -176,6 +277,20 @@ export function activityService(db: Db) {
           eq(heartbeatRuns.companyId, companyId),
           isNull(heartbeatRuns.livenessState),
           sql`${heartbeatRuns.status} not in ('queued', 'running')`,
+          // ⚠️ PEN-6670 DELIBERATELY LEAVES THIS ONE ALONE, and the reason is a
+          // measurement that refuted the obvious guess. This is the same
+          // OR-over-a-correlated-EXISTS shape `runsForIssue` had, so it looks
+          // like the same defect — it is not, because the predicate ABOVE it is
+          // different. `heartbeat_runs_company_liveness_idx` (migration 0058,
+          // `(company_id, liveness_state, created_at)`) drives this query off
+          // `liveness_state IS NULL`, so the OR never has to be the access path:
+          // the EXISTS runs as a cheap point probe on `activity_log_run_id_idx`
+          // for each of the few candidate rows, and `limit(20)` is a real bound.
+          // Measured on a 905,300-run seed in the steady state (every run already
+          // backfilled): 3 buffers, 0.077ms, total cost 18.68. Rewriting it to the
+          // union arms made the plan WORSE — a nested loop whose inner side builds
+          // the whole issue's id set, total cost 9,545.42, to answer a question one
+          // index probe already answers. The control arm is in the bench above.
           or(
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             sql`exists (
@@ -404,9 +519,10 @@ export function activityService(db: Db) {
         )
         .orderBy(desc(activityLog.createdAt)),
 
-    runsForIssue: async (companyId: string, issueId: string) => {
+    runsForIssue: async (companyId: string, issueId: string, options?: { limit?: number }) => {
       scheduleRunLivenessBackfill(companyId, issueId);
-      const runs = await db
+      const limit = normalizeIssueRunsLimit(options?.limit);
+      const runsQuery = db
         .select({
           runId: heartbeatRuns.id,
           status: heartbeatRuns.status,
@@ -442,20 +558,13 @@ export function activityService(db: Db) {
         .where(
           and(
             eq(heartbeatRuns.companyId, companyId),
-            or(
-              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-              sql`exists (
-                select 1
-                from ${activityLog}
-                where ${activityLog.companyId} = ${companyId}
-                  and ${activityLog.entityType} = 'issue'
-                  and ${activityLog.entityId} = ${issueId}
-                  and ${activityLog.runId} = ${heartbeatRuns.id}
-              )`,
-            ),
+            runBelongsToIssue(companyId, issueId),
           ),
         )
         .orderBy(desc(heartbeatRuns.createdAt));
+      // `null` means no limit was requested, and the default is UNBOUNDED on
+      // purpose — see `normalizeIssueRunsLimit`.
+      const runs = await (limit === null ? runsQuery : runsQuery.limit(limit));
 
       if (runs.length === 0) return runs;
       const runIds = runs.map((run) => run.runId);
