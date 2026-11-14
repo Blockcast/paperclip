@@ -1058,6 +1058,131 @@ test("an inherited stale number is reported apart, and not under the --fix hint"
   }
 });
 
+// PEN-6680, second Ally review on #3788. The worktree union was a TWO-DOT diff against
+// `ref` itself, so it asked "how does my tree differ from master's TIP" -- and being
+// behind master is the normal state of anyone who fetched after branching. Every file
+// master changed since the fork then landed in the fix scope, and `--fix --base
+// origin/master` renumbered citations in documents this change never opened, over drift
+// that is the base's. That is the #3774 widening the narrowing exists to remove,
+// arriving through the union instead of through the missing filter. Reproduced on
+// 110b74f0 before the fix: `fixed docs/two.md:1 \`src/b.ts:4\` -> :2`, rc 0.
+//
+// The existing fixtures cannot see it: their base IS the fork, so the two-dot and
+// merge-base forms are the same set and every assertion passes either way.
+const behindBaseFixture = async ({ commit = true } = {}) => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const root = mkdtempSync(join(tmpdir(), "anchor-behind-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "master");
+  git("config", "user.email", "t@t");
+  git("config", "user.name", "t");
+  mkdirSync(join(root, "src"));
+  mkdirSync(join(root, "docs"));
+  writeFileSync(join(root, "src/a.ts"), SOURCE);
+  writeFileSync(join(root, "src/b.ts"), OTHER_SOURCE);
+  writeFileSync(join(root, "docs/one.md"), "`parseThing` (`src/a.ts:2`)\n");
+  // Stale at the fork already, and it stays the base's: nothing in this change opens
+  // either `src/b.ts` or the document citing it.
+  writeFileSync(join(root, "docs/two.md"), INHERITED_DOC);
+  git("add", "-A");
+  git("commit", "-qm", "fork point");
+  const fork = git("rev-parse", "HEAD");
+
+  // MASTER MOVES ON, and this branch does not follow. `src/b.ts` is now a file the BASE
+  // TIP differs from this tree at, while being no part of this change.
+  writeFileSync(join(root, "src/b.ts"), `${OTHER_SOURCE}\n// master appended this\n`);
+  git("add", "-A");
+  git("commit", "-qm", "master moves the cited file");
+  const base = git("rev-parse", "HEAD");
+
+  git("checkout", "-q", "-b", "feature", fork);
+  // This change, and all of it: two lines above `parseThing`, in `src/a.ts` only.
+  writeFileSync(join(root, "src/a.ts"), `// this change added\n// two lines\n${SOURCE}`);
+  if (commit) {
+    git("add", "-A");
+    git("commit", "-qm", "the change moves src/a.ts");
+  }
+  const head = git("rev-parse", "HEAD");
+  return { root, fork, base, head, rm: () => rmSync(root, { recursive: true, force: true }) };
+};
+
+test("end to end: a branch behind master does not inherit master's files into --fix", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const script = await checkerPath();
+
+  // Both halves of the local shape: the change committed, and the same change sitting
+  // uncommitted in the worktree. The union is taken in both, so the base tip can leak
+  // into both, and only the merge-base anchor keeps either narrow.
+  for (const commit of [true, false]) {
+    const f = await behindBaseFixture({ commit });
+    try {
+      const doc = (rel) => readFileSync(join(f.root, rel), "utf8");
+      const run = (...extra) =>
+        spawnSync(process.execPath, [script, "--root", f.root, "--glob", "docs/*.md", ...extra], {
+          encoding: "utf8",
+        });
+
+      // The documented command, verbatim in shape: a base ref whose tip is ahead of
+      // this branch, and no --head.
+      const r = run("--base", f.base, "--fix");
+      assert.equal(r.status, 0, `a stale number is never fatal: ${r.stderr}`);
+
+      // THE MUST-FAIL ASSERTION. Against the two-dot form this reads `src/b.ts:2`,
+      // because master's commit put `src/b.ts` in the diff and ownership arm 1 then
+      // scored the citation as this change's.
+      assert.equal(
+        doc("docs/two.md"),
+        INHERITED_DOC,
+        `commit=${commit}: master's own files must not become this change's fix scope`,
+      );
+
+      // ...and the fixture is not vacuous: the number this change DID make stale is
+      // still rewritten, so the test cannot be satisfied by a --fix that writes nothing.
+      assert.equal(
+        doc("docs/one.md"),
+        "`parseThing` (`src/a.ts:4`)\n",
+        `commit=${commit}: the owned number must still be rewritten`,
+      );
+
+      // ...and `docs/two.md` was rewritable all along, so the assertion above is a
+      // narrowing and not an anchor the checker simply cannot place.
+      const wide = run("--fix-all");
+      assert.equal(wide.status, 0, wide.stderr);
+      assert.equal(doc("docs/two.md"), "`otherThing` (`src/b.ts:2`)\n", "--fix-all takes it");
+    } finally {
+      f.rm();
+    }
+  }
+});
+
+test("worktreeChangedSince is anchored at the merge base, not at the ref's tip", async () => {
+  const { execFileSync } = await import("node:child_process");
+
+  const f = await behindBaseFixture({ commit: false });
+  try {
+    const wt = worktreeChangedSince(f.base, f.root);
+    assert.ok(wt.has("src/a.ts"), "this change's own uncommitted work is in scope");
+    assert.ok(!wt.has("src/b.ts"), "a file only MASTER moved is not this change's");
+
+    // The control that makes it a comparison rather than a tautology: the two-dot form
+    // against the same ref does list master's file, which is the defect in one line.
+    const twoDot = execFileSync("git", ["diff", "--no-renames", "--name-only", f.base], {
+      cwd: f.root,
+      encoding: "utf8",
+    })
+      .split("\n")
+      .filter(Boolean);
+    assert.ok(twoDot.includes("src/b.ts"), "fixture must actually put master ahead");
+  } finally {
+    f.rm();
+  }
+});
+
 test("worktreeChangedSince sees staged, unstaged and untracked work; changedSince does not", async () => {
   const { writeFileSync } = await import("node:fs");
   const { join } = await import("node:path");

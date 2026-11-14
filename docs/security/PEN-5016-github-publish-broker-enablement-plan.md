@@ -145,7 +145,11 @@ staged and untracked work as well as committed work. (Attribution for the PR gat
 committed diff, which is the right shape there and the wrong one here: narrowing the rewrite
 to it made this command a silent no-op before the first commit, which is most of the times
 anyone runs it. Passing `--head` pins the comparison back to a commit, which is what CI does
-and what you want under a merge-ref checkout; local runs should leave it off.) Everything else is the base's drift, and
+and what you want under a merge-ref checkout; local runs should leave it off. The comparison
+is against the commit you branched FROM, not against `origin/master`'s tip, so a branch that
+is behind master — the normal state once you have fetched — does not inherit master's files
+as its own; without that anchor the remedy widened again through the same documents, which is
+how this was found.) Everything else is the base's drift, and
 rewriting it writes a shared line in a document you never opened — which manufactures exactly
 the pairwise conflict PEN-6674 removed the mandate for, arrived at voluntarily. Measured on
 #3774: a `--fix` run also renumbered a `Dockerfile` anchor, from line 674 to line 705, in an
