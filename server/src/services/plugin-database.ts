@@ -1219,9 +1219,39 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       );
     }
     return db.transaction(async (tx) => {
-      await tx.execute(sql.raw(`SET LOCAL search_path TO ${quoteIdentifier(namespace)}`));
+      await pinSearchPath(tx as PluginDatabaseClient, namespace);
       return tx.execute(statement);
     });
+  }
+
+  /**
+   * The single construct that pins `search_path`, used by BOTH the runtime paths above
+   * and the migration path below. One function on purpose: two hand-written pins are
+   * two things that can drift, and a drifted pin fails OPEN with no symptom -- the
+   * statement still runs, it just runs somewhere else.
+   *
+   * `quoteIdentifier` and not a bound parameter: `SET` takes an identifier list, not a
+   * value, so there is nothing to bind. The namespace reaching here has already passed
+   * `assertIdentifier`, and `derivePluginDatabaseNamespace` only ever mints
+   * `plugin_[a-z0-9_]+`, so the quoting is a second fence rather than the only one.
+   */
+  async function pinSearchPath(client: PluginDatabaseClient, namespace: string): Promise<void> {
+    await client.execute(sql.raw(`SET LOCAL search_path TO ${quoteIdentifier(namespace)}`));
+  }
+
+  /**
+   * Puts `search_path` back to a value CAPTURED from the session, rather than to any
+   * value this file composes.
+   *
+   * `set_config(..., true)` and not `SET LOCAL`: the captured value is an opaque GUC
+   * string (`"$user", public` on a stock database), so re-emitting it through
+   * `sql.raw` would mean re-quoting a list this file did not parse. `set_config` binds
+   * it as a VALUE and hands the GUC parser exactly the bytes `current_setting`
+   * returned. The `true` is the local/transaction scope -- the same scope `SET LOCAL`
+   * has, and for the same reason: `db` is a shared pool.
+   */
+  async function restoreSearchPath(client: PluginDatabaseClient, value: string): Promise<void> {
+    await client.execute(sql`SELECT set_config('search_path', ${value}, true)`);
   }
 
   async function getRuntimeNamespace(pluginId: string) {
@@ -1292,6 +1322,16 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
 
       const applyWithClient = async (client: PluginDatabaseClient) => {
         await client.execute(sql`SELECT pg_advisory_xact_lock(${lockKey})`);
+        // Captured ONCE, before anything below pins. This is the value every ledger
+        // write in this loop needs: Drizzle emits `plugin_migrations` and
+        // `plugin_database_namespaces` UNQUALIFIED, so they resolve through whatever
+        // `search_path` is in force. Restoring to a value this file composes --
+        // `TO DEFAULT`, or a hardcoded `public` -- would be a guess; this is a replay.
+        const priorRows = await client.execute(sql`SELECT current_setting('search_path') AS search_path`);
+        const priorSearchPath = Array.from(priorRows as Iterable<{ search_path?: unknown }>)[0]?.search_path;
+        if (typeof priorSearchPath !== "string") {
+          throw new Error("Could not read search_path before applying plugin migrations");
+        }
         for (const migrationKey of migrationFiles) {
           const content = await readFile(path.join(migrationDir, migrationKey), "utf8");
           const checksum = createHash("sha256").update(content).digest("hex");
@@ -1317,6 +1357,34 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
             if (statements.length === 0) {
               throw new Error(`Plugin migration ${migrationKey} is empty`);
             }
+            // PIN, for exactly the plugin-authored statements and nothing else
+            // (PEN-6669). The validators in this file adjudicate SCHEMA-QUALIFIED
+            // names; an UNQUALIFIED relation name is not one, so a migration that
+            // qualifies ONE object satisfies every lexical test and the bare name is
+            // resolved by Postgres through `search_path`, which nothing on this path
+            // set -- so it reached `public`. PEN-6604 closed that on `query`/`execute`
+            // and deliberately did not reach here, because this path interleaves the
+            // plugin's statements with the ORM ledger writes below and a
+            // transaction-level pin breaks those.
+            //
+            // So the pin is scoped to the statement loop and LIFTED before the ledger
+            // write. Measured ALLOW on the migration path at master e89b8388 before
+            // this change: `INSERT INTO ns.t SELECT ... FROM secrets`, `UPDATE ns.t ...
+            // FROM secrets`, a `WITH` CTE over a bare name, `CREATE TABLE ns.t AS
+            // SELECT ... FROM secrets`, `CREATE VIEW ns.v AS SELECT ... FROM secrets`
+            // and `ALTER TABLE ns.t ... REFERENCES secrets(id)`. The view is the one
+            // that outlives the migration: Postgres resolves a view body at CREATE and
+            // stores the OIDs, so an unpinned `CREATE VIEW` binds to `public`
+            // permanently.
+            //
+            // There is NO `finally` here on purpose. A failed statement ABORTS the
+            // transaction, and every later command in it is refused until rollback, so
+            // a restore on the error path would throw a second error over the first and
+            // report the wrong cause. The pin dies with the rollback, which is the
+            // whole reason it is `SET LOCAL`. (The `catch` below writes its failure row
+            // through `db` rather than `client`, which predates this change -- stated as
+            // what the code does, not as a motive this change established.)
+            await pinSearchPath(client, namespace.namespaceName);
             for (const statement of statements) {
               validatePluginMigrationStatement(
                 statement,
@@ -1326,6 +1394,7 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
               );
               await client.execute(sql.raw(statement));
             }
+            await restoreSearchPath(client, priorSearchPath);
             await client
               .insert(pluginMigrations)
               .values({
@@ -1366,11 +1435,21 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
         }
       };
 
-      if (typeof db.transaction === "function") {
-        await db.transaction(async (tx) => applyWithClient(tx as PluginDatabaseClient));
-      } else {
-        await applyWithClient(db);
+      // REFUSED rather than run unpinned, exactly as `runWithPinnedSearchPath` refuses
+      // on the runtime paths and for the same reason. `SET LOCAL` outside a transaction
+      // block is not an error in Postgres -- it emits a WARNING and changes nothing --
+      // so an unpinnable fallback here would run every plugin migration with the hole
+      // above wide open and report success. A pooled client is worse still: without a
+      // transaction the pin and the statement can land on different connections.
+      // Both production callers pass a client with `transaction` (`plugin-loader`
+      // passes its own `txDb`, where Drizzle opens a SAVEPOINT); the `Partial<>` in
+      // `PluginDatabaseRootClient` exists for narrower test doubles.
+      if (typeof db.transaction !== "function") {
+        throw new Error(
+          "Plugin migrations need a transactional database client so search_path can be pinned to the plugin namespace",
+        );
       }
+      await db.transaction(async (tx) => applyWithClient(tx as PluginDatabaseClient));
 
       return namespace;
     },
