@@ -2,8 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE,
   RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES,
+  RESTORED_CONTRADICTING_ISSUE_STATUSES,
   buildManualResolutionGuidance,
+  deriveRecordedResolveOutcome,
+  isContradictedRestoredClaim,
   issueRecoveryActionResolvePath,
+  resolveIssueRecoveryActionSchema,
 } from "./validators/issue.js";
 
 /**
@@ -67,5 +71,95 @@ describe("buildManualResolutionGuidance", () => {
     expect(guidance).toContain("board-only");
     expect(guidance).toContain("unresolved first-class blocker");
     expect(guidance).toContain("restored_unverified");
+  });
+
+  // PEN-5714 Part B.1: the route and the example body are the two fragments a
+  // reader copy-pastes. Unspanned, they render proportional and the {"..."}
+  // quoting blends into the surrounding prose quotes.
+  it("renders the route and the example body as code spans", () => {
+    expect(guidance).toContain(`\`POST ${issueRecoveryActionResolvePath(ISSUE_ID)}\``);
+    expect(guidance).toContain('`{"outcome":"restored","resolutionNote":"<why>"}`');
+  });
+
+  // PEN-5714 Part B.2: disclosing the downgrade is not the same as naming the
+  // way out of it. The copy-paste example omits `sourceIssueStatus`, and on an
+  // already-`blocked` row that records `restored_unverified` -- truthfully, but
+  // a reader who wants to avoid that was left to derive the field.
+  it("names the field that avoids the downgrade", () => {
+    expect(guidance).toContain('`"sourceIssueStatus":"todo"`');
+    expect(guidance).toContain("restored_unverified");
+  });
+
+  // Ally, review of #3760. The first version of the sentence above promised a
+  // VERIFIED `restored`, which the route does not record in the common case:
+  // `restored` + `todo` IS the hand-back arm, so where the action has a return
+  // owner the row is reassigned and the ledger says `handed_back`. The prose has
+  // to name both consequences, and the three tests below are what make that
+  // checkable -- the schema test that follows them sees arm (1) only.
+  it("names the hand-back outcome and the ownership move, not a verified restore", () => {
+    expect(guidance).toContain("handed_back");
+    expect(guidance).toContain("return owner");
+    expect(guidance).toContain("reassigns");
+    expect(guidance).not.toContain("VERIFIED");
+  });
+
+  it("promises the outcome `deriveRecordedResolveOutcome` actually returns", () => {
+    // The sentence is about an already-`blocked` row sent `restored` + `todo`.
+    // With a return owner recorded, that is a hand-back ...
+    expect(deriveRecordedResolveOutcome({
+      outcome: "restored",
+      requestedSourceIssueStatus: "todo",
+      currentIssueStatus: "blocked",
+      handingBack: true,
+    })).toBe("handed_back");
+    // ... and without one it is the plain `restored` the reader was after.
+    expect(deriveRecordedResolveOutcome({
+      outcome: "restored",
+      requestedSourceIssueStatus: "todo",
+      currentIssueStatus: "blocked",
+      handingBack: false,
+    })).toBe("restored");
+    // Control: the same call WITHOUT the field is the downgrade the prose warns
+    // about, so this trio shows the named field is what changes the outcome.
+    expect(deriveRecordedResolveOutcome({
+      outcome: "restored",
+      requestedSourceIssueStatus: null,
+      currentIssueStatus: "blocked",
+      handingBack: false,
+    })).toBe("restored_unverified");
+  });
+
+  it("keeps the contradiction arm ahead of the hand-back arm", () => {
+    // Precedence guard. If a contradicting status ever became hand-back-eligible,
+    // recording `handed_back` would let the PEN-3991 contradiction back in under a
+    // different name -- and the sentence above would be wrong a second time.
+    expect(deriveRecordedResolveOutcome({
+      outcome: "restored",
+      requestedSourceIssueStatus: "blocked",
+      currentIssueStatus: "blocked",
+      handingBack: true,
+    })).toBe("restored_unverified");
+  });
+
+  it("names a hand-back status the schema actually accepts for `restored`", () => {
+    // The sentence above is only worth adding if it is true: `todo` has to pass
+    // the schema AND clear the contradiction check. Derived from the exported
+    // constant, so widening the contradicting set fails here rather than
+    // leaving the prose quietly wrong.
+    expect(resolveIssueRecoveryActionSchema.safeParse({
+      outcome: "restored",
+      sourceIssueStatus: "todo",
+    }).success).toBe(true);
+    expect(RESTORED_CONTRADICTING_ISSUE_STATUSES as readonly string[]).not.toContain("todo");
+    expect(isContradictedRestoredClaim({
+      requestedSourceIssueStatus: "todo",
+      currentIssueStatus: "blocked",
+    })).toBe(false);
+    // Control: the same call WITHOUT the field is the downgrade the prose warns
+    // about, so this pair shows the sentence changes the outcome.
+    expect(isContradictedRestoredClaim({
+      requestedSourceIssueStatus: null,
+      currentIssueStatus: "blocked",
+    })).toBe(true);
   });
 });

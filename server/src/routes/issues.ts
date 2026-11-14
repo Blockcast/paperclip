@@ -51,6 +51,7 @@ import {
   resolveIssueRecoveryActionSchema,
   ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE,
   isContradictedRestoredClaim,
+  deriveRecordedResolveOutcome,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
   feedbackVoteValueSchema,
@@ -10671,19 +10672,19 @@ export function issueRoutes(
         requestedSourceIssueStatus: sourceIssueStatus ?? null,
         currentIssueStatus: existing.status,
       });
-    const recordedOutcome = contradictedRestoredClaim
-      // Checked BEFORE the hand-back arm on purpose. A hand-back returns the issue
-      // to its original owner, which is an ownership move and says nothing about
-      // whether execution was restored; recording `handed_back` here would let the
-      // contradiction back in under a different name. In practice the two cannot
-      // both fire today — hand-back requires `todo`, which is not a contradicting
-      // status — but the precedence is what keeps that true if either list moves.
-      ? "restored_unverified"
-      : handBackAgentId
-        ? "handed_back"
-        : outcome === "restored" && sourceIssueStatus === "done"
-          ? "owner_completed"
-          : outcome;
+    // Derived in `packages/shared`, beside `buildManualResolutionGuidance`, because
+    // the `nextAction` prose that builder emits promises readers this outcome and
+    // has to be pinned to it (PEN-5714 / Ally on #3760). The precedence between the
+    // four arms lives in that function's doc comment. `contradictedRestoredClaim`
+    // above recomputes arm (1) for `claimDowngraded`; both go through the one
+    // `isContradictedRestoredClaim` helper with the same inputs, so they cannot
+    // disagree.
+    const recordedOutcome = deriveRecordedResolveOutcome({
+      outcome,
+      requestedSourceIssueStatus: sourceIssueStatus ?? null,
+      currentIssueStatus: existing.status,
+      handingBack: Boolean(handBackAgentId),
+    });
     const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
     await assertAgentInReviewReviewPath({
       existing,

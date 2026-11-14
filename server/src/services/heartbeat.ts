@@ -102,6 +102,7 @@ import {
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   MODEL_PROFILE_KEYS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
+  buildManualResolutionGuidance,
   envBindingSchema,
   isSensitiveEnv,
   isEnvironmentDriverSupportedForAdapter,
@@ -42342,13 +42343,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
   function buildExecutionReviewParticipantRecoveryComment(input: {
     latestRun: Pick<typeof heartbeatRuns.$inferSelect, "error" | "errorCode"> | null | undefined;
+    issueId: string;
   }) {
     const failureSummary = summarizeRunFailureForIssueComment(input.latestRun);
     return (
       "Paperclip retried the pending execution-review participant once, but the review stage still has no completed decision " +
       `or live reviewer run.${failureSummary ?? ""} ` +
       "Moving it to `blocked` with a source-scoped recovery action so the recovery owner can repair the reviewer runtime, " +
-      "restore the review stage, or record an intentional manual resolution."
+      "restore the review stage, or " +
+      buildManualResolutionGuidance(input.issueId)
     );
   }
 
@@ -43192,7 +43195,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               kind: "blocked" as const,
               issue,
               previousStatus: issue.status,
-              comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run }),
+              comment: buildExecutionReviewParticipantRecoveryComment({ latestRun: run, issueId: issue.id }),
               recoveryCause: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE,
               recoveryOwnerAgentId: currentParticipant.agentId,
               expectedReviewStage: {
