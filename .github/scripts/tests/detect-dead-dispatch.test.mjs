@@ -32,6 +32,7 @@ import {
   findLastCompletedDispatch,
   isDeadLane,
   MIN_INTERVAL_STEP_NAME,
+  BUILD_JOB_NAME,
 } from '../detect-dead-dispatch.mjs';
 import { laneRefilled } from '../deploy-stall-record.mjs';
 
@@ -395,7 +396,10 @@ test('`survived` is NOT proof of a refill, and the close gate must not read it',
     { name: 'build-and-push', conclusion: 'success' },
     { name: 'deploy', conclusion: 'skipped' },
   ]);
-  assert.equal(cancelledBeforeDeploy, DISPATCH_FATE.SURVIVED, 'a supersede is not a death');
+  // BLO-57091: a cancelled BUILD is not a supersede (that cancels a run whose
+  // build succeeded); on a dispatch it is a timeout or manual cancel. Either
+  // way it did not refill the lane, which is what this test pins.
+  assert.equal(cancelledBeforeDeploy, DISPATCH_FATE.BUILD_CANCELLED, 'a cancelled build is retryable');
   assert.equal(deploySkippedByGuard, DISPATCH_FATE.SURVIVED, 'nor is a guard-skipped deploy');
   // ...and neither refilled the lane. The strict signal says so.
   assert.equal(deployJobCompleted([{ name: 'build-and-push', conclusion: 'cancelled' }]), false);
@@ -659,4 +663,62 @@ test('a refused run is not a refill for the close gate, and is not a dead lane',
   assert.equal(last.run.deployExecuted, false);
   assert.equal(last.run.refusedAt, '2026-11-14T07:41:12Z', 'the retry clock starts at the refusal');
   assert.equal(LANE_FAILED_TO_DELIVER_FATES.has(DISPATCH_FATE.REFUSED_MIN_INTERVAL), false);
+});
+
+// ---------------------------------------------------------------------------
+// BLO-57091. Replay of docker.yml run 43592047585 (2026-11-14): a dispatch
+// build hung on buildkit-amd64-1, hit `timeout-minutes: 90` and was cancelled;
+// the run concluded `cancelled` with `deploy: skipped`. It read as `survived`,
+// so nothing retried and the day's deploy was lost.
+// ---------------------------------------------------------------------------
+const cancelledRun = { status: 'completed', conclusion: 'cancelled', head_branch: 'master' };
+
+test('replay 2026-11-14 run 43592047585: a cancelled/timed-out build is retryable, not survived', () => {
+  assert.equal(BUILD_JOB_NAME, 'build-and-push');
+  for (const build of ['cancelled', 'timed_out']) {
+    assert.equal(
+      classifyDispatchRun(cancelledRun, jobs(['build-and-push', build], [DEPLOY_GATE_JOB_NAME, 'skipped'],
+        ['guard-pending-deploy-final', 'skipped'], ['deploy', 'skipped'])),
+      DISPATCH_FATE.BUILD_CANCELLED,
+    );
+  }
+  assert.equal(LANE_FAILED_TO_DELIVER_FATES.has(DISPATCH_FATE.BUILD_CANCELLED), true,
+    'a cancelled build whose retry is spent must still be reported');
+});
+
+test('BLO-57091: the supersede/eviction shape (build succeeded, deploy cancelled) stays survived', () => {
+  assert.equal(
+    classifyDispatchRun(cancelledRun, jobs(['build-and-push', 'success'], ['deploy', 'cancelled'])),
+    DISPATCH_FATE.SURVIVED,
+  );
+  // An ABSENT build job claims nothing either.
+  assert.equal(classifyDispatchRun(cancelledRun, jobs(['deploy', 'skipped'])), DISPATCH_FATE.SURVIVED);
+});
+
+test('BLO-57091: precededByRecentDispatch marks a run that was itself a quick retry', async () => {
+  const shape = { jobs: jobs(['build-and-push', 'cancelled'], ['deploy', 'skipped']) };
+  const at = (prevAt) => stubClient({
+    '/actions/workflows/': {
+      workflow_runs: [
+        { id: 2, status: 'completed', conclusion: 'cancelled', head_branch: 'master', created_at: '2026-11-14T13:30:00Z' },
+        { id: 1, status: 'completed', conclusion: 'cancelled', head_branch: 'master', created_at: prevAt },
+      ],
+    },
+    '/actions/runs/2/jobs': shape,
+  });
+  const fresh = await findLastCompletedDispatch({ client: at('2026-11-13T07:30:00Z') });
+  assert.equal(fresh.fate, DISPATCH_FATE.BUILD_CANCELLED);
+  assert.equal(fresh.run.precededByRecentDispatch, false, 'yesterday\'s daily dispatch does not spend the retry');
+  const retried = await findLastCompletedDispatch({ client: at('2026-11-14T09:00:00Z') });
+  assert.equal(retried.run.precededByRecentDispatch, true, 'a retry that hangs again is not retried');
+});
+
+test('BLO-57091: an unreadable created_at reads as preceded — no retry, fail-quiet', async () => {
+  const client = stubClient({
+    '/actions/workflows/': { workflow_runs: [{ id: 3, status: 'completed', conclusion: 'cancelled', head_branch: 'master' }] },
+    '/actions/runs/3/jobs': { jobs: jobs(['build-and-push', 'timed_out'], ['deploy', 'skipped']) },
+  });
+  const last = await findLastCompletedDispatch({ client });
+  assert.equal(last.fate, DISPATCH_FATE.BUILD_CANCELLED);
+  assert.equal(last.run.precededByRecentDispatch, true);
 });
