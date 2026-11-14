@@ -122,6 +122,24 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        # PEN-6676. STRICTLY BELOW the job's `timeout-minutes: 15`, so an
+        # overrun here concludes `failure` ON THE STEP instead of `cancelled`
+        # on the job. That distinction is the whole point: this job's own
+        # `cancel-in-progress: true` produces `cancelled` on every routine
+        # supersede, so a ceiling kill recorded that way is indistinguishable
+        # from one, and the alert arm below would have to guess.
+        #
+        # Sized off the SUCCESSFUL population, never the killed runs. 9 builds
+        # completed between 2026-06-21 and 2026-11-14: max 7.42 min (run #13),
+        # median 3.95, most recent 4.88 (run #17). 12 min is ~62% above the
+        # longest build that has ever finished.
+        #
+        # Deliberately NOT sized to clear the longest KILLED attempt, which is
+        # the sibling gateway lane's rule. Run #18 emitted its last BuildKit
+        # progress line at 14:53:43.78Z and nothing for the following 14m39s
+        # before the ceiling cut it, so its demand is unbounded — no budget can
+        # clear a hang, and bounding it loudly is the remedy.
+        timeout-minutes: 12
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -144,3 +162,86 @@ jobs:
           labels: |
             ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.base.name=${{ steps.base.outputs.image }}
+
+  # PEN-6676. A `master` push that publishes no image must reach somebody.
+  #
+  # On 2026-11-14 run #18 hit the job ceiling after 14m39s with no BuildKit
+  # progress, published nothing, and notified nobody. Nothing covers this lane:
+  # measured that day, `scheduled_workflow_last_verdict_failed` carries 20
+  # series for this repo and NONE for any `docker-*` workflow, and its alert
+  # keys on the CRON verdict so it cannot see a push build at all. All 13
+  # BuildKit rules were `inactive` throughout.
+  #
+  # Same shape as docker-mcp-gateway.yml and docker-agent.yml: a separate job,
+  # firing on `failure` OR `cancelled`, routed to Alertmanager (NOT GitHub
+  # Issues, which are disabled on this repo - BLO-33382) and fanned to the
+  # paperclip-plugin-alertmanager webhook, which dedupes on the alert
+  # fingerprint and refreshes one issue in place.
+  alert-on-failure:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled')
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    # actions: read + checks: read are what let the script tell a timeout kill
+    # from a concurrency supersede and from a human cancel. All three report
+    # `cancelled`; only the annotations separate them, and without these scopes
+    # every cancellation classifies `unknown` and pages (fail-closed, but
+    # uselessly noisy - and a noisy alert gets muted, which is the silence this
+    # row exists to end).
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Report the unpublished image to Alertmanager
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: firing
+          GH_REPO: ${{ github.repository }}
+          # Collapsed to a single value for tags so the label set stays bounded:
+          # the fingerprint hashes every label, and one identity per tag would
+          # fragment the alert the bridge dedupes on (BLO-28616).
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-mcp-external-image-alert.mjs
+
+  # The other half of an honest alert: without it `endsAt` is the only thing
+  # retiring the firing alert, so the lane goes quiet on a TIMER rather than on
+  # a fix. Pushing the identical label set with a past `endsAt` makes
+  # Alertmanager send `resolved`, which cancels the issue.
+  #
+  # It is also the continuous capability probe. This lane is sparse - 9
+  # successful builds in the ~5 months to 2026-11-14 - so a channel that rotted
+  # here would otherwise be discovered by the next outage. Every green build
+  # exercises the exact delivery path the failure path depends on.
+  #
+  # A separate job rather than a step inside build-and-push, deliberately: a
+  # delivery failure here must not flip `build-and-push.result` to `failure`
+  # and fire a spurious "the build is failing" alert about itself.
+  resolve-on-success:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      needs.build-and-push.result == 'success'
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Resolve the image-delivery alert (and prove the channel still works)
+        env:
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: resolved
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-mcp-external-image-alert.mjs

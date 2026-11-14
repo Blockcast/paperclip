@@ -613,6 +613,22 @@ jobs:
         run: node --test ./scripts/check-mcp-gateway-image-alert-channel.test.js
         timeout-minutes: 1
 
+      # PEN-6676: the SAME silence in a third shape, and the measurement that
+      # showed it is not one workflow's problem. On 2026-11-14 three builds at
+      # one master push were killed at their own ceilings - mcp-external at
+      # 15m05s/15, webflow-bot at 30m05s/30, figma-bot at 30m07s/30 - all on
+      # runner scale set `arc-paperclip-buildkit-n7zlf`, while designer and
+      # mcp-gateway on `rnxnc` with the same BuildKit ordinal finished in 2m18s
+      # and 1m48s. So a bigger budget is not the fix: 30 was not enough for two
+      # siblings. What was missing is the ability to SAY SO - `cancelled` is
+      # also what a routine supersede reports, and nothing else watches this
+      # lane (`scheduled_workflow_last_verdict_failed` carries no `docker-*`
+      # series, and its alert keys on the cron verdict, not a push).
+      - name: Validate mcp-external image alert channel and timeout budgets (PEN-6676)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-mcp-external-image-alert-channel.test.js
+        timeout-minutes: 1
+
       # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
       # approval holds a lock until its rollout lands, so a deploy dying between
       # the approval step and `helm upgrade` strands a lock nothing can clear
