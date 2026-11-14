@@ -768,6 +768,53 @@ function assertNoEscapeStringLiterals(statement: string): void {
   }
 }
 
+/**
+ * The GUC-write ban, scanned over `stripSqlComments` output and NOT over
+ * `normaliseSql` output. That difference is the whole construct.
+ *
+ * A GUC write inside a plugin statement defeats the `search_path` pins on EVERY path
+ * in this file, so the ban is called from `assertNoBannedSql` -- the one place all
+ * three validators already share -- rather than sitting on the migration path alone
+ * (#3775 review).
+ *
+ * ⚠ It cannot live IN the `banned` list, because that list is tested against the
+ * keyword scan. Every other entry there names a KEYWORD, and a keyword cannot be
+ * written as a quoted identifier and still parse -- `"grant" ...` is not a GRANT, so
+ * blanking quoted spans costs those patterns nothing. These two name a FUNCTION and a
+ * GUC, which ARE identifiers, and Postgres resolves a quoted lowercase identifier to
+ * the same object. `stripSqlForKeywordScan` collapses `"..."` to `""`, so
+ * `"set_config"('search_path', ...)` normalised to `""('', '', ...)` and NEITHER
+ * pattern matched: measured ALLOW on all three validators at `3092cdc`, reproduced
+ * first-party before this change. The comment-stripped RAW text keeps quoted
+ * identifiers and string literals intact, so one scan sees `set_config`,
+ * `"set_config"`, `pg_catalog."set_config"`, the GUC name inside `'search_path'`, and
+ * a dollar-quoted `$$search_path$$` alike.
+ *
+ * Comments are stripped, not kept, so that a comment can never be read as part of a
+ * name. `hasNestedBlockComment` refuses the one input `stripSqlComments` cannot span,
+ * and `assertNoBannedSql` runs it before calling this.
+ *
+ * ⚠ LEXICAL, and therefore BROADER than the hazard: it refuses `set_config` for any
+ * GUC, and refuses the bare word `search_path` wherever it appears -- including inside
+ * a string literal or an identifier. That trade, a loud deploy-time refusal over a
+ * silent namespace escape, is the one this file already takes, and it is bounded
+ * rather than assumed: over the shipped plugin corpus (18 migration files across the 3
+ * plugins that ship any, plus every `ctx.db.query`/`ctx.db.execute` statement in
+ * `packages/plugins`) ZERO statements contain either word in RAW text, so no shipped
+ * statement changes verdict. (Positive control for that scan: `create table` matches 8
+ * of the 18 files; a minted nonce matches 0.) A plugin that needs a GUC write needs
+ * this validator changed, not a spelling that gets past it.
+ */
+const GUC_WRITE_PATTERNS = [/\bset_config\b/, /\bsearch_path\b/];
+
+function assertNoGucWrite(statement: string): void {
+  const scanText = stripSqlComments(statement).toLowerCase();
+  const matched = GUC_WRITE_PATTERNS.find((pattern) => pattern.test(scanText));
+  if (matched) {
+    throw new Error(`Plugin SQL contains a disallowed statement or clause: ${matched.source}`);
+  }
+}
+
 function assertNoBannedSql(statement: string): void {
   assertNoEscapeStringLiterals(statement);
   const normalized = normaliseSql(statement);
@@ -794,37 +841,12 @@ function assertNoBannedSql(statement: string): void {
     /\bcopy\b/,
     /\bcall\b/,
     /\bdo\s+(?:\$\$|language\b)/,
-    // A GUC write inside a plugin statement defeats the `search_path` pins on EVERY
-    // path in this file, so it is banned here -- the one place all three validators
-    // already share -- rather than on the migration path alone (#3775 review).
-    //
-    // `set_config` is the pattern that catches the reachable form, and the two
-    // patterns are NOT interchangeable. `stripSqlForKeywordScan` replaces a quoted
-    // span with an EMPTY one, so `set_config('search_path', 'public', true)`
-    // normalises to `set_config('', '', true)` and `\bsearch_path\b` never sees the
-    // GUC name at all. The function name is code, not a literal, so `set_config`
-    // does -- including `pg_catalog.set_config(...)`, where the word boundary holds
-    // after the dot, and a dollar-quoted `$$search_path$$`, whose body is erased the
-    // same way.
-    //
-    // `search_path` is kept for the forms where the GUC name IS code: `SET
-    // search_path TO ...`, `RESET search_path`, `ALTER ROLE/DATABASE ... SET
-    // search_path`. Most of those are already refused upstream by the leading-keyword
-    // whitelists, but those whitelists exist to classify statements, not to defend
-    // the pin, and this does not depend on them.
-    //
-    // Measured over the shipped plugin corpus -- 18 migration files across the 3
-    // plugins that ship any, plus every `ctx.db.query`/`ctx.db.execute` statement in
-    // `packages/plugins` -- ZERO statements match either pattern, so no shipped
-    // statement changes verdict. (Positive control: the same scan finds `create
-    // table` in 8 files; a minted nonce finds 0.)
-    /\bset_config\b/,
-    /\bsearch_path\b/,
   ];
   const matched = banned.find((pattern) => pattern.test(normalized));
   if (matched) {
     throw new Error(`Plugin SQL contains a disallowed statement or clause: ${matched.source}`);
   }
+  assertNoGucWrite(statement);
 }
 
 /**

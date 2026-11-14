@@ -107,10 +107,16 @@ describe("plugin database SQL validation", () => {
 
   /**
    * A GUC write defeats the `search_path` pins on every path in this file, so the ban
-   * sits in `assertNoBannedSql`, which all three validators already share (#3775
-   * review). The two patterns are not interchangeable and this pins which one does the
-   * work: `stripSqlForKeywordScan` empties a quoted span, so the GUC NAME is invisible
-   * inside `set_config('search_path', ...)` and only `\bset_config\b` can refuse it.
+   * is called from `assertNoBannedSql`, which all three validators already share
+   * (#3775 review).
+   *
+   * The two patterns are not interchangeable, and which one carries a given form
+   * depends on the TEXT the check reads. `assertNoGucWrite` reads comment-stripped RAW
+   * text, so both patterns see a string literal and either can match -- `set_config`
+   * is simply first in the list, so it names the refusal. The round-2 claim that
+   * `\bsearch_path\b` could never see the GUC name was true only of the KEYWORD SCAN,
+   * which blanks quoted spans; that is also what let the quoted spelling through, and
+   * is the subject of the next test.
    */
   it("refuses a statement that writes search_path, on every plugin SQL path", () => {
     const localScoped = "INSERT INTO plugin_test.probe (v) SELECT set_config('search_path', 'public', true)";
@@ -138,8 +144,7 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/set_config/i);
 
     // Schema-qualifying the call does not evade it: the word boundary holds after the
-    // dot. Nor does dollar-quoting the GUC name, which is emptied the same way `'...'`
-    // is -- so again it is `set_config` and not `search_path` that refuses.
+    // dot. Nor does dollar-quoting the GUC name.
     expect(() =>
       validatePluginMigrationStatement(
         "INSERT INTO plugin_test.probe (v) SELECT pg_catalog.set_config($$search_path$$, $$public$$, true)",
@@ -161,6 +166,58 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/search_path/i);
   });
 
+  /**
+   * Round 3 on #3775. The ban was an entry in the `banned` list, which is tested
+   * against the KEYWORD SCAN -- and `stripSqlForKeywordScan` collapses `"..."` to
+   * `""`, so `"set_config"('search_path', ...)` normalised to `""('', '', ...)` and
+   * NEITHER pattern matched. Postgres resolves a quoted lowercase identifier to the
+   * same function, so this is a working spelling of the call and not a curiosity.
+   * Measured ALLOW on all three validators at `3092cdc` and reproduced first-party
+   * before the fix. The GUC check now reads comment-stripped RAW text, where a quoted
+   * identifier is still there to be seen.
+   *
+   * It is specific to banning an IDENTIFIER. Every other entry in `banned` names a
+   * KEYWORD, and a keyword cannot be written as a quoted identifier and still parse --
+   * `"grant" ...` is not a GRANT -- so blanking quoted spans costs those patterns
+   * nothing.
+   */
+  it("refuses a GUC write spelled as a quoted identifier, on every plugin SQL path", () => {
+    const quotedSession =
+      `INSERT INTO plugin_test.probe (v) SELECT "set_config"('search_path', 'plugin_test, public', false)`;
+    const quotedLocal =
+      `INSERT INTO plugin_test.probe (v) SELECT "set_config"('search_path', 'public', true)`;
+
+    for (const statement of [quotedSession, quotedLocal]) {
+      expect(() =>
+        validatePluginMigrationStatement(statement, "plugin_test", [], KNOWN_SCHEMAS)
+      ).toThrow(/set_config/i);
+      expect(() =>
+        validatePluginRuntimeExecute(statement, "plugin_test", KNOWN_SCHEMAS)
+      ).toThrow(/set_config/i);
+    }
+
+    expect(() =>
+      validatePluginRuntimeQuery(
+        `SELECT "set_config"('search_path', 'plugin_test, public', false) FROM plugin_test.rows`,
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).toThrow(/set_config/i);
+
+    // Schema-qualifying the quoted call does not evade it either. This form was
+    // already refused at `3092cdc`, but by the unextracted-ref check rather than by
+    // the ban -- so it is asserted here against the ban's own message.
+    expect(() =>
+      validatePluginMigrationStatement(
+        `INSERT INTO plugin_test.probe (v) SELECT pg_catalog."set_config"('search_path', 'public', true)`,
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).toThrow(/set_config/i);
+  });
+
   it("does not refuse ordinary plugin SQL for the search_path ban", () => {
     // The control for the test above: the ban is narrow enough that the statements
     // this validator is supposed to ALLOW still pass. Without this, a ban that refused
@@ -176,6 +233,28 @@ describe("plugin database SQL validation", () => {
     expect(() =>
       validatePluginRuntimeQuery(
         "SELECT id, config FROM plugin_test.rows WHERE id = $1",
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).not.toThrow();
+    // A quoted identifier is not a GUC write just because it is quoted -- the check
+    // reads raw text, so this is the arm that keeps it from refusing every quoted
+    // name.
+    expect(() =>
+      validatePluginRuntimeQuery(
+        `SELECT "config" FROM plugin_test.rows WHERE id = $1`,
+        "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
+      )
+    ).not.toThrow();
+    // Comments are STRIPPED before the GUC scan, so a comment that merely mentions the
+    // GUC is not a GUC write. This pins the scan text as comment-stripped raw text
+    // rather than the raw statement.
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "SELECT id FROM plugin_test.rows -- search_path is pinned by the caller\n WHERE id = $1",
         "plugin_test",
         [],
         KNOWN_SCHEMAS,
@@ -2160,6 +2239,57 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       ).rejects.toThrow(/set_config/i);
 
       // The whole file rolled back, so the decoy read never happened at all.
+      const [{ present }] = Array.from(
+        (await db.execute(
+          sql.raw(`SELECT to_regclass('"${namespace}".sink') IS NOT NULL AS present`),
+        )) as Iterable<{ present: boolean }>,
+      );
+      expect(present).toBe(false);
+    });
+
+    /**
+     * Round 3 on #3775. The ban the test above pins was an entry in the `banned`
+     * list, which is tested against the KEYWORD SCAN, and that scan blanks quoted
+     * spans -- so `"set_config"(...)` got past it on all three validators. The first
+     * half of this test is the control that makes the second half mean anything: it
+     * runs the quoted spelling through the RAW client, with no validator in the way,
+     * and shows the database treats it as the same function. Unquoted identifiers are
+     * folded to lower case, so the quoted lower-case form names the same object.
+     */
+    it("refuses a GUC write spelled as a quoted identifier in a migration", async () => {
+      // CONTROL: the quoted spelling really does write the GUC. Without this, the
+      // refusal below could be refusing something that was never a threat.
+      await db.transaction(async (tx) => {
+        await tx.execute(sql.raw("SET LOCAL search_path TO pg_catalog"));
+        await tx.execute(sql.raw(`SELECT "set_config"('search_path', 'public', true)`));
+        const [{ value }] = Array.from(
+          (await tx.execute(
+            sql.raw("SELECT current_setting('search_path') AS value"),
+          )) as Iterable<{ value: string }>,
+        );
+        expect(value).toBe("public");
+      });
+
+      await installPublicDecoys();
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.pen6669_shadow (label text NOT NULL);
+        CREATE TABLE ${namespace}.sink (label text NOT NULL);
+        CREATE TABLE ${namespace}.probe (v text);
+        INSERT INTO ${namespace}.pen6669_shadow (label) VALUES ('from-namespace');
+        INSERT INTO ${namespace}.probe (v) SELECT "set_config"('search_path', 'public', true);
+        INSERT INTO ${namespace}.sink (label) SELECT label FROM pen6669_shadow;
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+
+      await expect(
+        pluginDatabaseService(db).applyMigrations(pluginId, pluginManifest, packageRoot),
+      ).rejects.toThrow(/set_config/i);
+
       const [{ present }] = Array.from(
         (await db.execute(
           sql.raw(`SELECT to_regclass('"${namespace}".sink') IS NOT NULL AS present`),
