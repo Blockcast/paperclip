@@ -100,7 +100,11 @@ jobs:
     # docker.yml). BLO-46675: off org group 1 (arc-dind) so tag pushes
     # (refs/tags/mcp-gateway-v*) keep a runner once group 1 is scoped to
     # master-pinned workflows (BLO-40782).
-    runs-on: arc-paperclip-buildkit
+    # PEN-6677: group pinned so this cannot land on the tools-cluster twin,
+    # which reaches a different BuildKit. Full rationale in docker.yml.
+    runs-on:
+      group: arc-paperclip-buildkit
+      labels: arc-paperclip-buildkit
     # PEN-6034: a BACKSTOP, not the operative budget. `Build and push` carries
     # its own, lower `timeout-minutes` below, and that is what should ever bite
     # — a step timeout concludes `failure`, a job timeout concludes `cancelled`

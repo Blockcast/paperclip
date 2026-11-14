@@ -83,7 +83,17 @@ jobs:
     if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
     # This job only needs a BuildKit client. Keep it off the warm-seeded DinD
     # pool and execute the build on the persistent, Ceph-backed amd64 builders.
-    runs-on: arc-paperclip-buildkit
+    # PEN-6677: pin the GROUP, not just the label. Two org runner groups answer
+    # the bare label -- 13 `arc-paperclip-buildkit` (this cluster) and 16
+    # `arc-paperclip-buildkit-tools` -- so placement was non-deterministic per
+    # job, and a tools-cluster runner reaches THAT cluster's BuildKit, not the
+    # Ceph-backed prod StatefulSet this job's cache and GC policy assume.
+    # Measured 2026-11-14: 4 image builds hung to their timeout ceilings on the
+    # tools pool and 0 on this one. Same remedy, and the same reason, as the
+    # arc-paperclip-dind pin in docker-agent.yml.
+    runs-on:
+      group: arc-paperclip-buildkit
+      labels: arc-paperclip-buildkit
     timeout-minutes: 90
     concurrency:
       # A master push may supersede another publish build, but it must never
