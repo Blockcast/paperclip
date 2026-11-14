@@ -55,7 +55,7 @@ import {
 import { accessService } from "../services/access.js";
 import { authorizationService } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
-import { isMaskedWorkspaceRuntimeEcho } from "../redaction.js";
+import { isMaskedEchoOfStoredWorkspaceRuntime } from "../redaction.js";
 import { assertCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -513,17 +513,24 @@ function assertNoAgentStageConfigCommandMutation(req: Request, config: unknown, 
  * operator-authored service commands. The four issue write routes have refused an agent
  * setting it since `#3699`; these three did not.
  *
- * ⛔ `admitMaskedEcho` IS THE WHOLE ASYMMETRY AND IT IS NOT A STYLE CHOICE. Pass it only
- * where a restore runs. `services/pipelines.ts` calls `restoreWithheldPipelineStageConfig`
- * on `input.patch.config`, i.e. on stage PATCH alone, so only there does admitting an echo
- * end with the operator's stored value back in place. At stage CREATE and at pipeline
- * CREATE's `stages[]` there is nothing to restore FROM — an admitted echo would persist the
- * literal `REDACTED_EVENT_VALUE` into a fresh stage config, which is a hole wearing a
- * carve-out's clothes. Those two refuse outright, and a plain refusal there breaks no
- * round-trip because there is no stored value to round-trip.
+ * ⛔ `storedWorkspaceRuntime` IS THE WHOLE ASYMMETRY. Pass it only where a restore runs.
+ * `services/pipelines.ts` calls `restoreWithheldPipelineStageConfig` on `input.patch.config`,
+ * i.e. on stage PATCH alone, so only there can an admitted echo end with the operator's
+ * stored value back in place. At stage CREATE and at pipeline CREATE's `stages[]` there is
+ * nothing to restore FROM — pass `undefined` and every non-nullish value is refused. A plain
+ * refusal there breaks no round-trip, because there is no stored value to round-trip.
  *
  * ⛔ AND A CREATE-ONLY REFUSAL WOULD NOT HAVE BEEN A CLOSE: it is bypassable one route over
  * by PATCHing the value in afterwards. Both halves are required or neither is worth having.
+ *
+ * ⛔ THE PATCH TEST COMPARES AGAINST THE STORED VALUE, NOT AGAINST THE INCOMING ONE'S OWN
+ * MASK. A fixpoint test (`mask(x)` deep-equal `x`) looks equivalent and is not: the mask
+ * passes identity keys and the in-set `kind`/`lifecycle` enums through verbatim, so an agent
+ * can author THOSE and still be a fixpoint — duplicating a stored service so its real command
+ * is restored and started twice, flipping `service`→`job` or `shared`→`ephemeral` under a
+ * restored command, or re-pointing one element's identity onto another's. None writes a fresh
+ * command string and every one changes what the host executes. `isMaskedEchoOfStoredWorkspaceRuntime`
+ * carries the full reasoning; it was caught in review on `#3764` before it landed.
  *
  * ⚠ The nullish admission is the issue-route rule, unchanged and for the same measured
  * reason: `parseIssueExecutionWorkspaceSettings` drops a nullish `workspaceRuntime`
@@ -533,11 +540,17 @@ function assertNoAgentStageConfigCommandMutation(req: Request, config: unknown, 
  * "do not set this". At stage PATCH `null` is the one thing an agent must NOT be told to
  * send: there it DELETES the operator's stored runtime config rather than clearing a
  * marker. The issue-route refusal's own "send `null`" text would be wrong here.
+ *
+ * ⚠ BOTH CARRIERS COMPARE AGAINST THE STORED `onEnter` BLOCK, and that is not an oversight:
+ * `restoreWithheldPipelineStageConfig` restores both from stored `onEnter` too, because
+ * `persistedStageConfig` destructures `automation` out before every write so no stored row
+ * can carry one. Keying `automation` off a stored `automation` would compare against
+ * `undefined` and refuse every faithful round-trip of that branch.
  */
 function collectStageConfigWorkspaceRuntimePaths(
   config: unknown,
   prefix: string,
-  admitMaskedEcho: boolean,
+  storedWorkspaceRuntime: unknown,
 ): string[] {
   if (typeof config !== "object" || config === null || Array.isArray(config)) return [];
   const record = config as Record<string, unknown>;
@@ -549,29 +562,39 @@ function collectStageConfigWorkspaceRuntimePaths(
     if (typeof settings !== "object" || settings === null || Array.isArray(settings)) continue;
     const value = (settings as Record<string, unknown>).workspaceRuntime;
     if (value === null || value === undefined) continue;
-    // ⛔ `{}` is a FIXPOINT of the mask, so the echo test alone admits it — and an
-    // empty record is not an empty write. `restoreWithheldValue` walks the INCOMING
-    // keys, so `{}` restores nothing and REPLACES the operator's stored config.
-    // Refused here rather than inside the predicate, which answers "could a masked
-    // read have produced this" and is documented as not answering "is admitting it
-    // non-destructive". Same call as
-    // `collectAgentDisallowedIssueWorkspaceRuntimePaths` makes for the issue routes.
-    if (admitMaskedEcho
-        && Object.keys(value as Record<string, unknown>).length > 0
-        && isMaskedWorkspaceRuntimeEcho(value)) continue;
+    if (storedWorkspaceRuntime !== undefined
+        && isMaskedEchoOfStoredWorkspaceRuntime(value, storedWorkspaceRuntime)) continue;
     paths.push(`${prefix}.${carrier}.executionWorkspaceSettings.workspaceRuntime`);
   }
   return paths;
+}
+
+/** Does this body carry a non-nullish `workspaceRuntime` on either carrier? Gates the extra
+ *  stored-row read so an ordinary stage PATCH pays nothing. ⛔ It must stay a SUPERSET of what
+ *  the collector refuses, or a refusable body would skip the read and be admitted unchecked. */
+function stageConfigCarriesWorkspaceRuntime(config: unknown): boolean {
+  return collectStageConfigWorkspaceRuntimePaths(config, "config", undefined).length > 0;
+}
+
+/** The stored `onEnter` runtime block both carriers restore from. `undefined` means "no
+ *  stored config to compare against", which refuses every non-nullish incoming value. */
+function storedStageWorkspaceRuntime(storedConfig: unknown): unknown {
+  if (typeof storedConfig !== "object" || storedConfig === null || Array.isArray(storedConfig)) return undefined;
+  const onEnter = (storedConfig as Record<string, unknown>).onEnter;
+  if (typeof onEnter !== "object" || onEnter === null || Array.isArray(onEnter)) return undefined;
+  const settings = (onEnter as Record<string, unknown>).executionWorkspaceSettings;
+  if (typeof settings !== "object" || settings === null || Array.isArray(settings)) return undefined;
+  return (settings as Record<string, unknown>).workspaceRuntime;
 }
 
 function assertNoAgentStageConfigWorkspaceRuntimeMutation(
   req: Request,
   config: unknown,
   prefix: string,
-  options: { admitMaskedEcho: boolean; remedy: string },
+  options: { storedWorkspaceRuntime: unknown; remedy: string },
 ) {
   if (req.actor.type !== "agent") return;
-  const paths = collectStageConfigWorkspaceRuntimePaths(config, prefix, options.admitMaskedEcho);
+  const paths = collectStageConfigWorkspaceRuntimePaths(config, prefix, options.storedWorkspaceRuntime);
   if (paths.length === 0) return;
   throw forbidden(
     `Agent keys cannot set pipeline stage execution workspace runtime config (${paths.join(", ")}). `
@@ -590,9 +613,10 @@ function assertNoAgentStageConfigWorkspaceRuntimeMutation(
 const STAGE_RUNTIME_CREATE_REMEDY =
   "Omit the key, or send `null`, to create the stage without one.";
 const STAGE_RUNTIME_PATCH_REMEDY =
-  "Omit the key to leave the stored config untouched - an unmodified echo of a masked read is "
-  + "admitted, and is restored to the stored value. Do NOT send `null` here: on this route it "
-  + "DELETES the operator's runtime config rather than clearing a redaction marker.";
+  "Omit the key to leave the stored config untouched - only an UNMODIFIED echo of this stage's "
+  + "own masked config is admitted, and it is restored to the stored value. Do NOT send `null` "
+  + "here: on this route it DELETES the operator's runtime config rather than clearing a "
+  + "redaction marker.";
 
 function actorForMutation(req: Request): PipelineActor {
   if (req.actor.type === "agent") {
@@ -1113,7 +1137,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     for (const [index, stage] of ((req.body.stages ?? []) as { config?: unknown }[]).entries()) {
       assertNoAgentStageConfigCommandMutation(req, stage?.config, `stages[${index}].config`);
       assertNoAgentStageConfigWorkspaceRuntimeMutation(req, stage?.config, `stages[${index}].config`, {
-        admitMaskedEcho: false,
+        storedWorkspaceRuntime: undefined,
         remedy: STAGE_RUNTIME_CREATE_REMEDY,
       });
     }
@@ -1453,7 +1477,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
     assertNoAgentStageConfigCommandMutation(req, req.body.config, "config");
     assertNoAgentStageConfigWorkspaceRuntimeMutation(req, req.body.config, "config", {
-      admitMaskedEcho: false,
+      storedWorkspaceRuntime: undefined,
       remedy: STAGE_RUNTIME_CREATE_REMEDY,
     });
     const actor = actorForMutation(req);
@@ -1481,10 +1505,21 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
     assertNoAgentStageConfigCommandMutation(req, req.body.config, "config");
-    assertNoAgentStageConfigWorkspaceRuntimeMutation(req, req.body.config, "config", {
-      admitMaskedEcho: true,
-      remedy: STAGE_RUNTIME_PATCH_REMEDY,
-    });
+    // The ONLY admitted `workspaceRuntime` here is the exact value a withheld read of THIS
+    // stage would have returned, so the guard needs the stored row. Read lazily: the query
+    // runs only for an agent actor that actually supplied the field, which is the rare path.
+    // ⛔ Fail CLOSED — a stage that cannot be read yields `undefined`, which refuses.
+    if (req.actor.type === "agent" && stageConfigCarriesWorkspaceRuntime(req.body.config)) {
+      const [storedStage] = await db
+        .select({ config: pipelineStages.config })
+        .from(pipelineStages)
+        .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)))
+        .limit(1);
+      assertNoAgentStageConfigWorkspaceRuntimeMutation(req, req.body.config, "config", {
+        storedWorkspaceRuntime: storedStageWorkspaceRuntime(storedStage?.config),
+        remedy: STAGE_RUNTIME_PATCH_REMEDY,
+      });
+    }
     const actor = actorForMutation(req);
     try {
       const updatedStage = await svc.updateStage({ companyId, pipelineId, stageId, patch: req.body, actor });

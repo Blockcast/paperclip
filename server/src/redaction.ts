@@ -1523,73 +1523,64 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
 }
 
 /**
- * PEN-6595. Could this incoming `workspaceRuntime` have come out of
- * `maskWorkspaceRuntimeForRead` above? That is the write-side question the
- * pipeline stage-PATCH guard needs, and it is deliberately NOT a second
- * classification of which keys are sensitive.
+ * PEN-6595. Is this incoming `workspaceRuntime` the EXACT value a withheld reader
+ * would have been handed for the STORED one — i.e. an unmodified round-trip that
+ * `restoreWithheldPipelineStageConfig` will put straight back?
  *
- * The mask is a pure function and is IDEMPOTENT on its own output: a sentinel
- * leaf masks to the sentinel, a surviving identity key masks to itself, an
- * in-set enum value masks to itself, and `null`/`undefined` pass through. A
- * FRESH value is the only thing the mask changes. So `mask(x)` deep-equal `x`
- * holds exactly when `x` carries nothing a withheld reader could not already
- * see — which is what "an unmodified echo of a masked read" means.
+ * ⛔⛔ IT TAKES THE STORED VALUE, AND THAT PARAMETER IS THE WHOLE GUARD. An earlier
+ * version of this compared the incoming value against ITS OWN mask — `mask(x)`
+ * deep-equal `x`, a FIXPOINT test — reasoning that the mask is idempotent so a
+ * fixpoint is exactly "carries nothing a withheld reader could not already see".
+ * That reasoning is WRONG and was caught in review on `#3764` before it landed.
+ * **A FIXPOINT IS NOT AN ECHO.** The mask deliberately lets identity keys
+ * (`id`/`name`/`label`/`title`) and the in-set `kind`/`lifecycle` enums through
+ * verbatim, so an agent can AUTHOR those freely and still be a fixpoint:
  *
- * ⭐ Using the mask as its own oracle is the point. A hand-written list of
- * "which leaves may be non-sentinel" would be a COPY of the mask's
- * classification, and the copy is how a key ends up honoured on one side and
- * not the other — the duplication `readArrayElementIdentity` below already
- * refuses by reading the mask's OWN identity set rather than a copy of it. An
- * identity or enum key added to the mask is honoured here in the same commit,
- * with no edit.
+ *   - DUPLICATE an operator service — `[{id:"web",…},{id:"web",…}]` against a
+ *     single stored `web`. `matchExistingArrayElement` resolves the one stored
+ *     element for BOTH, so the operator's real command is restored twice and the
+ *     runtime starts it twice.
+ *   - FLIP EXECUTION SEMANTICS — echo with `kind:"service"`→`"job"` or
+ *     `lifecycle:"shared"`→`"ephemeral"`. Both are in-set, so the fixpoint test
+ *     admits them and the stored command restores into an agent-chosen lifecycle.
+ *   - RE-POINT or INTRODUCE entries — rename an element's identity onto another
+ *     stored service's, or add `{id:"x",command:<sentinel>}` with nothing stored
+ *     to match, which persists the literal sentinel as a service command.
  *
- * ⛔ A non-plain-object is REFUSED rather than tested, and that is not
- * belt-and-braces. The mask returns the bare sentinel STRING for every
- * non-object shape, so a scalar `workspaceRuntime` whose value is the sentinel
- * would be its own fixpoint and walk straight through — the array-shaped and
- * JSON-string-shaped bypasses this series has already shipped once each (#1574,
- * #1583), read in the write direction. Nothing legitimate round-trips that way:
- * the column is typed `Record<string, unknown> | null` at every schema that
- * declares it.
+ * None of those writes a fresh command string, and every one of them changes what
+ * the host executes — so "refuses a fresh value" was true of the LEAVES and false
+ * of the STRUCTURE, which is the half that matters here.
  *
- * ⚠ THIS IS NOT AN ENTITLEMENT CHECK AND IT PROVES NOTHING ABOUT THE CALLER.
- * It asks only what the incoming bytes say — the same viewer-independent
- * reasoning `restoreWithheldPipelineStageConfig` records below. An ENTITLED
- * reader echoes REAL values, which this refuses; that is correct for the one
- * caller today (no agent resolves `revealRuntimeConfig`, so every agent read is
- * masked) and it is the fail-closed direction if that ever changes.
+ * Comparing against `mask(stored)` closes all of them at once, plus `{}` (admitted
+ * only when the stored value is also `{}`, where it is a true no-op) and the
+ * partial-echo deletion the fixpoint form had to carry as a documented residual.
+ * ⇒ there is no longer a second special case to keep in step.
  *
- * ⚠ AND IT IS ONLY SAFE WHERE A RESTORE RUNS. Admitting an echo persists the
- * literal sentinel unless something puts the stored value back — which is why
- * its one call site is stage PATCH, where `services/pipelines.ts` calls
- * `restoreWithheldPipelineStageConfig`. At a CREATE path there is nothing to
- * restore FROM, so admitting an echo there would write `REDACTED_EVENT_VALUE`
- * into a fresh stage config: a hole, not a carve-out.
+ * ⭐ The mask is still its own oracle for the CLASSIFICATION — which leaves survive
+ * and which are elided is read from `maskWorkspaceRuntimeForRead` rather than
+ * re-listed here, so an identity or enum key added there is honoured in the same
+ * commit. What changed is the OPERAND: the mask is applied to the stored value, not
+ * to the caller's.
  *
- * ⛔⛔ TWO THINGS THIS DOES NOT ANSWER, BOTH MEASURED, BOTH LEFT TO THE CALLER
- * ON PURPOSE — it asks "could a masked read have produced this?" and NOT "is
- * admitting it non-destructive", and those diverge:
+ * ⛔ A non-plain-object `incoming` is REFUSED rather than compared. The mask returns
+ * the bare sentinel STRING for every non-object shape, so a scalar `workspaceRuntime`
+ * could otherwise match a scalar stored one — the array-shaped and JSON-string-shaped
+ * bypasses this series has already shipped once each (#1574, #1583), read in the
+ * write direction. Nothing legitimate round-trips that way: the column is typed
+ * `Record<string, unknown> | null` at every schema that declares it.
  *
- *   1. `{}` IS ITS OWN MASK, so this returns `true` for it. An empty record is
- *      not information-free: `restoreWithheldValue` walks the INCOMING keys, so
- *      an empty one restores nothing and REPLACES the stored config. That is the
- *      same asymmetry `collectAgentDisallowedIssueWorkspaceRuntimePaths` records
- *      for the issue routes, where `{}` is refused while the sibling
- *      `adapterConfig: {}` is admitted. The caller must refuse it; this
- *      predicate deliberately does not, because folding a destructive-write test
- *      into a masked-read test welds two questions into one answer.
- *   2. A PARTIAL echo — a masked read with a key DROPPED — is also a fixpoint,
- *      and the restore deletes the dropped key for the same reason. That
- *      residual cannot be closed from the incoming bytes alone: separating a
- *      deliberate deletion from a lossy round-trip needs the stored value, which
- *      is the service's to read and not the route's. It is the destructive-write
- *      class `matchExistingArrayElement` below already lives with, not the
- *      host-execution class this guard exists for, and `null` — an outright
- *      delete — is admitted at the issue routes for reasons recorded there.
+ * ⚠ THIS IS NOT AN ENTITLEMENT CHECK AND IT PROVES NOTHING ABOUT THE CALLER — the
+ * same viewer-independent reasoning `restoreWithheldPipelineStageConfig` records
+ * below. An ENTITLED reader echoes REAL values, which this refuses; that is correct
+ * for the one caller today (no agent resolves `revealRuntimeConfig`, so every agent
+ * read is masked) and it is the fail-closed direction if that ever changes.
+ *
+ * ⚠ A nullish `stored` makes every non-nullish `incoming` refuse, which is right:
+ * with nothing stored there is nothing to round-trip and any value is fresh.
  */
-export function isMaskedWorkspaceRuntimeEcho(value: unknown): boolean {
-  if (!isPlainObject(value)) return false;
-  return isSameMaskedShape(maskWorkspaceRuntimeForRead(value), value);
+export function isMaskedEchoOfStoredWorkspaceRuntime(incoming: unknown, stored: unknown): boolean {
+  if (!isPlainObject(incoming)) return false;
+  return isSameMaskedShape(maskWorkspaceRuntimeForRead(stored), incoming);
 }
 
 /**
