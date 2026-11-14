@@ -66,6 +66,67 @@ function jsonResponse(data: unknown, ok = true, status = 200, headers: Record<st
   return { ok, status, headers: new Headers(headers), json: async () => data } as unknown as Response;
 }
 
+/** A review fixture in the REST shape every test below is still written in. */
+type FakeReviewRow = {
+  user?: { login?: string };
+  commit_id?: string;
+  state?: string;
+  body?: string;
+  submitted_at?: string;
+};
+
+/**
+ * PEN-6341 item 2: the reviewer-evidence pager reads `/pulls/{n}/reviews` over
+ * GraphQL now, so those REST-shaped fixtures are rendered here into the
+ * `reviews` connection the reader actually parses.
+ *
+ * A Bot actor's `login` is the BARE slug over GraphQL where REST returns
+ * `<slug>[bot]` (measured on Blockcast/paperclip#3694); the suffix is stripped
+ * here and the READER is what puts it back, which is what keeps the
+ * Ally-identity assertions below a test of the reader rather than an echo of
+ * their own fixture.
+ *
+ * Every field a fixture supplies is carried. `submittedAt` in particular is
+ * load-bearing and was missed once: the comment-review gate orders a review
+ * against the green status it is re-evaluating, so hardcoding `null` here
+ * silently turns "a newer finding exists" into "nothing newer" and flips the
+ * posted gate state from `failure` to `success`.
+ */
+function graphQlReviewsEnvelope(rows: unknown[]): unknown {
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          reviews: {
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes: rows.map((row) => {
+              const rest = row as FakeReviewRow;
+              const login = rest.user?.login ?? "";
+              const isBot = login.endsWith("[bot]");
+              return {
+                state: rest.state ?? "",
+                body: rest.body ?? "",
+                submittedAt: rest.submitted_at ?? null,
+                author: {
+                  login: isBot ? login.slice(0, -"[bot]".length) : login,
+                  __typename: isBot ? "Bot" : "User",
+                },
+                commit: { oid: rest.commit_id ?? null },
+              };
+            }),
+          },
+        },
+      },
+    },
+  };
+}
+
+/** True when this GraphQL POST is the reviews pager rather than a field read. */
+function isReviewsQuery(init?: unknown): boolean {
+  const body = (init as { body?: unknown } | undefined)?.body;
+  return typeof body === "string" && body.includes("reviews(first:");
+}
+
 function setCreds() {
   h.cfg.githubAppId = "3966421";
   h.cfg.githubAppInstallationId = "12345678";
@@ -89,7 +150,15 @@ describe("reviewer-evidence error classification", () => {
     clearCreds();
   });
 
-  for (const error of ["reviews_http_403", "reviews_http_404", "reviews_http_401"]) {
+  // `reviews_graphql_errors` is the PEN-6341 item-2 spelling of an unreadable
+  // reviews surface: GitHub answers an unknown pull-request number with HTTP
+  // 200 plus an `errors` entry, so it never reaches the `http_*` arms above.
+  for (const error of [
+    "reviews_http_403",
+    "reviews_http_404",
+    "reviews_http_401",
+    "reviews_graphql_errors",
+  ]) {
     it(`retries \`${error}\` rather than permanently dropping the gate-status delivery`, () => {
       setCreds();
       expect(_classifyReviewerEvidenceError(error)).toEqual({
@@ -234,24 +303,27 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse(options.latestStatuses ?? []);
       if (/\/commits\/[^/]+\/pulls(?:\?|$)/.test(u)) return jsonResponse(options.openPullRequestsAtHead ?? []);
-      if (u.includes("/pulls/") && u.includes("/reviews")) {
-        if (options.reviewsStatus && options.reviewsStatus >= 400) {
-          return jsonResponse(
-            options.reviewsBody ?? [],
-            false,
-            options.reviewsStatus,
-            options.reviewsHeaders,
-          );
-        }
-        return jsonResponse(options.reviews ?? []);
-      }
-      // The PR author, read over GraphQL since PEN-6341 (`user.login` ->
-      // `author { login }`). The gate reads it only to refuse `clean` for a
-      // self-attestation (BLO-34316), so this must answer with an identity
-      // distinct from `prReviewerBotLogin`: left unstubbed, the fetch throws,
-      // the bounded retry swallows it, and every clean verdict here collapses
-      // to `fetch_failed` with nothing posted.
+      // TWO GraphQL documents now arrive on this ONE url, and they are told
+      // apart by the document rather than by the url: the reviews pager
+      // (PEN-6341 item 2) and the PR-author field read.
       if (u.endsWith("/graphql")) {
+        if (isReviewsQuery(init)) {
+          if (options.reviewsStatus && options.reviewsStatus >= 400) {
+            return jsonResponse(
+              options.reviewsBody ?? {},
+              false,
+              options.reviewsStatus,
+              options.reviewsHeaders,
+            );
+          }
+          return jsonResponse(graphQlReviewsEnvelope(options.reviews ?? []));
+        }
+        // The PR author, read over GraphQL since PEN-6341 (`user.login` ->
+        // `author { login }`). The gate reads it only to refuse `clean` for a
+        // self-attestation (BLO-34316), so this must answer with an identity
+        // distinct from `prReviewerBotLogin`: left unstubbed, the fetch throws,
+        // the bounded retry swallows it, and every clean verdict here collapses
+        // to `fetch_failed` with nothing posted.
         return jsonResponse({
           data: { repository: { pullRequest: { author: { login: "distinct-pr-author" } } } },
         });
@@ -439,11 +511,11 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     setCreds();
     const { delivery } = await seedRun();
     let reclaimed = false;
-    const fetchMock = vi.fn(async (url: string | URL) => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse([]);
-      if (u.includes("/pulls/") && u.includes("/reviews")) {
+      if (u.endsWith("/graphql") && isReviewsQuery(init)) {
         const staleProcessingAt = new Date(Date.now() - 11 * 60 * 1_000);
         await db
           .update(githubCommitStatusDeliveries)
@@ -451,7 +523,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
           .where(eq(githubCommitStatusDeliveries.id, delivery.id));
         await expect(resetStaleGitHubCommitStatusDeliveries(db, new Date())).resolves.toBe(1);
         reclaimed = true;
-        return jsonResponse([]);
+        return jsonResponse(graphQlReviewsEnvelope([]));
       }
       if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) return jsonResponse({ id: 1 }, true, 201);
       throw new Error(`unexpected url ${u}`);
@@ -775,7 +847,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     setCreds();
     const { delivery } = await seedRun();
     let statusReads = 0;
-    const fetchMock = vi.fn(async (url: string | URL) => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) {
@@ -792,7 +864,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
               ],
         );
       }
-      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse([]);
+      if (u.endsWith("/graphql") && isReviewsQuery(init)) return jsonResponse(graphQlReviewsEnvelope([]));
       if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse([]);
       if (/\/statuses\/[0-9a-f]{7,40}(?:\?|$)/i.test(u)) return jsonResponse({ id: 1 }, true, 201);
       throw new Error(`unexpected url ${u}`);
@@ -955,7 +1027,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
         if (init?.body) postedBodies.push(JSON.parse(String(init.body)) as { state?: string; context?: string; description?: string });
         return jsonResponse({ id: postedBodies.length }, true, 201);
       }
-      if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse([]);
+      if (u.endsWith("/graphql") && isReviewsQuery(init)) return jsonResponse(graphQlReviewsEnvelope([]));
       if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse([]);
       throw new Error(`unexpected url ${u}`);
     });
@@ -1032,7 +1104,13 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     expect(updated).toMatchObject({
       status: "queued",
       attempts: 1,
-      lastError: "reviewer_evidence_reviews_rate_limited",
+      // PEN-6341 item 2: `ghGraphQlQuery` does not hand back the `Response`,
+      // so the reader can no longer tell a rate-limited 403 from any other 403
+      // by its headers and records `reviews_http_403`. The PROPERTY this test
+      // pins is unchanged and is the one that matters -- retryable, not
+      // permanent -- because `classifyReviewerEvidenceError` defaults every
+      // unenumerated reason to retryable (BLO-28968).
+      lastError: "reviewer_evidence_reviews_http_403",
       lastErrorKind: "transient",
     });
     expect(updated?.nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
@@ -1398,7 +1476,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       const readReleased = new Promise<void>((resolve) => { releaseRead = resolve; });
       let paused = false;
       vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
-        if (!paused && String(url).includes("/reviews")) {
+        if (!paused && isReviewsQuery(init)) {
           paused = true;
           markReading();
           await readReleased;
