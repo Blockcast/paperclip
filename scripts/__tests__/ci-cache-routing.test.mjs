@@ -16,6 +16,14 @@ const restorePnpmStoreActionPath = ".github/actions/restore-pnpm-store/action.ym
 const pluginBuildDepsActionPath = ".github/actions/plugin-build-deps/action.yml";
 const ensurePluginBuildDepsPath = "scripts/ensure-plugin-build-deps.mjs";
 
+// Action refs below are matched as `@[^\s]+[^\n]*`, never as a literal major.
+// Every assertion in this file is about the SHAPE of a step — which action, with
+// which inputs, gated how — and the major is incidental to all of them. Pinning
+// it made a Dependabot major bump fail a guard that was not about versions, and
+// the PR then sat presenting `reviewDecision: APPROVED` with no approval backing
+// its head while the guard stayed red (PEN-6673). Same reasoning, and the same
+// relaxation, as #3772 applied to the worktree_install setup-node guard.
+
 test("PR jobs do not install an ineffective compiler cache", async () => {
   const workflow = await readFile(prWorkflowPath, "utf8");
 
@@ -47,7 +55,7 @@ test("Docker builds use persistent remote BuildKit, master cache, and bounded co
   );
   assert.match(
     buildJob,
-    /uses: docker\/setup-buildx-action@v4\n        with:\n          driver: remote\n          endpoint: \$\{\{ steps\.buildkit-endpoint\.outputs\.endpoint \}\}\n/,
+    /uses: docker\/setup-buildx-action@[^\s]+[^\n]*\n        with:\n          driver: remote\n          endpoint: \$\{\{ steps\.buildkit-endpoint\.outputs\.endpoint \}\}\n/,
   );
   assert.match(agentWorkflow, /PREFERRED_ORDINAL: "1"/);
   assert.match(
@@ -61,7 +69,7 @@ test("Docker builds use persistent remote BuildKit, master cache, and bounded co
   );
   assert.match(
     agentWorkflow,
-    /uses: docker\/setup-buildx-action@v4\n        with:\n          driver: remote\n          endpoint: \$\{\{ steps\.buildkit-endpoint\.outputs\.endpoint \}\}\n/,
+    /uses: docker\/setup-buildx-action@[^\s]+[^\n]*\n        with:\n          driver: remote\n          endpoint: \$\{\{ steps\.buildkit-endpoint\.outputs\.endpoint \}\}\n/,
   );
   assert.doesNotMatch(buildJob, /buildcache-\$\{\{ steps\.target\.outputs\.full \}\}/);
   assert.match(buildJob, /type=raw,value=\$\{\{ steps\.image_tag\.outputs\.value \}\}/);
@@ -103,12 +111,12 @@ test("Refresh Lockfile populates the setup-node-compatible pnpm cache before sav
   );
   assert.match(
     workflow,
-    /- name: Restore pnpm store\n        id: pnpm-cache-restore\n        uses: actions\/cache\/restore@v4\n        with:\n          path: \$\{\{ steps\.pnpm-cache\.outputs\.path \}\}/,
+    /- name: Restore pnpm store\n        id: pnpm-cache-restore\n        uses: actions\/cache\/restore@[^\s]+[^\n]*\n        with:\n          path: \$\{\{ steps\.pnpm-cache\.outputs\.path \}\}/,
   );
   assert.match(workflow, /- name: Populate pnpm store\n        run: pnpm fetch --frozen-lockfile/);
   assert.match(
     workflow,
-    /- name: Save populated pnpm store\n        if: success\(\) && steps\.pnpm-cache-restore\.outputs\.cache-hit != 'true'\n        uses: actions\/cache\/save@v4\n        with:\n          path: \$\{\{ steps\.pnpm-cache\.outputs\.path \}\}/,
+    /- name: Save populated pnpm store\n        if: success\(\) && steps\.pnpm-cache-restore\.outputs\.cache-hit != 'true'\n        uses: actions\/cache\/save@[^\s]+[^\n]*\n        with:\n          path: \$\{\{ steps\.pnpm-cache\.outputs\.path \}\}/,
   );
 
   const orderedSteps = [
@@ -177,7 +185,7 @@ test("the restore-only pnpm action reads exactly the entry Refresh Lockfile save
   assert.deepEqual(values(action, "key"), [refreshKey, refreshKey]);
   assert.match(
     action,
-    /- name: Retry pnpm store restore\n\s+if: steps\.pnpm-cache-restore\.outputs\.cache-matched-key == ''\n\s+uses: actions\/cache\/restore@v4\n/,
+    /- name: Retry pnpm store restore\n\s+if: steps\.pnpm-cache-restore\.outputs\.cache-matched-key == ''\n\s+uses: actions\/cache\/restore@[^\s]+[^\n]*\n/,
     "the retry must fire only when nothing was restored",
   );
   // A prefix match in the job's own scope beats master's exact entry, so only
@@ -214,7 +222,7 @@ test("plugin build deps: the key hashes every build target, and only a master pu
   assert.doesNotMatch(action, /^\s*restore-keys:/m, "a near match would be touched into looking fresh");
   assert.match(action, /- name: Mark restored plugin build deps fresh\n\s+if: steps\.restore\.outputs\.cache-hit == 'true'\n/);
 
-  const gate = action.match(/- name: Save plugin build deps\n\s+if: ([^\n]+)\n\s+uses: actions\/cache\/save@v4\n/)?.[1];
+  const gate = action.match(/- name: Save plugin build deps\n\s+if: ([^\n]+)\n\s+uses: actions\/cache\/save@[^\s]+[^\n]*\n/)?.[1];
   assert.ok(gate, "plugin build deps save step is missing");
   // GitHub's `a.b-c` property syntax is not JavaScript; everything else here is.
   const expression = gate.replace(/\.([A-Za-z_]\w*-[\w-]*)/g, '["$1"]');
@@ -328,7 +336,7 @@ test("setup-actionlint restores the pinned tarball and never saves", async () =>
   // merge_group lands in a single-use `gh-readonly-queue/*` scope no later run
   // reads, and the post-step upload is itself a lane-killer (PEN-5032
   // cancelled 3 of 14 sampled heavy jobs inside one).
-  assert.match(action, /uses: actions\/cache\/restore@v4\n/);
+  assert.match(action, /uses: actions\/cache\/restore@[^\s]+[^\n]*\n/);
   assert.doesNotMatch(action, /uses: actions\/cache\/save@/);
   assert.doesNotMatch(action, /uses: actions\/cache@/);
 
