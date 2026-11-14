@@ -17641,9 +17641,21 @@ export function issueRoutes(
         //    nothing, changes no status, and passes all five — while the inline
         //    path still writes `resumeIntent`/`followUpRequested` into both the
         //    activity details and the assignee wake payload, which the builder
-        //    cannot express. `effectiveMoveToTodoRequested` is the exact
-        //    condition for the `svc.update` block, so it covers the implicit
-        //    move-to-todo cases too.
+        //    cannot express. `effectiveMoveToTodoRequested` then adds the
+        //    IMPLICIT move-to-todo cases on top of that. It is NECESSARY but
+        //    NOT SUFFICIENT for the `svc.update` block below: that block's
+        //    guard is `effectiveMoveToTodoRequested && (isClosed || (isBlocked
+        //    && !hasUnresolvedFirstClassBlockers) ||
+        //    shouldResumeInProgressScheduledRetry)`, so a request can set the
+        //    term while the block never runs. That leaves `reopened` FALSE —
+        //    it is assigned at exactly ONE site, INSIDE that block — and every
+        //    neighbouring conjunct here TRUE. A USER `reopen: true` on an
+        //    `in_progress`, not-blocked row with no in-progress scheduled
+        //    retry is that case, and #3770 (PEN-6645) pins this term on it in
+        //    `issue-comment-unkeyed-outbox-routes.test.ts`. Excluding it
+        //    anyway is the NARROWING declared above: whenever the block DOES
+        //    run it writes `reopened`/`reopenedFrom` and swaps the assignee
+        //    wake, and nothing here rests on the term matching the block.
         //
         // Not in the predicate because the arm itself excludes them: the
         // auto-approval transition (this is its `else`), and the blocked-reopen
