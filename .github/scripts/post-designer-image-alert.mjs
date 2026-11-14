@@ -92,17 +92,47 @@ export function classifyCancellation(annotations = []) {
 /** Supersession and a human cancel are intended; everything else pages. */
 export const NON_PAGING_CANCELLATIONS = new Set(['superseded', 'manual_cancel']);
 
-export function shouldPage({ buildResult, cancellation }) {
-  if (buildResult === 'success' || buildResult === 'skipped') return false;
+export function shouldPage({ buildResult, testResult = 'unknown', cancellation }) {
+  if (buildResult === 'success') return false;
+  // `build-and-push` is gated on `needs: test`. On a master push it is therefore
+  // SKIPPED only because the test job did not succeed -- no image was published,
+  // which is the same user-visible outcome as a failed build.
+  //
+  // This arm previously returned false, on the reasoning that the run is already
+  // red for the real reason and a second alert would duplicate it. That is
+  // circular: this lane has no first alert, which is the whole premise of
+  // PEN-6683. A master push whose tests fail must reach somebody.
+  //
+  // The one exception is a deliberate stop. A concurrency supersede kills the
+  // test job too, so a cancelled test is classified exactly like a cancelled
+  // build, and anything the classifier cannot read still pages (fail-closed).
+  if (buildResult === 'skipped') {
+    return !(testResult === 'cancelled' && NON_PAGING_CANCELLATIONS.has(cancellation));
+  }
   if (buildResult !== 'cancelled') return true;
   return !NON_PAGING_CANCELLATIONS.has(cancellation);
+}
+
+/**
+ * Which job's annotations prove why no image was published.
+ *
+ * A cancelled build is classified from its own annotations. A build SKIPPED
+ * behind a cancelled test has none of its own -- it never ran -- so the test
+ * job's are the only evidence that the run was deliberately superseded. Reading
+ * `build-and-push` there would always classify `unknown` and page through a
+ * legitimate supersede.
+ */
+export function cancellationSourceJob({ buildResult, testResult }) {
+  if (buildResult === 'cancelled') return 'build-and-push';
+  if (buildResult === 'skipped' && testResult === 'cancelled') return 'test';
+  return null;
 }
 
 /**
  * Fail-closed toward ALERTING: any lookup error returns 'unknown', which pages.
  * An API outage can only ever produce a page, never suppress one.
  */
-export async function classifyBuildCancellation(env = process.env, fetchFn = fetch) {
+export async function classifyBuildCancellation(env = process.env, fetchFn = fetch, jobName = 'build-and-push') {
   const { GITHUB_API_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_TOKEN } = env;
   if (!GITHUB_TOKEN || !GITHUB_REPOSITORY || !GITHUB_RUN_ID) return 'unknown';
   const api = `${GITHUB_API_URL || 'https://api.github.com'}/repos/${GITHUB_REPOSITORY}`;
@@ -118,7 +148,7 @@ export async function classifyBuildCancellation(env = process.env, fetchFn = fet
     const { jobs = [] } = await get(
       `/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT || 1}/jobs?per_page=100`,
     );
-    const job = jobs.find((j) => j.name === 'build-and-push');
+    const job = jobs.find((j) => j.name === jobName);
     if (!job?.id) return 'unknown';
     const annotations = await get(`/check-runs/${job.id}/annotations?per_page=100`);
     return classifyCancellation(Array.isArray(annotations) ? annotations : []);
@@ -148,7 +178,7 @@ const CANCELLATION_DETAIL = {
     'widening the suppression.',
 };
 
-export function buildAlert({ state, repo, branch, runUrl, headSha, buildResult, cancellation, now }) {
+export function buildAlert({ state, repo, branch, runUrl, headSha, buildResult, testResult = 'unknown', cancellation, now }) {
   const resolved = state === 'resolved';
   // Alertmanager rejects `startsAt >= endsAt` with `400 start time must be
   // before end time`, so a resolved push cannot simply back-date `endsAt`
@@ -159,7 +189,13 @@ export function buildAlert({ state, repo, branch, runUrl, headSha, buildResult, 
   const detail =
     buildResult === 'cancelled'
       ? ` The build reported \`cancelled\`, and ${CANCELLATION_DETAIL[cancellation] ?? CANCELLATION_DETAIL.unknown}`
-      : '';
+      : buildResult === 'skipped'
+        ? ` The \`test\` job reported \`${testResult}\`, so \`build-and-push\` never ran (it is gated on ` +
+          `\`needs: test\`) and no image was produced. Fix the test job: the build is not itself at fault.` +
+          (testResult === 'cancelled'
+            ? ` The cancellation classified as \`${cancellation}\`.`
+            : '')
+        : '';
 
   return {
     // Stable label set ONLY — see the cardinality note in the file header.
@@ -183,6 +219,7 @@ export function buildAlert({ state, repo, branch, runUrl, headSha, buildResult, 
         'before starting a fresh investigation.',
       head_sha: headSha,
       build_result: buildResult,
+      test_result: testResult,
       cancellation,
       run_url: runUrl,
     },
@@ -194,14 +231,19 @@ export function buildAlert({ state, repo, branch, runUrl, headSha, buildResult, 
 async function main() {
   const state = process.env.STATE === 'resolved' ? 'resolved' : 'firing';
   const buildResult = process.env.BUILD_RESULT ?? 'unknown';
+  const testResult = process.env.TEST_RESULT ?? 'unknown';
 
   let cancellation = 'n/a';
-  if (state !== 'resolved' && buildResult === 'cancelled') {
-    cancellation = await classifyBuildCancellation();
-    if (!shouldPage({ buildResult, cancellation })) {
+  if (state !== 'resolved') {
+    const cancelledJob = cancellationSourceJob({ buildResult, testResult });
+    if (cancelledJob) {
+      cancellation = await classifyBuildCancellation(process.env, fetch, cancelledJob);
+    }
+    if (!shouldPage({ buildResult, testResult, cancellation })) {
       console.log(
-        `::notice::build-and-push reported cancelled and classified as '${cancellation}', which is ` +
-          'an intended cancellation rather than a delivery failure. Not paging.',
+        `::notice::build-and-push reported '${buildResult}' (test: '${testResult}'` +
+          `${cancellation === 'n/a' ? '' : `, classified '${cancellation}'`}), which is an intended ` +
+          'outcome rather than an unpublished image. Not paging.',
       );
       return;
     }
@@ -220,6 +262,7 @@ async function main() {
     runUrl,
     headSha,
     buildResult,
+    testResult,
     cancellation,
     now: new Date(),
   });

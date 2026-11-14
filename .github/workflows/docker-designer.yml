@@ -218,10 +218,14 @@ jobs:
   # keys on the CRON verdict, so it cannot see a push build; and this workflow
   # has no outcome job of its own.
   alert-on-failure:
-    needs: [build-and-push]
+    # `test` is in `needs` because `build-and-push` is gated on it: when the test
+    # job fails the build is SKIPPED, no image is published, and the build-result
+    # arms below cannot see it. That silence is the PEN-6683 failure itself.
+    needs: [test, build-and-push]
     if: >-
       always() && github.event_name != 'workflow_dispatch' &&
-      (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled')
+      (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled' ||
+       needs.test.result == 'failure' || needs.test.result == 'cancelled')
     runs-on: arc-paperclip-light
     timeout-minutes: 10
     # actions: read + checks: read are what let the script tell a timeout kill
@@ -240,6 +244,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BUILD_RESULT: ${{ needs.build-and-push.result }}
+          TEST_RESULT: ${{ needs.test.result }}
           ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
           STATE: firing
           GH_REPO: ${{ github.repository }}
