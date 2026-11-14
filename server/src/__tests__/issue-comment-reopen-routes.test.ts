@@ -1041,10 +1041,12 @@ describe.sequential("issue comment reopen routes", () => {
     // As of PEN-6430 no bare `z.record(z.string(), z.unknown())` is reachable
     // through these four ISSUE WRITE ROUTES, which is a result in its own
     // right — and it is a claim about the ROUTES, not about the fields: the
-    // same `workspaceRuntime` record is still reachable through the two
-    // pipeline stage-settings schemas, which call the command-only
+    // same `workspaceRuntime` record is carried by the two pipeline
+    // stage-settings schemas, which call the command-only
     // `assertNoAgentHostWorkspaceCommandMutation` rather than the compound
-    // guard (named in that guard's own doc comment and carried on PEN-6595).
+    // guard. That is still true of the GUARD they call; it stopped being true
+    // of the FIELD on 2026-11-14, when PEN-6595 gave those three routes their
+    // own `workspaceRuntime` refusal in `routes/pipelines.ts`.
     // `runRoutineSchema` was in that list until 2026-11-13 and is NOT any more:
     // `routes/routines.ts` has called the compound guard since `#3701`, so it
     // inherited this refusal when `#3699` landed, with no edit of its own.

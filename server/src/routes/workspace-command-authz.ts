@@ -199,6 +199,10 @@ export function collectIssueWorkspaceCommandPaths(input: {
  * wider — see the carrier list on
  * `collectAgentDisallowedIssueWorkspaceRuntimePaths` below for the pipeline
  * stage-config surfaces that reach the same field without passing through here.
+ * Those are refused SINCE 2026-11-14 (PEN-6595), by a guard of their own in
+ * `routes/pipelines.ts`; they still do not pass through here, so this list is
+ * about reachability of THIS module and is not a map of where the field is
+ * refused.
  *
  * ⚠ THIS IS THE WRITE SIDE ONLY. `AGENT_SCOPE_ONLY_CONFIG_KEYS` in
  * `services/heartbeat.ts` answers a different question — which SCOPE wins at
@@ -307,9 +311,15 @@ export function assertNoAgentIssueAdapterConfigMutation(req: Request, paths: str
  *      (`packages/shared/src/validators/pipeline.ts`), carried by
  *      `services/pipelines.ts` and written at THREE routes: stage CREATE, stage
  *      PATCH, and the `stages[]` array of pipeline CREATE.
- *      ⚠ HALF-CLOSED. `#3701` refused the two COMMAND paths at all three
- *      (`assertNoAgentStageConfigCommandMutation` in `routes/pipelines.ts`).
- *      `workspaceRuntime` is NOT refused there and stays agent-settable.
+ *      ✅ `workspaceRuntime` IS CLOSED AT THESE THREE PIPELINE ROUTES, 2026-11-14
+ *      (PEN-6595), in two hand-wired halves rather than by inheritance. `#3701` refused the two COMMAND paths at all three
+ *      (`assertNoAgentStageConfigCommandMutation` in `routes/pipelines.ts`);
+ *      `assertNoAgentStageConfigWorkspaceRuntimeMutation` in the same file now
+ *      refuses `workspaceRuntime`, OUTRIGHT at the two CREATE paths and for any
+ *      value but an unmodified echo of a masked read at stage PATCH.
+ *      ⛔ Still read these three as NOT inheriting from this module: the next
+ *      field added to `assertNoAgentIssueHostControlledMutation` will reach them
+ *      only when someone wires it, exactly as this one did.
  *
  * Reachability of carriers 2 & 3 is no longer unmeasured — but the measurement
  * is narrower than it reads. On 2026-11-12 (PEN-6595) ONE ordinary agent seat
@@ -321,10 +331,11 @@ export function assertNoAgentIssueAdapterConfigMutation(req: Request, paths: str
  * board-issued grant row restores the exposure, which is why the gap is carried
  * rather than closed as moot.
  *
- * ⛔ AND DO NOT READ THE OPEN HALF AS "JUST EXTEND THE COLLECTOR". PEN-6595
- * decided to do exactly that and then refused on evidence: this surface already
- * carries a DIFFERENT remedy for the round-trip hazard that the refusal below
- * closes on the issue routes. `restoreWithheldPipelineStageConfig`
+ * ⛔ AND DO NOT READ THE CLOSE AS "THEY JUST EXTENDED THE COLLECTOR" — IT IS A
+ * SEPARATE GUARD WITH A DIFFERENT PREDICATE, AND COLLAPSING THE TWO WOULD
+ * REOPEN THE HAZARD. PEN-6595 decided to extend this collector and then refused
+ * on evidence: that surface already carries a DIFFERENT remedy for the
+ * round-trip hazard that the refusal below closes on the issue routes. `restoreWithheldPipelineStageConfig`
  * (`../redaction.ts`, PEN-3266/PEN-3288) restores the stored value when a
  * withheld reader PATCHes a masked stage config home, and `services/pipelines.ts`
  * calls it on the stage-PATCH path. No agent resolves `revealRuntimeConfig`
@@ -333,7 +344,10 @@ export function assertNoAgentIssueAdapterConfigMutation(req: Request, paths: str
  * `null`. A blanket refusal would therefore fire on that faithful round-trip,
  * because the route guard runs BEFORE the service restore, and the remedy this
  * refusal's own message offers ("send `null`") would DELETE the operator's
- * runtime config rather than clear a marker.
+ * runtime config rather than clear a marker — which is why the pipeline guard
+ * carries its own message, naming `null` as the way out at a CREATE path and
+ * explicitly forbidding it at stage PATCH. ⛔ Do not reuse THIS refusal's text
+ * there.
  *
  * ⛔ AND THAT IS PATCH-ONLY — the distinction is load-bearing in the opposite
  * direction. `services/pipelines.ts` keys the restore on `input.patch.config`,
@@ -341,11 +355,11 @@ export function assertNoAgentIssueAdapterConfigMutation(req: Request, paths: str
  * there a masked echo would persist the literal sentinel whatever the guard
  * does, and a plain refusal breaks no round-trip. Admitting an all-sentinel echo
  * at those two routes would be a HOLE rather than a carve-out — it would let
- * `REDACTED_EVENT_VALUE` be written into a fresh stage config. ⇒ a close refuses
- * OUTRIGHT at stage CREATE and pipeline CREATE, and at stage PATCH either admits
- * an all-sentinel echo and refuses a fresh value, or runs after the restore.
- * Carried on PEN-6595 with that shape named; the PATCH/CREATE split was raised
- * by Ally on `#3745`.
+ * `REDACTED_EVENT_VALUE` be written into a fresh stage config. ⇒ the close
+ * refuses OUTRIGHT at stage CREATE and pipeline CREATE, and at stage PATCH
+ * admits an unmodified echo of a masked read and refuses a fresh value. Landed
+ * 2026-11-14 on PEN-6595 with that shape; the PATCH/CREATE split was raised by
+ * Ally on `#3745`.
  *
  * ⚠ And do NOT route a reader to PEN-3266 for this. That row is `done` and is
  * the READ side of the same schema; it states "Routines are input-only for this
