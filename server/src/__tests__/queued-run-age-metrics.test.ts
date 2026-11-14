@@ -78,13 +78,13 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
     await tempDb?.cleanup();
   });
 
-  async function insertCompanyAndAgent() {
+  async function insertCompanyAndAgent(issuePrefix = "QRA") {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
       name: "Queued Run Age Co",
-      issuePrefix: "QRA",
+      issuePrefix,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
@@ -273,7 +273,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
     it("still counts the github wake when the running run is on a different issue or a different agent", async () => {
       const { companyId, agentId } = await insertCompanyAndAgent();
-      const other = await insertCompanyAndAgent();
+      const other = await insertCompanyAndAgent("QRB");
       const now = new Date("2026-11-14T20:33:08.000Z");
       const issueId = await insertIssue(companyId);
       const otherIssueId = await insertIssue(companyId);

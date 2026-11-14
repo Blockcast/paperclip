@@ -35,6 +35,10 @@ import { KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS } from "../services/metrics.js";
  * sticky `carriesGithubWake` marker and the coalesce suite below.
  */
 
+const DISPATCH_READINESS_SOURCE = readFileSync(
+  fileURLToPath(new URL("../services/dispatch-readiness.ts", import.meta.url)),
+  "utf8",
+);
 const HEARTBEAT_SOURCE = readFileSync(
   fileURLToPath(new URL("../services/heartbeat.ts", import.meta.url)),
   "utf8",
@@ -206,8 +210,16 @@ describe("the cross-reason deferral gates the cancel", () => {
       loopSource.indexOf("const crossReasonGithubWake"),
       loopSource.indexOf('"duplicate_dispatch_cross_reason_deferred"'),
     );
-    expect(guard).toContain("contextCarriesGithubWake(queuedSnapshot)");
+    // BLO-57165: the predicate lives in dispatch-readiness.ts so the claimable
+    // gauge shares it; the guard must call it on the raw snapshot, and the
+    // helper must read the sticky marker.
+    expect(guard).toContain("isCrossReasonGithubWakeDeferral(");
+    expect(guard).toContain("queuedSnapshot,");
     expect(guard).not.toContain('arrivalWakeClass === "github_webhook"');
+    const helper = DISPATCH_READINESS_SOURCE.slice(
+      DISPATCH_READINESS_SOURCE.indexOf("export function isCrossReasonGithubWakeDeferral"),
+    );
+    expect(helper.slice(0, helper.indexOf("\n}\n"))).toContain("contextCarriesGithubWake(arrivalSnapshot)");
   });
 
   it("decides the class BEFORE cancelling, not after", () => {
