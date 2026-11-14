@@ -2885,10 +2885,16 @@ export async function startServer(): Promise<StartedServer> {
   // vacuous forward-only 100% to a measured number. Kicks off once on startup
   // (so coverage is honest without waiting a full interval) then runs on interval.
   if (config.prReconcilerEnabled && config.paperclipNodeRole !== "api") {
-    const reconcilerToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
-    if (!reconcilerToken) {
+    const reconcilerEnvToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null;
+    const { githubAppCredentialsConfigured, getInstallationToken } = await import(
+      "./services/github-app-auth.js"
+    );
+    // PEN-6413: fall back to the App installation token. See the block comment
+    // on resolveReconcilerToken -- neither GITHUB_TOKEN nor GH_TOKEN is set in
+    // this deployment, so gating on them alone skipped the whole subsystem.
+    if (!reconcilerEnvToken && !githubAppCredentialsConfigured()) {
       logger.warn(
-        "Merged-PR reconciler enabled but no GITHUB_TOKEN/GH_TOKEN set; private repos would 404. Skipping reconciler.",
+        "Merged-PR reconciler enabled but no GITHUB_TOKEN/GH_TOKEN and no GitHub App credentials; private repos would 404. Skipping reconciler.",
       );
     } else {
       const reconcilerIntervalMs = config.prReconcilerIntervalMinutes * 60 * 1000;
@@ -2897,16 +2903,34 @@ export async function startServer(): Promise<StartedServer> {
           intervalMinutes: config.prReconcilerIntervalMinutes,
           windowDays: config.prReconcilerWindowDays,
           enrichLoc: config.prReconcilerEnrichLoc,
+          tokenSource: reconcilerEnvToken ? "env" : "github_app",
         },
         "Merged-PR reconciler enabled",
       );
-      const { reconcilerSweepTick } = await import("./services/pr-reconciler-sweep.js");
+      const { reconcilerSweepTick, resolveReconcilerToken } = await import(
+        "./services/pr-reconciler-sweep.js"
+      );
       const runReconcilerSweepTick = () =>
-        void reconcilerSweepTick(db, {
-          windowDays: config.prReconcilerWindowDays,
-          token: reconcilerToken,
-          enrichLoc: config.prReconcilerEnrichLoc,
-        }).catch((err) => {
+        void (async () => {
+          // Resolved per tick, not once at startup: an installation token lives
+          // ~1h and the interval defaults to 6h.
+          const resolved = await resolveReconcilerToken({
+            envToken: reconcilerEnvToken,
+            appCredentialsConfigured: githubAppCredentialsConfigured,
+            getInstallationToken: () => getInstallationToken(),
+          });
+          if (!resolved.ok) {
+            // Skip the tick rather than sweep unauthenticated, which would 404
+            // on every private target and report them all as failures.
+            logger.warn({ reason: resolved.reason }, "Merged-PR reconciler: no usable token this tick; skipping");
+            return;
+          }
+          await reconcilerSweepTick(db, {
+            windowDays: config.prReconcilerWindowDays,
+            token: resolved.token,
+            enrichLoc: config.prReconcilerEnrichLoc,
+          });
+        })().catch((err) => {
           logger.error({ err }, "Merged-PR reconciler sweep failed");
         });
       // BLO-46694: lease holder only.

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   computeReconcilerWindow,
+  resolveReconcilerToken,
   runReconcilerSweep,
   type ReconcilerTarget,
   type ReconcileResult,
@@ -83,5 +84,78 @@ describe("runReconcilerSweep", () => {
     const res = await runReconcilerSweep({ targets: [], now, windowDays: 21, reconcile });
     expect(res).toMatchObject({ targets: 0, ok: 0, failed: 0, totals: zero });
     expect(reconcile).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveReconcilerToken (PEN-6413)", () => {
+  it("prefers an explicit env token and never consults the App", async () => {
+    const getInstallationToken = vi.fn(async () => "app-token");
+    const appCredentialsConfigured = vi.fn(() => true);
+
+    const res = await resolveReconcilerToken({
+      envToken: "pat-token",
+      appCredentialsConfigured,
+      getInstallationToken,
+    });
+
+    expect(res).toEqual({ ok: true, token: "pat-token", source: "env" });
+    expect(getInstallationToken).not.toHaveBeenCalled();
+    expect(appCredentialsConfigured).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the App installation token when no env token is set", async () => {
+    const res = await resolveReconcilerToken({
+      envToken: null,
+      appCredentialsConfigured: () => true,
+      getInstallationToken: async () => "app-token",
+    });
+
+    expect(res).toEqual({ ok: true, token: "app-token", source: "github_app" });
+  });
+
+  it("refuses without minting when neither credential source is configured", async () => {
+    const getInstallationToken = vi.fn(async () => "app-token");
+
+    const res = await resolveReconcilerToken({
+      envToken: null,
+      appCredentialsConfigured: () => false,
+      getInstallationToken,
+    });
+
+    expect(res).toEqual({ ok: false, reason: "no_credentials" });
+    expect(getInstallationToken).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the App is configured but minting fails", async () => {
+    const res = await resolveReconcilerToken({
+      envToken: null,
+      appCredentialsConfigured: () => true,
+      getInstallationToken: async () => null,
+    });
+
+    expect(res).toEqual({ ok: false, reason: "github_app_token_unavailable" });
+  });
+
+  it("re-asks on every call, so a per-tick caller never reuses an expired token", async () => {
+    // The sweep interval defaults to 6h and an installation token lives ~1h, so
+    // a resolver that answered once from its own cache would succeed on the
+    // startup pass and fail silently on every tick after it.
+    let n = 0;
+    const getInstallationToken = vi.fn(async () => `app-token-${++n}`);
+
+    const first = await resolveReconcilerToken({
+      envToken: null,
+      appCredentialsConfigured: () => true,
+      getInstallationToken,
+    });
+    const second = await resolveReconcilerToken({
+      envToken: null,
+      appCredentialsConfigured: () => true,
+      getInstallationToken,
+    });
+
+    expect(getInstallationToken).toHaveBeenCalledTimes(2);
+    expect(first).toEqual({ ok: true, token: "app-token-1", source: "github_app" });
+    expect(second).toEqual({ ok: true, token: "app-token-2", source: "github_app" });
   });
 });
