@@ -149,6 +149,15 @@ export const DISPATCH_FATE = Object.freeze({
    * re-dispatch once paperclip-0 is past the interval.
    */
   REFUSED_MIN_INTERVAL: 'refused-min-interval',
+  /**
+   * Terminal `cancelled` whose `build-and-push` job was cancelled or timed out,
+   * with `deploy` never executed. BLO-57091: on `workflow_dispatch` that job runs
+   * with `cancel-in-progress: false`, so no push or supersede can cancel it — it
+   * is a `timeout-minutes` expiry (a hung BuildKit build, run 43592047585) or a
+   * manual cancel. It used to read as `survived`, so nothing retried. Retryable:
+   * a sampling slot re-dispatches once, on the other BuildKit daemon.
+   */
+  BUILD_CANCELLED: 'build-cancelled',
   /** No completed dispatch run in the window, or the window is empty. */
   NONE: 'none',
   /** Anything unreadable. Reports nothing, reddens nothing. */
@@ -179,6 +188,27 @@ export const COMPLETED_SCAN_LIMIT = 20;
  * false alarm. Widen all three together.
  */
 export const DEPLOY_JOB_NAME = 'deploy';
+
+/** docker.yml's build job, matched EXACTLY — same coupling as DEPLOY_JOB_NAME. */
+export const BUILD_JOB_NAME = 'build-and-push';
+
+/**
+ * A retry needs the cancelled run to NOT itself follow another dispatch this
+ * closely. That bounds BUILD_CANCELLED retries: a re-dispatched build that hangs
+ * again was created < this long after the run it retried, so it is reported,
+ * not retried. The ~24h gap to the previous daily dispatch stays well outside.
+ */
+export const BUILD_RETRY_QUIET_MS = 6 * 3600 * 1000;
+
+/**
+ * Was `build-and-push` stopped (cancelled or timed out) rather than finishing?
+ * Absent stays false — an absent job is a renamed job or a thin fixture, and
+ * this module never claims a fate from a job list that does not show it.
+ */
+export function buildJobCancelled(jobs) {
+  const build = (jobs ?? []).find((job) => job?.name === BUILD_JOB_NAME);
+  return build?.conclusion === 'cancelled' || build?.conclusion === 'timed_out';
+}
 
 /**
  * The deploy lane's ENTRY GUARD job in docker.yml, matched EXACTLY — same
@@ -326,6 +356,12 @@ export function classifyDispatchRun(run, jobs) {
   // failed its migration pre-flight), and it is explicitly not this module's.
   if (deployJobExecuted(jobs)) return DISPATCH_FATE.SURVIVED;
   if (run.conclusion === 'failure') return DISPATCH_FATE.DIED_BEFORE_DEPLOY;
+  // BLO-57091. A supersede/eviction cancels a run whose build already SUCCEEDED
+  // (`deploy: cancelled`, caught as survived above). A cancelled BUILD on a
+  // dispatch is a timeout or a manual cancel — terminal, and nothing shipped.
+  if (run.conclusion === 'cancelled' && buildJobCancelled(jobs)) {
+    return DISPATCH_FATE.BUILD_CANCELLED;
+  }
   // PEN-5261. A GREEN run whose entry guard never executed is the lane being
   // switched off, and it was previously absorbed by the catch-all below as
   // "normal, owned behaviour" — which is true of the pending-guard skip the
@@ -348,7 +384,8 @@ export function classifyDispatchRun(run, jobs) {
   ) {
     return DISPATCH_FATE.LANE_GATED_OFF;
   }
-  // `cancelled` with deploy never executed, or `success` with deploy skipped by
+  // `cancelled` with deploy never executed (and the build NOT cancelled — e.g. an
+  // abbreviated job list), or `success` with deploy skipped by
   // the pending guard — the guard having RUN and reported blocked. Neither is a
   // death this module may claim; both are normal, owned behaviour of the lane.
   return DISPATCH_FATE.SURVIVED;
@@ -410,6 +447,14 @@ export async function findLastCompletedDispatch({
       // A min-interval refusal executed `deploy` only far enough to decline.
       deployExecuted: deployJobCompleted(jobs) && !deployRefusedByMinInterval(jobs),
       refusedAt: minIntervalRefusedAt(jobs),
+      // BLO-57091: true when another dispatch was created within
+      // BUILD_RETRY_QUIET_MS before this one, i.e. this run was itself a retry.
+      // An unreadable created_at reads as preceded: no retry, fail-quiet.
+      precededByRecentDispatch: !Number.isFinite(Date.parse(run.created_at ?? '')) || runs.some((other) => {
+        if (other?.id === run.id) return false;
+        const gap = Date.parse(run.created_at) - Date.parse(other?.created_at ?? '');
+        return gap > 0 && gap < BUILD_RETRY_QUIET_MS;
+      }),
     },
   };
 }
@@ -422,7 +467,9 @@ export async function findLastCompletedDispatch({
  * unreadable run — is silent.
  */
 export const LANE_FAILED_TO_DELIVER_FATES = Object.freeze(
-  new Set([DISPATCH_FATE.DIED_BEFORE_DEPLOY, DISPATCH_FATE.LANE_GATED_OFF]),
+  // BUILD_CANCELLED is here so a cancelled build whose ONE retry is spent (or
+  // that the daily slot does not retry) is still reported, not silently green.
+  new Set([DISPATCH_FATE.DIED_BEFORE_DEPLOY, DISPATCH_FATE.LANE_GATED_OFF, DISPATCH_FATE.BUILD_CANCELLED]),
 );
 
 /**

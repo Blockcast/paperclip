@@ -1070,7 +1070,7 @@ import os from 'node:os';
 
 const NOW = 1_763_100_000; // fixed clock via NOW_EPOCH
 
-function runRetryBlock({ fate, isDispatchSlot, refusedAgoSeconds, refusedAt }) {
+function runRetryBlock({ fate, isDispatchSlot, refusedAgoSeconds, refusedAt, preceded }) {
   const start = code.indexOf('RETRY_MIN_INTERVAL=false');
   const end = code.indexOf('if [ "$IS_DISPATCH_SLOT" != "true" ] && [ "$RETRY_MIN_INTERVAL" != "true" ]');
   assert.ok(start !== -1 && end > start, 'the retry block must sit before the sampling-slot branch');
@@ -1079,10 +1079,10 @@ function runRetryBlock({ fate, isDispatchSlot, refusedAgoSeconds, refusedAt }) {
   chmodSync(path.join(dir, 'kubectl'), 0o755);
   const at = refusedAt ?? new Date((NOW - refusedAgoSeconds) * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
   const json = path.join(dir, 'dead.json');
-  writeFileSync(json, JSON.stringify({ fate, run: { databaseId: 43571300881, refusedAt: at } }));
+  writeFileSync(json, JSON.stringify({ fate, run: { databaseId: 43571300881, refusedAt: at, precededByRecentDispatch: preceded } }));
   const out = path.join(dir, 'out');
   writeFileSync(out, '');
-  const script = `set -euo pipefail\n${code.slice(start, end)}\necho "RETRY=$RETRY_MIN_INTERVAL"\n`;
+  const script = `set -euo pipefail\n${code.slice(start, end)}\necho "RETRY=$RETRY_MIN_INTERVAL BC=$RETRY_BUILD_CANCELLED ORDINAL=$BUILDKIT_ORDINAL"\n`;
   const stdout = execFileSync('bash', ['-c', script], {
     cwd: path.resolve(path.dirname(workflowPath), '../..'),
     env: {
@@ -1124,4 +1124,29 @@ test('BLO-57061: any other fate, or the daily slot, leaves the existing flow unt
     assert.match(r.stdout, /RETRY=false/);
     assert.equal(r.outputs, '');
   }
+});
+
+// ---------------------------------------------------------------------------
+// BLO-57091: a dispatch whose build-and-push timed out (run 43592047585) shipped
+// nothing; a sampling slot re-dispatches it ONCE, on BuildKit ordinal 0.
+// ---------------------------------------------------------------------------
+test('BLO-57091: a cancelled build is re-dispatched once by a sampling slot, on ordinal 0', () => {
+  const r = runRetryBlock({ fate: 'build-cancelled', isDispatchSlot: 'false', refusedAt: '', preceded: false });
+  assert.match(r.stdout, /BC=true ORDINAL=0/);
+  assert.match(r.stdout, /Retrying the dispatch: run 43571300881's build-and-push was cancelled/);
+  assert.equal(r.outputs, '', 'falls through to the dispatch path, emitting no early outcome');
+});
+
+test('BLO-57091: no retry when the cancelled run was itself a retry, unreadable, or on the daily slot', () => {
+  for (const [preceded, slot] of [[true, 'false'], [undefined, 'false'], [false, 'true']]) {
+    const r = runRetryBlock({ fate: 'build-cancelled', isDispatchSlot: slot, refusedAt: '', preceded });
+    assert.match(r.stdout, /BC=false ORDINAL=1/);
+  }
+});
+
+test('BLO-57091: the retry does not add a second dispatch call; the one call carries the ordinal', () => {
+  assert.equal([...code.matchAll(/gh workflow run docker\.yml/g)].length, 1);
+  assert.match(code, /gh workflow run docker\.yml [^\n]*-f buildkit_ordinal="\$BUILDKIT_ORDINAL"/);
+  assert.match(code, /&& \[ "\$RETRY_BUILD_CANCELLED" != "true" \]; then/,
+    'the retry must skip the sampling-slot early exit');
 });
