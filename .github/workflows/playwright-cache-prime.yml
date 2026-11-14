@@ -101,7 +101,7 @@ jobs:
       # above); on a push of this file or a dispatch it hits the entry Refresh
       # Lockfile saves.
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
