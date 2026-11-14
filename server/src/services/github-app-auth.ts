@@ -670,7 +670,7 @@ function readGraphQlPullRequestMerger(raw: unknown): PullRequestMerger | null {
  * returns `<slug>[bot]`. Shared by every reader migrated off REST so the
  * re-attachment rule has one home rather than one copy per call site.
  */
-function withBotLoginSuffix(login: string): string {
+export function withBotLoginSuffix(login: string): string {
   return login.endsWith("[bot]") ? login : `${login}[bot]`;
 }
 
@@ -692,28 +692,53 @@ const OPEN_PRS_ON_BASE_PAGE_SIZE = 100;
  * without network or credentials — the same injection-seam reasoning as
  * `ReadPullRequestGate` in the terminal-gate reconciler.
  */
-export function parseOpenPullRequestsOnBasePayload(body: unknown): OpenPullRequestsOnBaseResult {
-  // A non-array body is not an empty page. Treating it as one would report a
-  // confident "this branch had no stacked children" for a response we could not
-  // read at all — the same false all-clear `listOpenPullRequests` refuses.
-  if (!Array.isArray(body)) return { error: "open_pull_requests_malformed" };
+/**
+ * Map a LIST reader's `ghGraphQlListPullRequests` failure onto the
+ * `<surface>_*` vocabulary its REST pager emitted, so the strings already
+ * recorded in tests and in the stacked-PR warn diagnostics stay recognisable
+ * across the transport change (PEN-6341 item 2).
+ *
+ * Deliberately NOT `graphQlReviewsFailureReason`, which is the same shape and
+ * a DIFFERENT mapping: that one spells a malformed payload
+ * `reviews_payload_malformed`, where both REST pagers here spelled it
+ * `<surface>_malformed`. Folding the two would silently re-spell a reason on
+ * a reader that has already landed.
+ */
+function graphQlListFailureReason(surface: string, reason: string): string {
+  // The REST readers' catch-all for a thrown fetch; the same condition.
+  if (reason === "transport") return `${surface}_fetch_failed`;
+  // Both REST readers answered a non-array body with this exact spelling.
+  if (reason === "payload_malformed") return `${surface}_malformed`;
+  return `${surface}_${reason}`;
+}
 
-  const pullRequests: OpenPullRequestOnBase[] = [];
-  for (const entry of body as Array<Record<string, unknown>>) {
-    const number = entry?.number;
-    if (!Number.isInteger(number)) continue;
-    const head = entry?.head as Record<string, unknown> | undefined;
-    pullRequests.push({
-      number: number as number,
-      title: typeof entry?.title === "string" ? entry.title : null,
-      url: typeof entry?.html_url === "string" ? entry.html_url : null,
-      headRef: typeof head?.ref === "string" ? head.ref : null,
-    });
-  }
-  // One page is the whole answer for any real stacked chain. Surface the cap
-  // anyway: a full page means "there may be more", which is a different claim
-  // from "these are all of them", and a silent prefix reads as the latter.
-  return { pullRequests, truncated: body.length >= OPEN_PRS_ON_BASE_PAGE_SIZE };
+export function parseOpenPullRequestsOnBasePayload(page: GraphQlPullRequestPage): OpenPullRequestsOnBaseResult {
+  // An unreadable page is not an empty one. Reporting `[]` would be a
+  // confident "this branch had no stacked children" for a response we could
+  // not read at all — the same false all-clear `listOpenPullRequests` refuses.
+  if (!page.ok) return { error: graphQlListFailureReason("open_pull_requests", page.reason) };
+
+  // `malformed` is deliberately NOT consulted: this reader's caller warns and
+  // moves on rather than pruning anything, so a node it could not read is the
+  // same non-event the REST reader's `continue` made it. The reconciler, whose
+  // caller DOES prune on absence, does consult it.
+  return {
+    pullRequests: page.pullRequests.map((pr) => ({
+      number: pr.number,
+      title: pr.title,
+      url: pr.url,
+      headRef: pr.headRefName,
+    })),
+    // One page is the whole answer for any real stacked chain. Surface the cap
+    // anyway: "there may be more" is a different claim from "these are all of
+    // them", and a silent prefix reads as the latter.
+    //
+    // PEN-6341: this is now `pageInfo.hasNextPage` rather than "the page came
+    // back full", which is STRICTER and correct rather than a regression — a
+    // chain that happens to hold exactly OPEN_PRS_ON_BASE_PAGE_SIZE children
+    // is no longer reported as possibly-incomplete when it is provably whole.
+    truncated: page.hasNextPage,
+  };
 }
 
 /**
@@ -735,23 +760,18 @@ export async function githubListOpenPullRequestsByBase(input: {
   const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { error: tokenResult.reason };
 
-  const url =
-    `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls` +
-    `?state=open&per_page=${OPEN_PRS_ON_BASE_PAGE_SIZE}&base=${encodeURIComponent(input.baseRef)}`;
-  let res: Response;
-  try {
-    res = await ghFetch(url, {
-      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+  // PEN-6341 item 2: `?base=` becomes `baseRefName`, a GraphQL VARIABLE, so
+  // the `encodeURIComponent` the URL form needed is gone with the URL.
+  return parseOpenPullRequestsOnBasePayload(
+    await ghGraphQlListPullRequests({
+      token: tokenResult.token,
+      repoFullName: input.repoFullName,
+      states: ["OPEN"],
+      baseRefName: input.baseRef,
+      first: OPEN_PRS_ON_BASE_PAGE_SIZE,
       signal: input.signal,
-    });
-  } catch {
-    return { error: "open_pull_requests_fetch_failed" };
-  }
-  if (!res.ok) {
-    const classified = await classifyGithubHttpFailure("pull_request", res);
-    return { error: classified.reason };
-  }
-  return parseOpenPullRequestsOnBasePayload(await res.json().catch(() => null));
+    }),
+  );
 }
 
 export type OpenPullRequestAtHead = { number: number; url: string | null };
@@ -1295,45 +1315,66 @@ export type MergedPullRequestForHeadRef =
 export const MERGED_PR_FOR_HEAD_REF_PAGE_SIZE = 100;
 
 /** Pure half of {@link githubResolveMergedPullRequestForHeadRef}, testable without network. */
-export function parseMergedPullRequestForHeadRef(body: unknown): MergedPullRequestForHeadRef {
-  if (!Array.isArray(body)) return { outcome: "error", reason: "merged_pull_request_malformed" };
+export function parseMergedPullRequestForHeadRef(
+  page: GraphQlPullRequestPage,
+  /**
+   * The owner REST's `?head=owner:ref` qualification named. GraphQL's
+   * `headRefName` matches a bare branch NAME, so without this a FORK carrying
+   * the same branch name matches too — see the filter below.
+   */
+  expectedHeadOwner: string,
+): MergedPullRequestForHeadRef {
+  if (!page.ok) return { outcome: "error", reason: graphQlListFailureReason("merged_pull_request", page.reason) };
 
-  // One page is fetched, so a full page is not provably the whole answer: the
-  // merge that triggered this retarget can be on page 2 (a recycled branch name
-  // like `dev` reaches a full page eventually). Scanning the prefix would report
+  // One page is fetched, so a second page is not provably absent: the merge
+  // that triggered this retarget can be on it (a recycled branch name like
+  // `dev` reaches a full page eventually). Scanning the prefix would report
   // `none`, or an older merge, for a read we could not complete, and `none`
-  // suppresses the wake. So a full page is unreadable, exactly as the invariant
-  // on `MergedPullRequestForHeadRef` requires.
-  if (body.length >= MERGED_PR_FOR_HEAD_REF_PAGE_SIZE) {
+  // suppresses the wake. So a further page is unreadable, exactly as the
+  // invariant on `MergedPullRequestForHeadRef` requires.
+  //
+  // PEN-6341: `pageInfo.hasNextPage` replaces "the page came back full", and
+  // it fires STRICTLY LESS OFTEN for two independent reasons — it is exact
+  // rather than a proxy, and `states: [MERGED]` filters closed-but-unmerged
+  // PRs out SERVER-side, so they no longer consume page slots on a recycled
+  // branch name. Both move in the same direction: fewer wakes suppressed by a
+  // page we could in fact have read.
+  if (page.hasNextPage) {
     return { outcome: "error", reason: "merged_pull_request_truncated" };
   }
 
-  // A branch name can be reused, so `?head=` can legitimately return several
-  // closed PRs. The most recently merged one is the one whose merge triggered
-  // this retarget; ordering is taken from `merged_at` rather than from the
-  // response order, which GitHub sorts by `created` descending (a PR opened
-  // earlier can merge later).
+  // A branch name can be reused, so the head-ref filter can legitimately
+  // return several merged PRs. The most recently merged one is the one whose
+  // merge triggered this retarget; ordering is taken from `mergedAt` rather
+  // than from the response order, which is `CREATED_AT` descending (a PR
+  // opened earlier can merge later).
   let best: { prNumber: number; mergeCommitSha: string | null; mergedAtMs: number } | null = null;
-  for (const entry of body as Array<Record<string, unknown>>) {
-    const number = entry?.number;
-    // Closed-but-not-merged PRs share this filter and must not count: an
-    // abandoned base is not a base whose work landed anywhere.
-    if (!Number.isInteger(number) || typeof entry?.merged_at !== "string") continue;
-    const mergedAtMs = Date.parse(entry.merged_at);
+  for (const pr of page.pullRequests) {
+    // Re-impose REST's `owner:ref` qualification. A PR opened from a FORK
+    // whose branch happens to share this name matches `headRefName` and is
+    // NOT a stacked child of ours; taking its merge commit would wake the
+    // wrong child with the wrong SHA. An unreadable owner cannot be confirmed
+    // to be ours, and REST's filter would not have returned it either, so it
+    // is skipped on the same terms.
+    if (
+      pr.headRepositoryOwnerLogin === null ||
+      pr.headRepositoryOwnerLogin.toLowerCase() !== expectedHeadOwner.toLowerCase()
+    ) {
+      continue;
+    }
+    // Belt-and-braces behind `states: [MERGED]`: an entry with no readable
+    // merge instant cannot be ordered, and an abandoned base is not a base
+    // whose work landed anywhere.
+    if (pr.mergedAt === null) continue;
+    const mergedAtMs = Date.parse(pr.mergedAt);
     if (Number.isNaN(mergedAtMs)) continue;
     if (best && mergedAtMs <= best.mergedAtMs) continue;
-    best = {
-      prNumber: number as number,
-      mergeCommitSha:
-        typeof entry?.merge_commit_sha === "string" ? entry.merge_commit_sha : null,
-      mergedAtMs,
-    };
+    best = { prNumber: pr.number, mergeCommitSha: pr.mergeCommitSha, mergedAtMs };
   }
   return best
     ? { outcome: "found", prNumber: best.prNumber, mergeCommitSha: best.mergeCommitSha }
     : { outcome: "none" };
 }
-
 export async function githubResolveMergedPullRequestForHeadRef(input: {
   repoFullName: string;
   headRef: string;
@@ -1342,28 +1383,29 @@ export async function githubResolveMergedPullRequestForHeadRef(input: {
   const tokenResult = await getInstallationTokenResult(Date.now(), { signal: input.signal });
   if (!tokenResult.ok) return { outcome: "error", reason: tokenResult.reason };
 
-  // `?head=` wants `owner:ref`. The owner is this repository's, not a fork's:
-  // GitHub only lets a PR target a branch in the base repository, so a stacked
-  // child's old base always lived here.
+  // REST's `?head=` wanted `owner:ref`. The owner is this repository's, not a
+  // fork's: GitHub only lets a PR target a branch in the base repository, so a
+  // stacked child's old base always lived here.
+  //
+  // PEN-6341 item 2: GraphQL's `headRefName` takes the BARE branch name and has
+  // no owner half, so the qualification moves from the query to the parse — the
+  // owner is handed down and each node is checked against it there.
   const owner = input.repoFullName.split("/")[0] ?? "";
-  const url =
-    `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls` +
-    `?state=closed&per_page=${MERGED_PR_FOR_HEAD_REF_PAGE_SIZE}` +
-    `&head=${encodeURIComponent(`${owner}:${input.headRef}`)}`;
-  let res: Response;
-  try {
-    res = await ghFetch(url, {
-      headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+  return parseMergedPullRequestForHeadRef(
+    await ghGraphQlListPullRequests({
+      token: tokenResult.token,
+      repoFullName: input.repoFullName,
+      // NOT `[CLOSED]`. GraphQL SPLITS these two where REST's `?state=closed`
+      // folds them, so `[CLOSED]` returns ZERO merged pull requests and this
+      // reader would answer `none` — suppressing the wake — for every branch it
+      // exists to resolve. Measured; see `GraphQlPullRequestState`.
+      states: ["MERGED"],
+      headRefName: input.headRef,
+      first: MERGED_PR_FOR_HEAD_REF_PAGE_SIZE,
       signal: input.signal,
-    });
-  } catch {
-    return { outcome: "error", reason: "merged_pull_request_fetch_failed" };
-  }
-  if (!res.ok) {
-    const classified = await classifyGithubHttpFailure("pull_request", res);
-    return { outcome: "error", reason: classified.reason };
-  }
-  return parseMergedPullRequestForHeadRef(await res.json().catch(() => null));
+    }),
+    owner,
+  );
 }
 
 /**
@@ -3013,6 +3055,20 @@ export type PullRequestReviewsResult =
  * silent truncation of the very list the polarity note above refuses to
  * truncate.
  */
+/**
+ * PEN-6341 item 2 (deferred nit, `#3768`): `commit { oid }` is the GraphQL
+ * field standing in for REST's `commit_id`, and NOTHING HERE ESTABLISHES
+ * whether GraphQL re-anchors an `APPROVED` review's commit forward onto a new
+ * head the way REST is measured to (BLO-27234). It is untested in this
+ * direction, so do not read the migration as having settled it.
+ *
+ * It is a note rather than a defect because the one consumer is already
+ * stricter than either answer: `reviewAttestsHead` consults `commitId` ONLY
+ * when the review body carries no `Reviewed head:` marker, and on a
+ * marker-less review both possible behaviours -- a pinned oid or a
+ * forward-re-anchored one -- make that fallback REFUSE MORE OFTEN than REST
+ * did, never less. A fail-open would need the opposite.
+ */
 function readGraphQlPullRequestReview(node: PullRequestReviewNode): GraphQlPullRequestReview {
   const bare = typeof node.author?.login === "string" ? node.author.login : null;
   const isBot = node.author?.__typename === "Bot";
@@ -3047,7 +3103,33 @@ export async function ghGraphQlPullRequestReviews(input: {
       variables: { owner, name, number: input.prNumber, cursor },
       signal: input.signal,
     });
-    if (!result.ok) return { ok: false, reason: result.reason };
+    if (!result.ok) {
+      // PEN-6341 item 2 (deferred nit, `#3768`): an unknown PR number answers
+      // HTTP 200 with an `errors` entry, and `ghGraphQlQuery` folds that into
+      // `graphql_errors` alongside a FORBIDDEN field, a RATE_LIMITED read and
+      // a type-less query timeout. An ALL-`NOT_FOUND` set is the one shape
+      // that means what REST's 404 meant, so it is named -- exactly as
+      // `classifyPullRequestNotFound` does for the gate reader.
+      //
+      // A POSITIVE assertion on purpose: an absent or empty `errorTypes` must
+      // NOT reach this branch, because `ghGraphQlQuery` keeps a `null` for
+      // every row whose `type` it could not read, and "a type we could not
+      // read" is not "no such pull request".
+      //
+      // Legibility, not behaviour: no consumer branches on the string, and
+      // `classifyReviewerEvidenceError` defaults every unenumerated reason to
+      // retryable (BLO-28968), so both spellings land identically.
+      const types = result.errorTypes;
+      if (
+        result.reason === "graphql_errors" &&
+        Array.isArray(types) &&
+        types.length > 0 &&
+        types.every((type) => type === "NOT_FOUND")
+      ) {
+        return { ok: false, reason: "not_found" };
+      }
+      return { ok: false, reason: result.reason };
+    }
 
     // Both annotations below break a TypeScript inference CYCLE rather than
     // documenting anything: `cursor` is passed into `variables`, so its
@@ -3083,6 +3165,241 @@ export async function ghGraphQlPullRequestReviews(input: {
     cursor = next;
   }
   return { ok: false, reason: "pagination_exhausted" };
+}
+
+/* ------------------------------------------------------------------------ *
+ * `repository.pullRequests` -- the shared pull-request LIST reader (PEN-6341)
+ * ------------------------------------------------------------------------ */
+
+/**
+ * One pull request as the LIST readers need it.
+ *
+ * The union of what the three migrated call sites read, rather than one shape
+ * per site: the nodes are the same objects and the per-site difference is
+ * which fields each one happens to care about. Every field is independently
+ * nullable because every field is independently nullable in the API, and a
+ * reader that cannot see one must say so rather than invent a value.
+ */
+export type GraphQlPullRequestSummary = {
+  number: number;
+  title: string | null;
+  url: string | null;
+  isDraft: boolean;
+  createdAt: string | null;
+  state: string | null;
+  mergedAt: string | null;
+  headRefName: string | null;
+  headRefOid: string | null;
+  /**
+   * Owner of the HEAD repository, which REST supplied through the `owner:ref`
+   * qualification on its `?head=` filter and GraphQL's `headRefName` does NOT:
+   * that argument matches a bare branch NAME, so a fork carrying the same
+   * branch name matches too. Carried here so the one caller that filtered by
+   * head ref can re-impose the qualification its REST query had for free.
+   */
+  headRepositoryOwnerLogin: string | null;
+  mergeCommitSha: string | null;
+  /** `[bot]` re-attached -- see {@link withBotLoginSuffix}. */
+  authorLogin: string | null;
+};
+
+export type GraphQlPullRequestPage =
+  | {
+      ok: true;
+      pullRequests: GraphQlPullRequestSummary[];
+      /**
+       * Nodes whose `number` was unreadable, so they are absent from
+       * `pullRequests`. Counted rather than dropped: a caller that prunes on
+       * "absent from the open set" must be able to tell an INCOMPLETE
+       * enumeration from a complete one, and a silently short list reads as
+       * the latter.
+       */
+      malformed: number;
+      hasNextPage: boolean;
+      endCursor: string | null;
+    }
+  | { ok: false; reason: string };
+
+/**
+ * ⚠ GraphQL SPLITS `CLOSED` and `MERGED`; REST FOLDS merged into `?state=closed`.
+ *
+ * Measured first-party 2026-11-14 on `Blockcast/paperclip#3768`, one merged PR,
+ * filtered by its head ref:
+ *
+ * | query                       | result        |
+ * |-----------------------------|---------------|
+ * | REST `?state=closed`        | 1 (`"closed"`)|
+ * | GraphQL `states:[CLOSED]`   | **0**         |
+ * | GraphQL `states:[MERGED]`   | 1             |
+ * | GraphQL `states:[CLOSED,MERGED]` | 1        |
+ *
+ * So the obvious mapping -- `?state=closed` to `states:[CLOSED]` -- returns an
+ * EMPTY set for every merged pull request. It is the exact inverse of the fold
+ * this row measured in the other direction (REST splits `state`/`merged` where
+ * GraphQL reports a single `MERGED`), and it is the more dangerous half: the
+ * one caller that filters on closed PRs reads an empty answer as `none`, and
+ * `none` SUPPRESSES the wake that caller exists to raise. No type check, null
+ * check or shape check can see it -- both answers are well-formed arrays.
+ */
+export type GraphQlPullRequestState = "OPEN" | "CLOSED" | "MERGED";
+
+const PULL_REQUESTS_QUERY = `
+query(
+  $owner: String!
+  $name: String!
+  $states: [PullRequestState!]
+  $baseRefName: String
+  $headRefName: String
+  $first: Int!
+  $cursor: String
+) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(
+      states: $states
+      baseRefName: $baseRefName
+      headRefName: $headRefName
+      first: $first
+      after: $cursor
+      orderBy: { field: CREATED_AT, direction: DESC }
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        title
+        url
+        isDraft
+        createdAt
+        state
+        mergedAt
+        headRefName
+        headRefOid
+        headRepositoryOwner { login }
+        mergeCommit { oid }
+        author { login __typename }
+      }
+    }
+  }
+}`;
+
+type PullRequestListNode = {
+  number?: unknown;
+  title?: unknown;
+  url?: unknown;
+  isDraft?: unknown;
+  createdAt?: unknown;
+  state?: unknown;
+  mergedAt?: unknown;
+  headRefName?: unknown;
+  headRefOid?: unknown;
+  headRepositoryOwner?: { login?: unknown } | null;
+  mergeCommit?: { oid?: unknown } | null;
+  author?: { login?: unknown; __typename?: unknown } | null;
+};
+
+type PullRequestsConnection = {
+  pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+  nodes?: unknown;
+};
+
+type PullRequestsResponse = { repository?: { pullRequests?: PullRequestsConnection | null } | null };
+
+/**
+ * Total over anything the API can return except an unreadable `number`, which
+ * is the one field no caller can work without -- that returns `null` and is
+ * counted as malformed rather than pushed as a row of nulls.
+ */
+function readGraphQlPullRequestSummary(node: PullRequestListNode): GraphQlPullRequestSummary | null {
+  const number = node.number;
+  if (typeof number !== "number" || !Number.isInteger(number)) return null;
+  const bare = typeof node.author?.login === "string" ? node.author.login : null;
+  const isBot = node.author?.__typename === "Bot";
+  return {
+    number,
+    title: typeof node.title === "string" ? node.title : null,
+    url: typeof node.url === "string" ? node.url : null,
+    isDraft: node.isDraft === true,
+    createdAt: typeof node.createdAt === "string" ? node.createdAt : null,
+    state: typeof node.state === "string" ? node.state.toUpperCase() : null,
+    mergedAt: typeof node.mergedAt === "string" ? node.mergedAt : null,
+    headRefName: typeof node.headRefName === "string" ? node.headRefName : null,
+    headRefOid: typeof node.headRefOid === "string" ? node.headRefOid : null,
+    headRepositoryOwnerLogin:
+      typeof node.headRepositoryOwner?.login === "string" ? node.headRepositoryOwner.login : null,
+    mergeCommitSha: typeof node.mergeCommit?.oid === "string" ? node.mergeCommit.oid : null,
+    authorLogin: bare === null ? null : isBot ? withBotLoginSuffix(bare) : bare,
+  };
+}
+
+/**
+ * ONE page of `repository.pullRequests` (PEN-6341 item 2).
+ *
+ * Deliberately a single page rather than an internal loop, unlike
+ * {@link ghGraphQlPullRequestReviews}: the three callers stop on DIFFERENT
+ * rules -- one takes a single page, one errors on a second page, and one runs
+ * two independent caps and can stop PART WAY THROUGH a page on a row budget.
+ * A shared loop would have to model all three, and the one that stops mid-page
+ * cannot be expressed as a page count at all.
+ *
+ * Fails closed on every path, because all three callers read an empty list as
+ * a positive fact about the repository -- "no stacked children", "nothing
+ * merged this branch", "these are the open PRs" -- and the last of those
+ * PRUNES rows that are absent from it.
+ */
+export async function ghGraphQlListPullRequests(input: {
+  token: string;
+  repoFullName: string;
+  states: readonly GraphQlPullRequestState[];
+  /** Omitted or `null` means NO filter -- verified live, against a control. */
+  baseRefName?: string | null;
+  headRefName?: string | null;
+  first: number;
+  cursor?: string | null;
+  signal?: AbortSignal;
+}): Promise<GraphQlPullRequestPage> {
+  const [owner, name, ...rest] = input.repoFullName.split("/");
+  if (!owner || !name || rest.length > 0) return { ok: false, reason: "repo_full_name_invalid" };
+
+  const result = await ghGraphQlQuery<PullRequestsResponse>({
+    token: input.token,
+    query: PULL_REQUESTS_QUERY,
+    variables: {
+      owner,
+      name,
+      states: input.states,
+      baseRefName: input.baseRefName ?? null,
+      headRefName: input.headRefName ?? null,
+      first: input.first,
+      cursor: input.cursor ?? null,
+    },
+    signal: input.signal,
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+
+  const connection = result.data.repository?.pullRequests;
+  // A null connection is NOT an empty page: REST answered 404 for a repository
+  // it could not see, and every caller mapped that onto unreadable.
+  if (!connection || typeof connection !== "object") return { ok: false, reason: "repository_absent" };
+  if (!Array.isArray(connection.nodes)) return { ok: false, reason: "payload_malformed" };
+
+  const pullRequests: GraphQlPullRequestSummary[] = [];
+  let malformed = 0;
+  for (const node of connection.nodes) {
+    if (!node || typeof node !== "object") {
+      malformed += 1;
+      continue;
+    }
+    const summary = readGraphQlPullRequestSummary(node as PullRequestListNode);
+    if (summary === null) {
+      malformed += 1;
+      continue;
+    }
+    pullRequests.push(summary);
+  }
+
+  const hasNextPage = connection.pageInfo?.hasNextPage === true;
+  const rawCursor: unknown = connection.pageInfo?.endCursor;
+  const endCursor = typeof rawCursor === "string" && rawCursor.length > 0 ? rawCursor : null;
+  return { ok: true, pullRequests, malformed, hasNextPage, endCursor };
 }
 
 /**

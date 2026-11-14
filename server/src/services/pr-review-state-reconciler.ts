@@ -42,7 +42,12 @@
 import { and, eq, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueWorkProducts, pullRequestReviewState } from "@paperclipai/db";
-import { getInstallationTokenResult, ghGraphQlPullRequestReviews } from "./github-app-auth.js";
+import {
+  getInstallationTokenResult,
+  ghGraphQlListPullRequests,
+  ghGraphQlPullRequestReviews,
+  type GraphQlPullRequestPage,
+} from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase } from "./github-fetch.js";
 import {
   emptyGateRedriveResult,
@@ -58,6 +63,9 @@ const GITHUB_API_HEADERS = { accept: "application/vnd.github+json" } as const;
 
 /** Pages of 100 open PRs per repo. 10 pages = 1000 PRs, well past any real repo. */
 const MAX_OPEN_PR_PAGES = 10;
+
+/** GitHub's per-page maximum, matching the `per_page=100` the REST pager sent. */
+const OPEN_PR_PAGE_SIZE = 100;
 /** Timeline pages probed per PR when dating a pending request. */
 const MAX_TIMELINE_PAGES = 10;
 
@@ -161,57 +169,69 @@ export async function listOpenPullRequests(input: {
   token: string;
   maxPullRequests: number;
 }): Promise<{ pullRequests: OpenPullRequest[]; truncated: boolean; malformed: number } | null> {
-  const apiBase = gitHubApiBase(GITHUB_HOST);
-  const headers = githubHeaders(input.token);
   const pullRequests: OpenPullRequest[] = [];
   // A skipped entry makes the enumeration INCOMPLETE, not merely lossy. Counted
   // rather than ignored because the prune treats "absent from the open set" as
   // "closed" — silently dropping an unparseable entry would delete a live row.
   let malformed = 0;
+  let cursor: string | null = null;
 
+  // PEN-6341 item 2: cursor pagination replaces `&page=N`. The two caps are
+  // unchanged and still independent — `MAX_OPEN_PR_PAGES` bounds the walk, and
+  // `maxPullRequests` can stop it PART WAY THROUGH a page, which is why this
+  // loop lives here rather than inside the shared reader.
   try {
     for (let page = 1; page <= MAX_OPEN_PR_PAGES; page += 1) {
-      const url = `${apiBase}/repos/${input.repoFullName}/pulls?state=open&per_page=100&page=${page}`;
-      const response = await ghFetch(url, { headers });
-      if (!response.ok) return null;
-      const payload = await response.json();
-      // A non-array body is not an empty page. Treating it as one would report a
-      // complete enumeration of zero open PRs and prune the entire repo.
-      if (!Array.isArray(payload)) return null;
-      const batch = payload as Array<{
-        number?: number;
-        title?: string | null;
-        html_url?: string | null;
-        draft?: boolean | null;
-        created_at?: string | null;
-        user?: { login?: string | null } | null;
-        head?: { sha?: string | null } | null;
-      }>;
+      const result: GraphQlPullRequestPage = await ghGraphQlListPullRequests({
+        token: input.token,
+        repoFullName: input.repoFullName,
+        states: ["OPEN"],
+        first: OPEN_PR_PAGE_SIZE,
+        cursor,
+      });
+      // An unreadable page is not an empty one. Treating it as one would report
+      // a complete enumeration of zero open PRs and prune the entire repo.
+      if (!result.ok) return null;
+      // Nodes the shared reader could not give a number to. Folded into this
+      // module's own counter rather than dropped, for the reason above.
+      malformed += result.malformed;
 
-      for (const pr of batch) {
-        if (!Number.isInteger(pr.number) || typeof pr.created_at !== "string") {
+      for (const pr of result.pullRequests) {
+        // `createdAt` is this module's own additional requirement — the row is
+        // written with `new Date(pr.createdAt)` and ages from it.
+        if (pr.createdAt === null) {
           malformed += 1;
           continue;
         }
         pullRequests.push({
-          number: pr.number as number,
-          title: pr.title ?? null,
-          url: pr.html_url ?? null,
-          authorLogin: pr.user?.login ?? null,
-          createdAt: pr.created_at,
-          isDraft: pr.draft === true,
-          headSha: typeof pr.head?.sha === "string" ? pr.head.sha : null,
+          number: pr.number,
+          title: pr.title,
+          url: pr.url,
+          // `[bot]` re-attached by the shared reader, so this column keeps the
+          // spelling REST wrote. GraphQL returns the BARE slug for an App
+          // actor, and this value is PERSISTED and compared downstream.
+          authorLogin: pr.authorLogin,
+          createdAt: pr.createdAt,
+          isDraft: pr.isDraft,
+          headSha: pr.headRefOid,
         });
         if (pullRequests.length >= input.maxPullRequests) {
           return { pullRequests, truncated: true, malformed };
         }
       }
 
-      if (batch.length < 100) return { pullRequests, truncated: false, malformed };
-      if (page === MAX_OPEN_PR_PAGES) return { pullRequests, truncated: true, malformed };
+      if (!result.hasNextPage) return { pullRequests, truncated: false, malformed };
+      // A further page we cannot address is an enumeration we cannot complete,
+      // never a complete one — same refusal as an unreadable page.
+      if (result.endCursor === null) return null;
+      cursor = result.endCursor;
     }
-    return { pullRequests, truncated: false, malformed };
+    // Every page of the cap consumed with more still to come.
+    return { pullRequests, truncated: true, malformed };
   } catch {
+    // `ghGraphQlListPullRequests` documents a never-throws contract; kept so
+    // that any breach of it still fails closed into "unreadable" rather than
+    // propagating into a sweep whose next act is a prune.
     return null;
   }
 }

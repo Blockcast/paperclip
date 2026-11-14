@@ -23,6 +23,8 @@ import {
   parseMergedPullRequestForHeadRef,
   parseMergeHistoryShape,
   parseOpenPullRequestsOnBasePayload,
+  type GraphQlPullRequestPage,
+  type GraphQlPullRequestSummary,
 } from "../services/github-app-auth.js";
 import { __test_stackedChildDirective } from "../routes/github-webhook.js";
 
@@ -47,11 +49,54 @@ describe("parseMergeHistoryShape", () => {
   });
 });
 
+/**
+ * PEN-6341 item 2: these parsers now read ONE `repository.pullRequests` page
+ * off the shared GraphQL reader instead of a REST array body. The fixtures are
+ * built GraphQL-shaped rather than translated — a double left in the old
+ * transport's shape would make every assertion a tautology about its own
+ * fixture rather than a test of the reader.
+ */
+const prSummary = (
+  over: Partial<GraphQlPullRequestSummary> & { number: number },
+): GraphQlPullRequestSummary => ({
+  title: null,
+  url: null,
+  isDraft: false,
+  createdAt: null,
+  state: null,
+  mergedAt: null,
+  headRefName: null,
+  headRefOid: null,
+  // Defaults to OUR owner so each test states only what it is about; the
+  // fork-qualification tests below override it deliberately.
+  headRepositoryOwnerLogin: "Blockcast",
+  mergeCommitSha: null,
+  authorLogin: null,
+  ...over,
+});
+
+const prPage = (
+  pullRequests: GraphQlPullRequestSummary[],
+  over: Partial<Extract<GraphQlPullRequestPage, { ok: true }>> = {},
+): GraphQlPullRequestPage => ({
+  ok: true,
+  pullRequests,
+  malformed: 0,
+  hasNextPage: false,
+  endCursor: null,
+  ...over,
+});
+
 describe("parseOpenPullRequestsOnBasePayload", () => {
   it("parses open PRs and carries each head ref", () => {
-    const result = parseOpenPullRequestsOnBasePayload([
-      { number: 1439, title: "child", html_url: "https://example.test/1439", head: { ref: "se/child" } },
-    ]);
+    const result = parseOpenPullRequestsOnBasePayload(prPage([
+      prSummary({
+        number: 1439,
+        title: "child",
+        url: "https://example.test/1439",
+        headRefName: "se/child",
+      }),
+    ]));
     expect(result).toEqual({
       pullRequests: [
         { number: 1439, title: "child", url: "https://example.test/1439", headRef: "se/child" },
@@ -60,34 +105,41 @@ describe("parseOpenPullRequestsOnBasePayload", () => {
     });
   });
 
-  it("fails closed on a non-array body instead of reporting zero children", () => {
+  it("fails closed on an unreadable page instead of reporting zero children", () => {
     // The dangerous direction: an empty list is indistinguishable from "this
     // branch had no stacked children", and silently means nobody is woken.
-    for (const body of [null, undefined, {}, "[]", 0]) {
-      expect(parseOpenPullRequestsOnBasePayload(body)).toEqual({
-        error: "open_pull_requests_malformed",
-      });
-    }
+    expect(parseOpenPullRequestsOnBasePayload({ ok: false, reason: "payload_malformed" }))
+      .toEqual({ error: "open_pull_requests_malformed" });
+    expect(parseOpenPullRequestsOnBasePayload({ ok: false, reason: "repository_absent" }))
+      .toEqual({ error: "open_pull_requests_repository_absent" });
   });
 
-  it("skips entries with no usable number without dropping the rest", () => {
-    const result = parseOpenPullRequestsOnBasePayload([
-      { number: "nope" },
-      { number: 7, head: { ref: "keep" } },
-    ]);
-    expect(result).toEqual({
-      pullRequests: [{ number: 7, title: null, url: null, headRef: "keep" }],
-      truncated: false,
-    });
+  it("keeps the REST reader's spelling for the two reasons it had its own words for", () => {
+    // `transport` was the REST catch-all for a thrown fetch, and a non-array
+    // body was `_malformed`. Both strings are already recorded in the
+    // stacked-PR warn diagnostics, so the transport change must not re-spell
+    // them. A mutation that drops the mapping reds exactly this.
+    expect(parseOpenPullRequestsOnBasePayload({ ok: false, reason: "transport" }))
+      .toEqual({ error: "open_pull_requests_fetch_failed" });
+    expect(parseOpenPullRequestsOnBasePayload({ ok: false, reason: "http_403" }))
+      .toEqual({ error: "open_pull_requests_http_403" });
   });
 
-  it("flags a full page as truncated so a prefix is never read as the whole set", () => {
-    const full = Array.from({ length: 100 }, (_, i) => ({ number: i + 1 }));
-    const result = parseOpenPullRequestsOnBasePayload(full);
-    expect(result).toMatchObject({ truncated: true });
-    expect(parseOpenPullRequestsOnBasePayload(full.slice(0, 99))).toMatchObject({
-      truncated: false,
-    });
+  it("reports a further page as truncated so a prefix is never read as the whole set", () => {
+    expect(parseOpenPullRequestsOnBasePayload(prPage([prSummary({ number: 7 })], {
+      hasNextPage: true,
+      endCursor: "cursor",
+    }))).toMatchObject({ truncated: true });
+  });
+
+  it("does NOT call a provably-whole page truncated, however full it is", () => {
+    // PEN-6341: the REST reader inferred truncation from "the page came back
+    // full", so a chain of exactly OPEN_PRS_ON_BASE_PAGE_SIZE children was
+    // reported as possibly-incomplete when it was provably whole.
+    // `pageInfo.hasNextPage` is exact. This is the assertion that would fail if
+    // the page-size heuristic were ever reinstated.
+    const full = Array.from({ length: 100 }, (_, i) => prSummary({ number: i + 1 }));
+    expect(parseOpenPullRequestsOnBasePayload(prPage(full))).toMatchObject({ truncated: false });
   });
 });
 
@@ -130,78 +182,140 @@ describe("stackedChildDirective", () => {
  * it for the same reason the enumeration keeps them apart.
  */
 describe("parseMergedPullRequestForHeadRef", () => {
+  const OWNER = "Blockcast";
+
   it("returns the merged PR and its merge commit", () => {
-    expect(parseMergedPullRequestForHeadRef([
-      { number: 2027, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: "cafebabe" },
-    ])).toEqual({ outcome: "found", prNumber: 2027, mergeCommitSha: "cafebabe" });
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({ number: 2027, mergedAt: "2026-09-26T09:00:00Z", mergeCommitSha: "cafebabe" }),
+    ]), OWNER)).toEqual({ outcome: "found", prNumber: 2027, mergeCommitSha: "cafebabe" });
   });
 
-  it("ignores closed-but-unmerged PRs — an abandoned base orphaned nothing", () => {
-    expect(parseMergedPullRequestForHeadRef([
-      { number: 2027, merged_at: null, merge_commit_sha: null },
-    ])).toEqual({ outcome: "none" });
+  it("ignores an entry with no merge instant — an abandoned base orphaned nothing", () => {
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({ number: 2027, mergedAt: null }),
+    ]), OWNER)).toEqual({ outcome: "none" });
   });
 
   it("takes the most recently merged PR, not the response order", () => {
-    // GitHub sorts this list by `created` descending, and a PR opened earlier
-    // can merge later. Ordering on `merged_at` is the fix.
-    expect(parseMergedPullRequestForHeadRef([
-      { number: 10, merged_at: "2026-01-01T00:00:00Z", merge_commit_sha: "old" },
-      { number: 20, merged_at: "2026-09-01T00:00:00Z", merge_commit_sha: "new" },
-      { number: 15, merged_at: "2026-05-01T00:00:00Z", merge_commit_sha: "mid" },
-    ])).toEqual({ outcome: "found", prNumber: 20, mergeCommitSha: "new" });
+    // The page is ordered CREATED_AT descending, and a PR opened earlier can
+    // merge later. Ordering on `mergedAt` is the fix.
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({ number: 10, mergedAt: "2026-01-01T00:00:00Z", mergeCommitSha: "old" }),
+      prSummary({ number: 20, mergedAt: "2026-09-01T00:00:00Z", mergeCommitSha: "new" }),
+      prSummary({ number: 15, mergedAt: "2026-05-01T00:00:00Z", mergeCommitSha: "mid" }),
+    ]), OWNER)).toEqual({ outcome: "found", prNumber: 20, mergeCommitSha: "new" });
   });
 
-  it("reports an empty list as none, not as an error", () => {
+  it("reports an empty page as none, not as an error", () => {
     // A branch can be deleted, or retargeted by hand, without ever merging.
     // Both fire the same event and neither is a stacked orphaning.
-    expect(parseMergedPullRequestForHeadRef([])).toEqual({ outcome: "none" });
+    expect(parseMergedPullRequestForHeadRef(prPage([]), OWNER)).toEqual({ outcome: "none" });
   });
 
-  it("treats a full page as unreadable, never as none or as a prefix's merge", () => {
+  it("ignores a FORK's pull request that merely shares the head branch name", () => {
+    // PEN-6341 item 2, and the reason this parser takes an owner at all. REST
+    // qualified its filter as `?head=owner:ref`; GraphQL's `headRefName` takes
+    // the BARE branch name, so a fork carrying `se/child` matches too. Taking
+    // its merge commit would wake our child with a SHA from someone else's
+    // repository — and every other field on the node looks perfectly valid.
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({
+        number: 99,
+        mergedAt: "2026-09-26T09:00:00Z",
+        mergeCommitSha: "fork-sha",
+        headRepositoryOwnerLogin: "someone-else",
+      }),
+    ]), OWNER)).toEqual({ outcome: "none" });
+  });
+
+  it("prefers OUR newer merge over a fork's, rather than merely preferring the newest", () => {
+    // The mutation this catches is dropping the owner filter: without it the
+    // fork's later merge wins on `mergedAt` alone.
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({
+        number: 42,
+        mergedAt: "2026-09-01T00:00:00Z",
+        mergeCommitSha: "ours",
+        headRepositoryOwnerLogin: "Blockcast",
+      }),
+      prSummary({
+        number: 99,
+        mergedAt: "2026-09-26T09:00:00Z",
+        mergeCommitSha: "theirs",
+        headRepositoryOwnerLogin: "someone-else",
+      }),
+    ]), OWNER)).toEqual({ outcome: "found", prNumber: 42, mergeCommitSha: "ours" });
+  });
+
+  it("matches the owner case-insensitively, as GitHub treats it", () => {
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({
+        number: 7,
+        mergedAt: "2026-09-26T09:00:00Z",
+        mergeCommitSha: "keep",
+        headRepositoryOwnerLogin: "blockcast",
+      }),
+    ]), "BLOCKCAST")).toEqual({ outcome: "found", prNumber: 7, mergeCommitSha: "keep" });
+  });
+
+  it("ignores an entry whose head owner is unreadable rather than assuming it is ours", () => {
+    // A head repository we cannot name cannot be confirmed to be ours, and
+    // REST's `owner:ref` filter would not have returned it either.
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({
+        number: 8,
+        mergedAt: "2026-09-26T09:00:00Z",
+        mergeCommitSha: "x",
+        headRepositoryOwnerLogin: null,
+      }),
+    ]), OWNER)).toEqual({ outcome: "none" });
+  });
+
+  it("treats a further page as unreadable, never as none or as a prefix's merge", () => {
     // Only one page is fetched, so the merge that triggered the retarget may be
-    // on page 2. Neither `none` (suppresses the wake) nor the prefix's newest
-    // merge (possibly the wrong base, so the wrong directive) is a safe answer.
-    // Sized off the exported constant so the guard and the fetcher's `per_page`
-    // cannot drift apart from this assertion.
-    const closedUnmerged = Array.from(
-      { length: MERGED_PR_FOR_HEAD_REF_PAGE_SIZE - 1 },
-      (_, i) => ({ number: i + 1, merged_at: null }),
-    );
-    expect(parseMergedPullRequestForHeadRef([...closedUnmerged, { number: 99, merged_at: null }]))
+    // on the next one. Neither `none` (suppresses the wake) nor the prefix's
+    // newest merge (possibly the wrong base, so the wrong directive) is safe.
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({ number: 99, mergedAt: "2026-09-26T09:00:00Z", mergeCommitSha: "prefix" }),
+    ], { hasNextPage: true, endCursor: "cursor" }), OWNER))
       .toEqual({ outcome: "error", reason: "merged_pull_request_truncated" });
-    expect(parseMergedPullRequestForHeadRef([
-      ...closedUnmerged,
-      { number: 99, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: "prefix" },
-    ])).toEqual({ outcome: "error", reason: "merged_pull_request_truncated" });
-    // One short of the page is still the whole answer.
-    expect(parseMergedPullRequestForHeadRef(closedUnmerged)).toEqual({ outcome: "none" });
   });
 
-  it("fails closed on an unreadable body instead of reporting none", () => {
+  it("does NOT call a provably-whole page truncated, however full it is", () => {
+    // PEN-6341: the REST reader inferred truncation from a full page, and
+    // closed-but-UNMERGED PRs consumed those slots — a recycled branch name
+    // reached the cap on abandoned PRs alone and suppressed the wake.
+    // `states: [MERGED]` filters them out server-side and `hasNextPage` is
+    // exact, so this page of the old cap size is readable.
+    const full = Array.from({ length: MERGED_PR_FOR_HEAD_REF_PAGE_SIZE }, (_, i) =>
+      prSummary({ number: i + 1, mergedAt: "2026-01-01T00:00:00Z", mergeCommitSha: "s" }));
+    expect(parseMergedPullRequestForHeadRef(prPage(full), OWNER))
+      .toMatchObject({ outcome: "found" });
+  });
+
+  it("fails closed on an unreadable page instead of reporting none", () => {
     // The dangerous collapse: `none` means "nothing merged this branch", which
     // suppresses the wake. An unreadable answer must never say that.
-    for (const body of [null, undefined, {}, "[]", 0]) {
-      expect(parseMergedPullRequestForHeadRef(body)).toEqual({
-        outcome: "error",
-        reason: "merged_pull_request_malformed",
-      });
-    }
+    expect(parseMergedPullRequestForHeadRef({ ok: false, reason: "payload_malformed" }, OWNER))
+      .toEqual({ outcome: "error", reason: "merged_pull_request_malformed" });
+    expect(parseMergedPullRequestForHeadRef({ ok: false, reason: "transport" }, OWNER))
+      .toEqual({ outcome: "error", reason: "merged_pull_request_fetch_failed" });
+    expect(parseMergedPullRequestForHeadRef({ ok: false, reason: "http_502" }, OWNER))
+      .toEqual({ outcome: "error", reason: "merged_pull_request_http_502" });
   });
 
-  it("skips entries with an unusable number or timestamp without dropping the rest", () => {
-    expect(parseMergedPullRequestForHeadRef([
-      { number: "nope", merged_at: "2026-09-26T09:00:00Z" },
-      { number: 31, merged_at: "not-a-date" },
-      { number: 42, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: "keep" },
-    ])).toEqual({ outcome: "found", prNumber: 42, mergeCommitSha: "keep" });
+  it("skips an entry with an unusable timestamp without dropping the rest", () => {
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({ number: 31, mergedAt: "not-a-date" }),
+      prSummary({ number: 42, mergedAt: "2026-09-26T09:00:00Z", mergeCommitSha: "keep" }),
+    ]), OWNER)).toEqual({ outcome: "found", prNumber: 42, mergeCommitSha: "keep" });
   });
 
   it("returns found with a null merge commit rather than dropping the PR", () => {
     // The caller turns this into `unknown`, which refuses to recommend a bare
     // retarget. Dropping the PR instead would suppress the wake entirely.
-    expect(parseMergedPullRequestForHeadRef([
-      { number: 2027, merged_at: "2026-09-26T09:00:00Z", merge_commit_sha: 42 },
-    ])).toEqual({ outcome: "found", prNumber: 2027, mergeCommitSha: null });
+    expect(parseMergedPullRequestForHeadRef(prPage([
+      prSummary({ number: 2027, mergedAt: "2026-09-26T09:00:00Z", mergeCommitSha: null }),
+    ]), OWNER)).toEqual({ outcome: "found", prNumber: 2027, mergeCommitSha: null });
   });
 });
