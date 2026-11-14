@@ -129,7 +129,7 @@ unguarded git **can authenticate** — and it does so *by itself*, with no crede
 the caller at all. Measured today:
 
 - The agent image's **system** git scope carries a credential helper for github.com.
-  `Dockerfile.runtime:87-88` writes, as the only `git config --system` in the whole build chain:
+  `Dockerfile.runtime:94-95` writes, as the only `git config --system` in the whole build chain:
 
   ```
   git config --system credential.https://github.com.helper '!/usr/bin/gh auth git-credential'
@@ -141,7 +141,7 @@ the caller at all. Measured today:
   injected only as `-c` flags on the wrapper's exec line. Skipping the wrapper therefore drops the
   paperclip helper and keeps the gh one.
 - That helper deliberately points at `/usr/bin/gh`, the wrapper — not `gh.real` — precisely
-  *because* the wrapper reads the token file (`Dockerfile.runtime:65-70`
+  *because* the wrapper reads the token file (`Dockerfile.runtime:72-77`
   (`Must point at /usr/bin/gh`), BLO-25702). So the helper
   resolves the credential on git's behalf.
 - The push credential is a Secret mounted at `/etc/paperclip/secrets/github-token/` with
@@ -231,7 +231,7 @@ The boundary must therefore hold the credential and **perform the publish itself
   `~/.config/gh/hosts.yml` — the unmaintained state BLO-13241 wrapped `gh` to stop using in the
   first place. Either one re-authenticates the unguarded binary with the mount already gone.
   Prefer removing the helper from the image's system scope outright; if it stays (the wrapped
-  doors still need it), D1 must assert it yields no credential. Note `Dockerfile.runtime:87`
+  doors still need it), D1 must assert it yields no credential. Note `Dockerfile.runtime:94`
   (`credential.https://github.com.helper`) is
   guarded by two equality checks (`scripts/check-agent-image-git-config.mjs` and assertion (a) in
   `agent-egress-path.test.mjs`) whose expectations live in `scripts/git-config-surface.mjs` —
@@ -976,7 +976,7 @@ Four things a reader should not infer from that paragraph:
    (`Dockerfile:674` (`/usr/local/libexec/paperclip/bin/`)) and is reached through `PATH`
    — which is precisely what
    bypass 4 sidesteps. The system helper is `!/usr/bin/gh auth git-credential`
-   (`Dockerfile.runtime:88` (`!/usr/bin/gh auth git-credential`)), an **absolute** path,
+   (`Dockerfile.runtime:95` (`!/usr/bin/gh auth git-credential`)), an **absolute** path,
    so `PATH` is not consulted
    and no egress wrapper is involved; and the broker is never asked, because
    nothing on this path speaks to it. Pointing an assertion at the documented
@@ -987,7 +987,7 @@ Four things a reader should not infer from that paragraph:
 <!-- anchor-file: scripts/gh-token-wrapper.sh -->
 
    The real mechanism, which is what the assertion confirms: `/usr/bin/gh` is
-   a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:59-61`
+   a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:66-68`
    (`ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh`)), and
    the decisive conjunct is its `TOKEN_FILE_REQUIRED`, set to `yes` **iff
    `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:1911-1912`
