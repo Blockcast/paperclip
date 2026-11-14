@@ -245,7 +245,8 @@ test("worktree_install does not enable setup-node's pnpm cache", () => {
   );
   assert.match(
     jobBody,
-    /uses: actions\/setup-node@v6\n        with:\n          node-version: 24\n\n/,
+    // Any ref: this asserts the block shape, not the major (a Dependabot bump must not fail it).
+    /uses: actions\/setup-node@[^\s]+[^\n]*\n        with:\n          node-version: 24\n\n/,
     "worktree_install's setup-node block must end at node-version — no cache input.",
   );
   assert.doesNotMatch(
