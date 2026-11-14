@@ -641,6 +641,19 @@ jobs:
         run: node --test ./scripts/check-designer-image-alert-channel.test.js
         timeout-minutes: 1
 
+      # PEN-6683: the same silence measured on a FOURTH lane, and the one with
+      # the highest observed incidence. figma-bot has been ceiling-killed on a
+      # master PUSH twice -- run #98 (2026-11-14, 30.12 min against a 30-minute
+      # ceiling) and run #80 (2026-11-09, 30.10 min), both on scale set
+      # `arc-paperclip-buildkit-n7zlf`. Each published nothing, each was
+      # recorded `cancelled` rather than `failure`, and nothing anywhere said
+      # so: master-health.yml censuses runs filtered on `.path ==
+      # ".github/workflows/pr.yml"` and so cannot see a `docker-*` run at all.
+      - name: Validate figma-bot image alert channel and timeout budgets (PEN-6683)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-figma-bot-image-alert-channel.test.js
+        timeout-minutes: 1
+
       # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
       # approval holds a lock until its rollout lands, so a deploy dying between
       # the approval step and `helm upgrade` strands a lock nothing can clear
