@@ -46,7 +46,7 @@ Trust boundaries are client-to-gateway, control-plane registry-to-gateway, gatew
 
 <!-- anchor-file: packages/mcp-gateway/src/upstreams.ts -->
 
-- Location: `packages/mcp-gateway/src/server.ts:395-458`, `packages/mcp-gateway/src/upstreams.ts:156-180` and `:233-245`.
+- Location, as reviewed at `7570f30078b4991da361f860439835d056609da8` (see *Gateway scope* above): `packages/mcp-gateway/src/server.ts` lines 395-458; `packages/mcp-gateway/src/upstreams.ts` lines 156-180 and 233-245. Remediated under `PEN-1656`; these ranges are not current-tree citations.
 - Evidence: correctly labeled `tenant_node` routes suppress central environment and custody injection, but use the generic forwarding path. That path copies inbound headers except a small hop-by-hop/framing denylist. Caller `Authorization`, `Cookie`, `x-api-key`, proxy authorization, forwarding metadata, and client-supplied tenant headers can reach the registry-selected URL.
 - Evidence: `UpstreamConfig` has no authenticated tenant, node, route, or audience fields. The gateway sends ordinary HTTP requests rather than a server-owned PEN-629 frame and cannot validate a relay response audience.
 - Risk: caller/session credentials can be disclosed to a tenant node or arbitrary route target, and client-controlled identity can be confused with authenticated channel identity.
@@ -55,7 +55,7 @@ Trust boundaries are client-to-gateway, control-plane registry-to-gateway, gatew
 
 ### High - Gateway tenant-node routes are an SSRF sink and stale cache is not principal-bound
 
-- Location: `packages/mcp-gateway/src/upstreams.ts:58-100` and `:115-127`; `packages/mcp-gateway/src/server.ts:395-428`.
+- Location, as reviewed at `7570f30078b4991da361f860439835d056609da8` (see *Gateway scope* above): `packages/mcp-gateway/src/upstreams.ts` lines 58-100 and 115-127; `packages/mcp-gateway/src/server.ts` lines 395-428. Remediated under `PEN-1657`; these ranges are not current-tree citations.
 - Evidence: URL validation accepts arbitrary HTTP(S) destinations and does not exclude loopback, RFC1918, link-local/metadata, cluster-internal targets, unsafe redirects, DNS rebinding, unexpected ports, or URL credentials.
 - Evidence: last-known-good routes are stored in one fixed cache without the authenticated state-token principal, tenant, or node audience. A principal rotation followed by control-plane outage can reuse another identity's route set.
 - Risk: central-network SSRF, cross-tenant route confusion, and stale route reuse.
