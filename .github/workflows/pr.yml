@@ -695,6 +695,18 @@ jobs:
         run: node --test ./scripts/check-webflow-bot-image-alert-channel.test.js
         timeout-minutes: 1
 
+      # PEN-6683: the same silence on the MAIN paperclip image lane. On a
+      # master PUSH, `build-and-push` is the only job in docker.yml that runs
+      # -- the guards, `deploy` and `deploy-dispatch-outcome` are all gated on
+      # `workflow_dispatch` -- so a push that publishes nothing is silent by
+      # construction. This pins the push-path arm AND the deliberate
+      # `workflow_dispatch` exclusion, which exists so the new arm cannot
+      # double-report a cause `deploy-dispatch-outcome` already handles.
+      - name: Validate paperclip image alert channel and timeout budgets (PEN-6683)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-paperclip-image-alert-channel.test.js
+        timeout-minutes: 1
+
       # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
       # approval holds a lock until its rollout lands, so a deploy dying between
       # the approval step and `helm upgrade` strands a lock nothing can clear
