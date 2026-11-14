@@ -221,7 +221,7 @@ ancestor of `master` is reading the wrong field.
 not affect the fleet today, because the gate is off everywhere and the overlay can only set it to the
 value it already has. **It becomes live the moment stage 1 sets the gate `true` at agent scope.**
 
-The chain, read at `47d01a4bf`:
+The chain:
 
 <!-- anchor-file: server/src/services/heartbeat.ts -->
 
@@ -1040,7 +1040,7 @@ precondition as outstanding, which is the *conservative* direction but still wro
 **Six of six discharged.** ⚠ The sixth was discharged by **closure**, not by merge, and the
 distinction matters: #3112's content reached `master` through #3123 and #3133 while #3112 itself was
 closed unmerged. A ledger that reads `merged` as the discharge condition would call this row
-outstanding forever. Re-verified at source on `47d01a4bf` — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
+outstanding forever. Re-verified at source — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
 (`server/src/services/agent-config-key-pins.ts:99`
 (`const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([`)), `withAgentScopedConfigProvenance`
 (defined `server/src/services/heartbeat.ts:3391`
