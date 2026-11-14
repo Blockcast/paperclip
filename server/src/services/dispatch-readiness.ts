@@ -39,6 +39,99 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 /**
+ * Which class of event woke a run, for the per-issue dispatch dedupe.
+ *
+ * `github_webhook` is a wake raised by an external GitHub delivery;
+ * `issue_local` is anything raised from the row itself (a comment, a monitor,
+ * a status change, an assignment). `null` means the snapshot carries no
+ * readable `wakeReason` and the class could not be established.
+ */
+export type HeartbeatWakeClass = "github_webhook" | "issue_local";
+
+/**
+ * PEN-6407. The per-issue dedupe below cancels a queued run when ANY other run
+ * for that issue is already dispatched, and justifies it with "the surviving
+ * run will continue the work". That premise holds for a same-class duplicate
+ * and does not hold across classes: an `issue_commented` run will not do the
+ * work of a `github_pr_review_requested` wake, because the webhook delivery is
+ * the only carrier of that event.
+ *
+ * This is the same asymmetry {@link isStaleMaintenanceSweepCandidate} already
+ * encodes one layer up (BLO-35488): an issue-local wake has a successor — the
+ * next one re-reads the whole row — while a GitHub webhook fires ONCE per push
+ * or review request, so a cancelled one is not deferred, it is destroyed.
+ *
+ * Measured 2026-11-10 over `heartbeat_runs`: of the `github_*` wakes cancelled
+ * `duplicate_dispatch_suppressed`, 33 of 47 classifiable kills had a NON-github
+ * incumbent (22 of 23 in a 2026-11-06 window). On `Blockcast/paperclip#3452`
+ * all 9 github wakes across a 3h24m strand were cancelled this way, 9 of 9
+ * against a comment-driven incumbent.
+ */
+export function classifyHeartbeatWakeClass(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): HeartbeatWakeClass | null {
+  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
+  if (wakeReason === null) return null;
+  return wakeReason.startsWith("github_") ? "github_webhook" : "issue_local";
+}
+
+/**
+ * Sticky marker: "this row carries at least one github webhook wake that has
+ * not been delivered yet."
+ *
+ * ⛔ Deliberately NOT a member of {@link GITHUB_PR_CONTEXT_KEYS}. Those keys
+ * describe WHICH pull request, and are dropped as a unit when an incoming wake
+ * names a different one; this key describes only that a webhook is still owed a
+ * dispatch, which stays true whichever PR it was for.
+ */
+export const CARRIES_GITHUB_WAKE_CONTEXT_KEY = "carriesGithubWake";
+
+/**
+ * PEN-6407 review follow-up. `classifyHeartbeatWakeClass` alone is NOT a safe
+ * test for "this queued row is a webhook delivery", because a queued row is a
+ * COALESCE TARGET and the merge overwrites `wakeReason`.
+ *
+ * The path, which is exactly the #3452 scenario rather than a corner case: a
+ * github row is deferred and sits `queued` while an `issue_local` incumbent
+ * runs. The next `issue_commented` wake for that issue has the same task scope,
+ * so `rawCoalescedTarget` selects `sameScopeQueuedRun` — the deferred row —
+ * FIRST, and `mergeCoalescedContextSnapshot` spreads `{...existing, ...incoming}`
+ * so `wakeReason` becomes `issue_commented`. The next dispatch pass then reads
+ * the row as issue-local, the cross-class branch does not fire, and the webhook
+ * is cancelled after all. The strand this gate exists for is precisely a long
+ * comment-driven hold with more comments arriving during it, so the coalesce is
+ * the normal case there, not the unlucky one.
+ *
+ * ⭐ Asymmetric by design, and the asymmetry is the same gate-polarity rule the
+ * unreadable-class fallback follows: this test PROTECTS an event from
+ * destruction, so it is generous (sticky marker OR a github `wakeReason`); the
+ * INCUMBENT test LICENSES a destruction, so it stays strict and keeps reading
+ * `classifyHeartbeatWakeClass` alone. Over-detecting an incumbent would cancel a
+ * webhook; over-detecting an arrival only costs a deferral.
+ */
+export function contextCarriesGithubWake(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): boolean {
+  if (contextSnapshot?.[CARRIES_GITHUB_WAKE_CONTEXT_KEY] === true) return true;
+  return classifyHeartbeatWakeClass(contextSnapshot) === "github_webhook";
+}
+
+/**
+ * PEN-6407 / BLO-57165. The dispatcher's cross-reason deferral arm, whole: a
+ * queued run whose issue already has a running run on the same agent is left
+ * `queued` (`duplicate_dispatch_cross_reason_deferred`) instead of cancelled
+ * when it carries a github wake and no incumbent on that issue was
+ * webhook-woken. Shared with the claimable queued-run age gauge so the gauge
+ * does not count, as claimable, a row the dispatcher is deliberately holding.
+ */
+export function isCrossReasonGithubWakeDeferral(
+  arrivalSnapshot: Record<string, unknown> | null | undefined,
+  incumbentWakeClasses: ReadonlySet<HeartbeatWakeClass>,
+): boolean {
+  return contextCarriesGithubWake(arrivalSnapshot) && !incumbentWakeClasses.has("github_webhook");
+}
+
+/**
  * The single reader of "which comment id, if any, woke this run".
  *
  * Batched wake ids win over the scalar fields: `extractWakeCommentIds`
