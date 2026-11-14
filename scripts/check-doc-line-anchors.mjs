@@ -697,11 +697,24 @@ export function changedSince(ref, root, head = "HEAD") {
   return r.status === 0 ? new Set(r.stdout.split("\n").filter(Boolean)) : null;
 }
 
-// Every path the WORKTREE differs from `ref` at: committed, staged, unstaged, and
-// untracked. The two-dot `git diff --name-only <ref>` already covers the first three
-// (it compares the ref against the working tree, not against HEAD); `ls-files --others`
-// adds a file this change has created and not yet added, which an anchor can cite and a
-// document can be.
+// Every path THIS CHANGE differs from `ref` at, counting work that is not committed:
+// committed, staged, unstaged, and untracked. `git diff --name-only <commit>` compares
+// that commit against the WORKING TREE, which is what covers the first three;
+// `ls-files --others` adds a file this change has created and not yet added, which an
+// anchor can cite and a document can be.
+//
+// THE COMMIT IT DIFFS FROM IS THE MERGE BASE, NOT `ref` ITSELF, AND THAT IS THE WHOLE
+// CARE OF THIS FUNCTION. A two-dot diff against `origin/master` asks "how does my tree
+// differ from master's TIP", which answers with every file MASTER changed since I
+// branched -- and being behind master is the normal state of anyone who fetched after
+// branching. Those files are not this change's, so handing them to the fix scope
+// renumbers citations in documents this change never opened, over drift that is the
+// base's: exactly the #3774 widening the narrowing exists to remove, arrived at through
+// the worktree union instead of through the missing filter. Reproduced on this head
+// before it was fixed. The attribution path never had this problem and does not need
+// changing, because `base...head` is merge-base-anchored BY DEFINITION; the two-dot
+// form is the one place the base TIP could leak in, so the two are now anchored at the
+// same commit and differ only in their right-hand end -- a commit there, this tree here.
 //
 // This is the FIX scope and never the attribution scope. A gate must judge a commit --
 // a worktree is not a thing CI has or a reviewer can read -- but `--fix` writes to the
@@ -711,12 +724,17 @@ export function changedSince(ref, root, head = "HEAD") {
 // `git mv` lists only the destination, and an anchor still citing the old path matches
 // neither ownership arm.
 //
-// Returns null on a git failure, which main refuses on rather than silently falling
-// back to the narrow set -- a quiet fallback here is indistinguishable from the no-op
-// this function exists to remove.
+// Returns null on a git failure -- the merge-base resolution included, so a `ref` with
+// no common ancestor is a refusal and not a wide answer -- which main refuses on rather
+// than silently falling back to the narrow set, a fallback indistinguishable from the
+// no-op this function exists to remove.
 export function worktreeChangedSince(ref, root) {
   const opts = { cwd: root, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 };
-  const tracked = spawnSync("git", ["diff", "--no-renames", "--name-only", ref], opts);
+  const mergeBase = spawnSync("git", ["merge-base", ref, "HEAD"], opts);
+  if (mergeBase.status !== 0) return null;
+  const forkPoint = mergeBase.stdout.trim();
+  if (!forkPoint) return null;
+  const tracked = spawnSync("git", ["diff", "--no-renames", "--name-only", forkPoint], opts);
   if (tracked.status !== 0) return null;
   const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard"], opts);
   if (untracked.status !== 0) return null;
@@ -802,6 +820,13 @@ function main(argv) {
     // worktree" -- CI passes $PR_HEAD_SHA precisely because its worktree is a merge ref
     // carrying master's changes too. Unioning that worktree in would hand every file
     // master touched to the fix scope, which is the widening this flag exists to stop.
+    //
+    // THE MERGE-BASE ANCHOR IN worktreeChangedSince DOES NOT MAKE THIS SUPPRESSION
+    // REDUNDANT, which is the reading to resist: under refs/pull/N/merge the base IS an
+    // ancestor of the merge commit, so the merge base IS the base and the two-dot diff
+    // lists master's files exactly as before. The anchor fixes a branch that is BEHIND
+    // its base; it cannot fix a worktree that already CONTAINS it. Deleting this branch
+    // fails the pinned --head arm of the uncommitted-move test, by design.
     if (argv.includes("--head")) {
       fixScope = changed;
     } else {
