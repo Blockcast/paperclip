@@ -609,14 +609,24 @@ function assertNoAgentStageConfigWorkspaceRuntimeMutation(
  * runtime config, so offering it as the way out of a refusal is a destructive instruction
  * dressed as help. They are separate constants so that the difference is visible at the
  * point a future edit would collapse them.
+ *
+ * ⛔ The PATCH remedy must not say "omit the key" either. A PATCH `config` replaces the stored
+ * config as a whole: `updateStage` (`../services/pipelines.ts`) persists the patch's config in
+ * place of the stored one whenever `config` is present, and `restoreWithheldPipelineStageConfig`
+ * (`../redaction.ts`) restores masked values only for keys the caller sent. A `config` that
+ * drops `workspaceRuntime` therefore deletes the stored value, exactly as `null` does. The two
+ * non-destructive ways out are to leave `config` out of the PATCH, or to send the stage's config
+ * as read with `workspaceRuntime` unchanged.
  */
 const STAGE_RUNTIME_CREATE_REMEDY =
   "Omit the key, or send `null`, to create the stage without one.";
 const STAGE_RUNTIME_PATCH_REMEDY =
-  "Omit the key to leave the stored config untouched - only an UNMODIFIED echo of this stage's "
-  + "own masked config is admitted, and it is restored to the stored value. Do NOT send `null` "
-  + "here: on this route it DELETES the operator's runtime config rather than clearing a "
-  + "redaction marker.";
+  "To keep the stored config, leave `config` out of this PATCH, or send this stage's config as you "
+  + "read it with `workspaceRuntime` unchanged: an UNMODIFIED echo of its masked value is admitted "
+  + "and restored to the stored value. Do NOT drop only the `workspaceRuntime` key from a `config` "
+  + "you send: `config` replaces the stored config as a whole, so that deletes it. Do NOT send "
+  + "`null` here either: on this route it DELETES the operator's runtime config rather than "
+  + "clearing a redaction marker.";
 
 function actorForMutation(req: Request): PipelineActor {
   if (req.actor.type === "agent") {
