@@ -2501,6 +2501,65 @@ export function contextCarriesGithubWake(
   return classifyHeartbeatWakeClass(contextSnapshot) === "github_webhook";
 }
 
+/**
+ * PEN-6629. The clause a cancelled duplicate-dispatch run carries saying which
+ * branch of the cross-reason deferral arm it missed.
+ *
+ * Reaching {@link cancelQueuedRunForDuplicateDispatch} falsifies
+ * `contextCarriesGithubWake(arrival) && !incumbent.has("github_webhook")`, so
+ * exactly one of the two branches below holds and together they are exhaustive.
+ *
+ * (1) The non-github branch spans TWO arrival states and must not let one speak
+ * for the other. `contextCarriesGithubWake` is false for a genuinely
+ * issue-local arrival AND for one whose class was never established:
+ * `classifyHeartbeatWakeClass` returns `null` when `wakeReason` is absent or
+ * unusable, and that `null` reads as false here. Branch SELECTION is correct in
+ * both states — neither arrival can satisfy the deferral arm either way — so
+ * the retired wording was a CLAIM defect, not a control-flow one. It asserted
+ * `issue-local` over a row whose class the code had not read, while the reason
+ * string four clauses earlier had already rendered the same `null` as
+ * `unclassified`, so the sentence contradicted itself. That is the same kind of
+ * over-claim PEN-6575 removed one layer up, in the text this clause sits beside.
+ *
+ * (2) The tracker identifiers below are CITATIONS, never owners. The retired
+ * tail named PEN-6575 as OWNING the population this arm does not reach —
+ * deliberately paraphrased rather than quoted, so the retired literal survives
+ * nowhere in this file and the suite can assert its absence file-wide. That
+ * claim does not decay, it INVERTS. PEN-6575 done-when 3 DECLINED the
+ * cross-reason widening on measurement: it would protect 11 of 26 non-github
+ * cancels while missing all 8 `issue_comment_mentioned` and the 4 destructive
+ * same-reason `issue_commented` kills. So from the moment that row closed, the
+ * string told a reader somebody was on it when the standing decision is that
+ * nobody is. This text is persisted on a cancelled run and admits no adjacent
+ * correction, so it states the decision as fact. The identifiers stay because a
+ * reader of a cancelled run cannot reach this comment, and those rows are the
+ * only address for the census behind the sentence.
+ *
+ * Exported and pure so both claims are pinned by EXECUTION. The surrounding
+ * suite slices this file as text, and that window already had to be widened
+ * once (2_000 -> 4_000) when the function grew past the cut; a short slice fails
+ * toward `not.toContain` passing vacuously, which is the direction that reads
+ * green.
+ */
+export function describeDuplicateDispatchDeferralMiss(
+  arrivalSnapshot: Record<string, unknown> | null | undefined,
+): string {
+  if (contextCarriesGithubWake(arrivalSnapshot)) {
+    return "the incumbent already carries a github wake, so there is no cross-class delivery to protect";
+  }
+  const arrivalClass = classifyHeartbeatWakeClass(arrivalSnapshot);
+  const arrivalDescription =
+    arrivalClass === null
+      ? "of no established class — its wakeReason was absent or unusable"
+      : "issue-local";
+  return (
+    "it defers only a GITHUB arrival against a non-github incumbent, and this arrival is "
+    + `${arrivalDescription}. Arrivals of that kind are uncovered by design, not by oversight: `
+    + "the cross-reason widening was measured and declined (PEN-6575), and the wider rule that "
+    + "would cover them is proposed but not adopted (PEN-6625)"
+  );
+}
+
 type PrReviewFairnessRun = Pick<
   typeof heartbeatRuns.$inferSelect,
   "id" | "createdAt" | "contextSnapshot"
@@ -28346,12 +28405,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //     side — was pointed at a remedy it fails in both positions. It is now
     //     computed, and says which branch THIS row missed.
     //
-    // Reaching here means `contextCarriesGithubWake(arrival) && !incumbent.has("github_webhook")`
-    // was false, so exactly one of these two branches holds and they are exhaustive.
-    const deferralMiss = contextCarriesGithubWake(arrivalSnapshot)
-      ? "the incumbent already carries a github wake, so there is no cross-class delivery to protect"
-      : "it defers only a GITHUB arrival against a non-github incumbent, and this arrival is "
-        + "issue-local — PEN-6575 owns the uncovered population";
+    // PEN-6629. Computed by `describeDuplicateDispatchDeferralMiss`, which reads
+    // the exhaustiveness argument above and additionally splits the non-github
+    // branch's TWO arrival states — issue-local, and class-never-established —
+    // rather than letting one assert the other's class. It cites the tracker
+    // rows instead of naming one as owner of the population this arm misses.
+    // Exported and pure so both of those are pinned by execution rather than by
+    // a text slice of this file.
+    const deferralMiss = describeDuplicateDispatchDeferralMiss(arrivalSnapshot);
     const reason =
       "Cancelled because a sibling run is already dispatched for this issue "
       + `(arrival ${arrivalWakeReason ?? "unclassified"}, in flight ${incumbentDescription}). `
