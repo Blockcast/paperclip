@@ -99,7 +99,13 @@ jobs:
 
       - name: Assert relay pods keep gateway-only ssl_multicert.config
         env:
-          RELAY_SSL_MULTICERT_NAMESPACES: ${{ vars.RELAY_SSL_MULTICERT_NAMESPACES || 'staging-traffic-control,production-traffic-control' }}
+          # Pinned here, not read from vars (BLO-49190). The repo var still listed
+          # staging-blockcastd. That namespace's gateway on the prod cluster is at 0
+          # replicas by design for the staging exit (BLO-44881, S13/S14), so every run
+          # exited 2 (UNOBSERVABLE). Staging now runs on its own cluster, which this
+          # kubeconfig does not reach. Re-adding staging coverage needs a staging-cluster
+          # kubeconfig, not this list.
+          RELAY_SSL_MULTICERT_NAMESPACES: production-blockcastd
           RELAY_SSL_MULTICERT_SELECTOR: ${{ vars.RELAY_SSL_MULTICERT_SELECTOR || 'app=relay-ats' }}
           RELAY_SSL_MULTICERT_CONTAINER: ${{ vars.RELAY_SSL_MULTICERT_CONTAINER || '' }}
           RELAY_SSL_MULTICERT_EXPECTED_LINE: ${{ vars.RELAY_SSL_MULTICERT_EXPECTED_LINE || '' }}
