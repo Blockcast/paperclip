@@ -1421,3 +1421,17 @@ describe("hire_agent approval payload workspace-command withholding (PEN-5225)",
     });
   });
 });
+
+describe("redactSensitiveText cost on long word runs (BLO-57549)", () => {
+  it("stays linear on a long base64-like run and still masks the key that follows it", () => {
+    // 40 KB with no secret stem in it: before the KEY_NAME_START lookbehind the two
+    // JSON-field text rules rescanned the run from every start position (~22 s here).
+    const run = "AbCdEfGh0123456789".repeat(2300).slice(0, 40_000);
+    const input = `blob ${run}.\n"token": "hunter2"`;
+    const startedAt = performance.now();
+    const output = redactSensitiveText(input);
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+    expect(output).toContain(run);
+    expect(output).not.toContain("hunter2");
+  });
+});

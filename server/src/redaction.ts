@@ -113,12 +113,20 @@ const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
 const AGENT_CONFIG_ARGS_KEY_RE = /^args$/i;
 const JWT_VALUE_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 const CLI_SECRET_FLAG_RE = new RegExp(String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`, "i");
+// BLO-57549: the two text rules below are unanchored and SECRET_FIELD_NAME_PATTERN
+// opens with `[A-Za-z0-9_-]*`, so inside one long word-character run (base64, a
+// hash, a minified blob) every start position re-scanned the rest of the run:
+// O(n^2), ~5 s of blocked event loop for a 20 KB run, measured in worker CPU
+// profiles. A key name can only usefully start where that run starts -- a
+// mid-run match always has a leftmost twin at the run start, and `$1` carries the
+// prefix verbatim -- so this lookbehind changes no output, only the cost.
+const KEY_NAME_START = String.raw`(?<![A-Za-z0-9_-])`;
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` + "`" + String.raw`\r\n]+((?:"|'))`,
+  String.raw`((?:"|')?${KEY_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` + "`" + String.raw`\r\n]+((?:"|'))`,
   "gi",
 );
 const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
+  String.raw`((?:\\")?${KEY_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
 const ENV_DUMP_SECRET_KEY_RE =
