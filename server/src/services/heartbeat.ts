@@ -15140,6 +15140,16 @@ export function buildPaperclipTaskMarkdown(input: {
     "If the mirror cannot answer, re-park and record why in the note. Do NOT improvise an instrument: a wake step you cannot execute is a reason to wait, not a licence to invent a substitute under time pressure.",
     "When you WRITE a wake step, name the FACT to read (\"read `mergedAt` on #3110\"), not the command to run (\"`gh pr view` ...\"). Naming the instrument is this surface's job, not the note's -- a note in fact form survives the instrument changing, while one in command form has to be rewritten, and a parked row is exactly what nobody goes back to rewrite.",
   );
+  // BLO-57576: the "never hand-write an authenticated git URL" rule (BLO-36674) lived only
+  // in per-company agent bundles, so it never reached the second tenant, and the
+  // git-credential-at-rest scrubber caught a token-in-URL clone under that
+  // tenant's work dir. Agent bundles are company-scoped and an agent key cannot write
+  // across companies; this surface is loaded by every wake in every company.
+  lines.push(
+    "",
+    "Cloning a GitHub repository:",
+    "Clone and set remotes with a PLAIN URL (`https://github.com/<owner>/<repo>`). Agent pods carry a system-wide git credential helper that authenticates private repos with nothing left on disk. NEVER put a token in the URL (the `x-access-token` userinfo form): it stores a live credential in `.git/config` on the shared volume every agent can read, `git remote -v` prints it into your transcript, and it breaks the clone's own push path within the hour because the installation token expires and the URL does not. If a plain-URL git operation fails auth, report that; do not paste a token into the URL.",
+  );
   // PEN-6271: stated BEFORE the breach rather than after it. Until this block existed the
   // only place the fleet was ever told a `triggered` monitor is an obligation was
   // `monitorRecoveryComment`, which is minted once the obligation has already been missed
