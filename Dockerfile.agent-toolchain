@@ -233,15 +233,18 @@ RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
 
 # kind (in-Docker Kubernetes) — magma/cdn/fab/k8s_ops.py detects the
 # `kind-kind` context as a first-class local runtime alongside minikube.
-ARG KIND_VERSION=v0.24.0
+# Pins below are kept on releases built with go >= 1.25.7: older builds carry
+# stdlib CVE-2025-68121 (Critical), which Harbor reports on every downstream image (BLO-56939).
+ARG KIND_VERSION=v0.33.0
 RUN curl -fsSL "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" \
        -o /usr/local/bin/kind \
-  && chmod +x /usr/local/bin/kind
+  && chmod +x /usr/local/bin/kind \
+  && kind version | grep -Fq "${KIND_VERSION} "
 
 # kubelogin (kubectl-oidc_login) — matches devbox 03-k8s-tools.sh; needed
 # for OIDC-authed kubeconfigs that paperclip-0 will start handing to agents
 # once the kubernetes-admin@kubernetes context is rotated out.
-ARG KUBELOGIN_VERSION=v1.30.1
+ARG KUBELOGIN_VERSION=v1.36.4
 RUN curl -fsSL "https://github.com/int128/kubelogin/releases/download/${KUBELOGIN_VERSION}/kubelogin_linux_amd64.zip" \
        -o /tmp/kubelogin.zip \
   && unzip -d /tmp /tmp/kubelogin.zip \
@@ -255,10 +258,10 @@ RUN curl -fsSL "https://github.com/int128/kubelogin/releases/download/${KUBELOGI
 # ROOT_TOOLCHAIN_SUBPATHS, so it is mounted into every agent pod off a single
 # CephFS volume handle: a tool nobody can reach without the shared mount is a
 # tool that keeps the mount, and the mount is what gives one hung
-# NodeUnstageVolume a whole node's blast radius. Version matches what the PVC
-# carried when it was inventoried (2026-10-28) so baking it changes no agent's
-# observed behaviour.
-ARG YQ_VERSION=v4.44.3
+# NodeUnstageVolume a whole node's blast radius. Originally pinned to the PVC's
+# v4.44.3 (inventoried 2026-10-28); bumped because that build is go1.22.5 and
+# carries stdlib CVE-2025-68121 (BLO-56939).
+ARG YQ_VERSION=v4.54.3
 RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
        -o /usr/local/bin/yq \
   && chmod +x /usr/local/bin/yq \
