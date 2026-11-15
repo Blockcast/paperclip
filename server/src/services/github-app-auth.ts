@@ -688,11 +688,6 @@ export type OpenPullRequestsOnBaseResult =
 const OPEN_PRS_ON_BASE_PAGE_SIZE = 100;
 
 /**
- * Pure payload parse, split from the fetch so the decision logic is testable
- * without network or credentials — the same injection-seam reasoning as
- * `ReadPullRequestGate` in the terminal-gate reconciler.
- */
-/**
  * Map a LIST reader's `ghGraphQlListPullRequests` failure onto the
  * `<surface>_*` vocabulary its REST pager emitted, so the strings already
  * recorded in tests and in the stacked-PR warn diagnostics stay recognisable
@@ -712,6 +707,11 @@ function graphQlListFailureReason(surface: string, reason: string): string {
   return `${surface}_${reason}`;
 }
 
+/**
+ * Pure payload parse, split from the fetch so the decision logic is testable
+ * without network or credentials — the same injection-seam reasoning as
+ * `ReadPullRequestGate` in the terminal-gate reconciler.
+ */
 export function parseOpenPullRequestsOnBasePayload(page: GraphQlPullRequestPage): OpenPullRequestsOnBaseResult {
   // An unreadable page is not an empty one. Reporting `[]` would be a
   // confident "this branch had no stacked children" for a response we could
@@ -782,13 +782,18 @@ const OPEN_PRS_AT_HEAD_PAGE_SIZE = 100;
 const OPEN_PRS_AT_HEAD_HARD_LIMIT_PAGES = 10;
 
 /**
- * Pure payload parse, split from the fetch for the same injection-seam reason
- * as `parseOpenPullRequestsOnBasePayload`.
+ * Pure page parse, split from the fetch for the same injection-seam reason as
+ * `parseOpenPullRequestsOnBasePayload`.
  *
- * Filters on BOTH `state === "open"` and `head.sha === sha`, and neither
- * predicate is redundant:
+ * Named `...Page` rather than `...Payload` because it no longer takes one:
+ * PEN-6341 item 2 slice 4 moved this reader to
+ * {@link ghGraphQlCommitAssociatedPullRequests}, and the REST body the old
+ * name described does not exist on this path any more.
  *
- * - `GET /commits/{sha}/pulls` returns every pull request this commit is
+ * Filters on BOTH `state` and `headRefOid`, and neither predicate is
+ * redundant:
+ *
+ * - `Commit.associatedPullRequests` returns every pull request this commit is
  *   *associated* with, which includes closed and merged ones. A verdict is only
  *   a property of the heads that can still merge, and a closed PR's stale red
  *   would pin an open sibling red forever with no lever to clear it.
@@ -799,24 +804,31 @@ const OPEN_PRS_AT_HEAD_HARD_LIMIT_PAGES = 10;
  *   that nobody has reviewed, and a descendant's clean review hide a finding
  *   raised here.
  *
- * A malformed body is an error, never an empty page — the same refusal as
- * `parseOpenPullRequestsOnBasePayload`, and load-bearing here: the one caller
- * reads "no peers" as licence to publish its own verdict unchanged.
+ * ⛔ A MALFORMED ROW IS AN ERROR HERE, WHERE THE REST PARSE SKIPPED IT, AND
+ * THAT IS A DELIBERATE TIGHTENING RATHER THAN AN INHERITED DEFAULT. Under
+ * REST a malformed entry was a value GitHub does not emit. Under GraphQL the
+ * same counter covers an UNRESOLVABLE node -- a row the connection counted and
+ * this token cannot read -- which is a routine outcome of an installation
+ * token meeting a private fork, and it renders as a confident SHORTER list
+ * rather than as any kind of failure. The one caller reads "no peers" as
+ * licence to publish its own green, so a list that is short for a reason it
+ * cannot see IS the PEN-3818 bypass. Unreadable, never fewer.
+ *
+ * An unreadable page is likewise an error, never an empty one.
  */
-export function parseOpenPullRequestsAtHeadPayload(body: unknown, sha: string): OpenPullRequestsAtHeadResult {
-  if (!Array.isArray(body)) return { error: "open_pull_requests_at_head_malformed" };
+export function parseOpenPullRequestsAtHeadPage(
+  page: GraphQlCommitPullRequestPage,
+  sha: string,
+): OpenPullRequestsAtHeadResult {
+  if (!page.ok) return { error: graphQlListFailureReason("open_pull_requests_at_head", page.reason) };
+  if (page.malformed > 0) return { error: "open_pull_requests_at_head_malformed" };
 
   const pullRequests: OpenPullRequestAtHead[] = [];
-  for (const entry of body as Array<Record<string, unknown>>) {
-    const number = entry?.number;
-    if (!Number.isInteger(number)) continue;
-    if (entry?.state !== "open") continue;
-    const head = entry?.head as Record<string, unknown> | undefined;
-    if (typeof head?.sha !== "string" || head.sha.toLowerCase() !== sha.toLowerCase()) continue;
-    pullRequests.push({
-      number: number as number,
-      url: typeof entry?.html_url === "string" ? entry.html_url : null,
-    });
+  for (const entry of page.pullRequests) {
+    if (entry.state !== "OPEN") continue;
+    if (typeof entry.headRefOid !== "string") continue;
+    if (entry.headRefOid.toLowerCase() !== sha.toLowerCase()) continue;
+    pullRequests.push({ number: entry.number, url: entry.url });
   }
   return { pullRequests };
 }
@@ -851,9 +863,16 @@ export function parseOpenPullRequestsAtHeadPayload(body: unknown, sha: string): 
  * - The association index can LAG for a brand-new pull request. That lag does
  *   not run in the bypass's direction — the victim is the long-open PR, indexed
  *   long ago — and the caller skips its own row regardless.
- * - Once the commit is on the DEFAULT BRANCH, GitHub documents this endpoint as
- *   returning only the pull request that merged it. A victim head on the default
- *   branch is already merged, so no gate decision rides on it.
+ * - Once the commit is on the DEFAULT BRANCH, GitHub documents the REST
+ *   endpoint this used to call as returning only the pull request that merged
+ *   it. A victim head on the default branch is already merged, so no gate
+ *   decision rides on it either way. ⚠ PEN-6341 item 2 slice 4 moved this to
+ *   GraphQL `Commit.associatedPullRequests`, and NOTHING HERE ESTABLISHES that
+ *   the same narrowing applies to that field -- it is documented of the REST
+ *   route, and the migration did not re-measure it. Recorded as unverified
+ *   rather than carried across as though it had been, and it does not change
+ *   the conclusion: the reachable direction is MORE rows, not fewer, and the
+ *   `headRefOid` filter drops those anyway.
  */
 export async function githubListOpenPullRequestsForHeadSha(input: {
   repoFullName: string;
@@ -862,37 +881,41 @@ export async function githubListOpenPullRequestsForHeadSha(input: {
 }): Promise<OpenPullRequestsAtHeadResult> {
   const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return { error: "open_pull_requests_at_head_no_token" };
-  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
-  const apiBase = gitHubApiBase(GITHUB_HOST);
   const pullRequests: OpenPullRequestAtHead[] = [];
 
-  try {
-    for (let page = 1; page <= OPEN_PRS_AT_HEAD_HARD_LIMIT_PAGES; page += 1) {
-      const url =
-        `${apiBase}/repos/${input.repoFullName}/commits/${encodeURIComponent(input.sha)}/pulls` +
-        `?per_page=${OPEN_PRS_AT_HEAD_PAGE_SIZE}&page=${page}`;
-      const res = await ghFetch(url, { headers, signal: input.signal });
-      if (!res.ok) {
-        const classified = await classifyGithubHttpFailure("pull_request", res);
-        return { error: classified.reason };
-      }
-      const body = (await res.json().catch(() => null)) as unknown;
-      const parsed = parseOpenPullRequestsAtHeadPayload(body, input.sha);
-      if ("error" in parsed) return parsed;
-      pullRequests.push(...parsed.pullRequests);
-      // Paginate on the RAW page length, not on the filtered count: the filters
-      // above drop closed and non-head rows, so a full page can contribute zero
-      // open peers and still be followed by a page that contributes several.
-      if (!Array.isArray(body) || body.length < OPEN_PRS_AT_HEAD_PAGE_SIZE) return { pullRequests };
-    }
-    // Ran out of pages rather than running out of results. A truncated
-    // enumeration cannot support "no other PR at this head is red", so it is an
-    // error, not a prefix — same reason the comment pagination hard limit
-    // returns null rather than what it had.
-    return { error: "open_pull_requests_at_head_truncated" };
-  } catch {
-    return { error: "open_pull_requests_at_head_fetch_failed" };
+  let cursor: string | null = null;
+  for (let page = 1; page <= OPEN_PRS_AT_HEAD_HARD_LIMIT_PAGES; page += 1) {
+    const result: GraphQlCommitPullRequestPage = await ghGraphQlCommitAssociatedPullRequests({
+      token,
+      repoFullName: input.repoFullName,
+      sha: input.sha,
+      first: OPEN_PRS_AT_HEAD_PAGE_SIZE,
+      cursor,
+      signal: input.signal,
+    });
+    const parsed = parseOpenPullRequestsAtHeadPage(result, input.sha);
+    if ("error" in parsed) return parsed;
+    pullRequests.push(...parsed.pullRequests);
+
+    // PEN-6341: the stop condition is now `pageInfo.hasNextPage`, an explicit
+    // statement by the server, where the REST loop had to INFER it from a page
+    // coming back short. Same direction as the base-list reader: it moves only
+    // toward fewer false "there may be more", because a page that happens to
+    // hold exactly OPEN_PRS_AT_HEAD_PAGE_SIZE rows is no longer followed by a
+    // speculative request. `result.ok` is implied -- `parsed` would have
+    // returned above otherwise -- but is narrowed explicitly for the compiler.
+    if (!result.ok) return { error: "open_pull_requests_at_head_malformed" };
+    if (!result.hasNextPage) return { pullRequests };
+    cursor = result.endCursor;
+    // A cursorless "there is more" cannot be followed, and silently stopping
+    // here would report a PREFIX as the whole enumeration.
+    if (cursor === null) return { error: "open_pull_requests_at_head_truncated" };
   }
+  // Ran out of pages rather than running out of results. A truncated
+  // enumeration cannot support "no other PR at this head is red", so it is an
+  // error, not a prefix -- same reason the comment pagination hard limit
+  // returns null rather than what it had.
+  return { error: "open_pull_requests_at_head_truncated" };
 }
 
 export type BranchState = "exists" | "deleted" | "unknown";
@@ -2060,18 +2083,30 @@ export type GitHubPullRequestCommitsResult =
   | { commits: GitHubPullRequestCommit[]; truncated: boolean }
   | { error: string };
 
-/** Cap on `/pulls/{n}/commits` pages. GitHub itself truncates this endpoint at 250 commits. */
+/** Cap on PR-commit pages read. GitHub's REST route truncated at 250 commits; see below. */
 export const GITHUB_PR_COMMITS_MAX_PAGES = 3;
 
 /**
- * GitHub's own ceiling on `/pulls/{n}/commits`: "Lists a maximum of 250
- * commits for a pull request." It is announced nowhere in the response -- the
- * endpoint just stops, so a 250-commit page-out looks exactly like a PR that
- * has 250 commits and no more. This ceiling, not {@link
- * GITHUB_PR_COMMITS_MAX_PAGES}, is what actually truncates in practice: 250 <
- * 3 * 100, so the page loop always breaks on a short page first and never
- * reaches its own cap. Both are still checked -- the page cap is the one that
- * bites if `per_page` or the cap is ever retuned.
+ * Rows per page. 100 is the GraphQL connection maximum for `first`, and it is
+ * the `per_page` the REST pager used, so the page budget means the same number
+ * of commits across the transport change (PEN-6341 item 2 slice 4).
+ */
+export const GITHUB_PR_COMMITS_PAGE_SIZE = 100;
+
+/**
+ * GitHub's own ceiling on the REST route `/pulls/{n}/commits`: "Lists a
+ * maximum of 250 commits for a pull request." It was announced nowhere in the
+ * response -- the endpoint just stopped, so a 250-commit page-out looked
+ * exactly like a PR that has 250 commits and no more.
+ *
+ * ⚠ PEN-6341 item 2 slice 4 moved this reader to GraphQL, where truncation is
+ * stated by `pageInfo.hasNextPage` and nothing has to be inferred from a short
+ * page. WHETHER THE 250 CEILING EXISTS ON THE GraphQL CONNECTION AT ALL IS
+ * UNMEASURED -- see the comment at the use site in
+ * {@link githubListPullRequestCommits} for why it could not be measured and
+ * why the check is kept regardless. It is now a CONSERVATIVE arm rather than a
+ * forced one: it preserves the REST reader's behaviour exactly on every input,
+ * and it covers the case where GraphQL caps silently too.
  */
 export const GITHUB_PR_COMMITS_ENDPOINT_LIMIT = 250;
 
@@ -2097,58 +2132,56 @@ export async function githubListPullRequestCommits(input: {
   const token = await getInstallationToken();
   if (!token) return { error: "no_token" };
 
-  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
-  const apiBase = gitHubApiBase(GITHUB_HOST);
   const commits: GitHubPullRequestCommit[] = [];
   let truncated = false;
+  let cursor: string | null = null;
 
   for (let page = 1; page <= GITHUB_PR_COMMITS_MAX_PAGES; page += 1) {
-    const url =
-      `${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}/commits`
-      + `?per_page=100&page=${page}`;
-    let res: Response;
-    try {
-      res = await ghFetch(url, { headers });
-    } catch {
-      return { error: "pr_commits_fetch_failed" };
-    }
-    if (!res.ok) {
-      const classified = await classifyGithubHttpFailure("pr_commits", res);
-      return { error: classified.reason };
-    }
+    const result: GraphQlPullRequestCommitPage = await ghGraphQlPullRequestCommits({
+      token,
+      repoFullName: input.repoFullName,
+      prNumber: input.prNumber,
+      first: GITHUB_PR_COMMITS_PAGE_SIZE,
+      cursor,
+    });
+    if (!result.ok) return { error: graphQlPrCommitsFailureReason(result.reason) };
+    commits.push(...result.commits);
 
-    let batch: Array<Record<string, unknown>>;
-    try {
-      batch = (await res.json()) as Array<Record<string, unknown>>;
-    } catch {
-      return { error: "pr_commits_parse_failed" };
+    if (!result.hasNextPage) break;
+    cursor = result.endCursor;
+    // "There is more" with no cursor to follow is a short read, not an end.
+    if (cursor === null) {
+      truncated = true;
+      break;
     }
-    if (!Array.isArray(batch)) return { error: "pr_commits_unexpected_shape" };
-
-    for (const entry of batch) {
-      const sha = typeof entry.sha === "string" ? entry.sha : null;
-      if (!sha) continue;
-      const commit = entry.commit as Record<string, unknown> | undefined;
-      const author = commit?.author as Record<string, unknown> | undefined;
-      const parents = Array.isArray(entry.parents) ? entry.parents : [];
-      commits.push({
-        sha,
-        authorEmail: typeof author?.email === "string" ? author.email : null,
-        authorName: typeof author?.name === "string" ? author.name : null,
-        parentCount: parents.length,
-      });
-    }
-
-    if (batch.length < 100) break;
-    // A full last page with no pages left: our own cap cut the listing short.
+    // A further page exists and we have no budget left: our own cap cut the
+    // listing short. Under REST this had to be inferred from a full last page;
+    // `hasNextPage` states it.
     if (page === GITHUB_PR_COMMITS_MAX_PAGES) truncated = true;
   }
 
-  // GitHub's 250 ceiling reports itself as a short page, so the loop above
-  // exits believing it read to the end. Landing on the ceiling is the only
-  // signal there is, and it is deliberately fail-closed: a PR with exactly
-  // 250 commits is flagged too, because nothing in the response distinguishes
-  // it from one with 400.
+  // PEN-6341 item 2 slice 4: KEPT ON PURPOSE, and keeping it is the whole
+  // decision this site turns on.
+  //
+  // Under REST this arm was FORCED -- GitHub's 250 ceiling announced itself
+  // only as a short page, so a page-out and a PR with exactly 250 commits were
+  // the same observation. Under GraphQL `hasNextPage` is explicit, so the
+  // inference is gone and this arm is no longer forced. Dropping it would be a
+  // LOOSENING of a fail-closed input to a review-gate authorship decision --
+  // a 250-to-300-commit PR that reads `truncated: true` today would start
+  // reading `false` -- and that is a behavioural change to a security control
+  // which must be deliberate and measured, never inherited from a transport
+  // swap.
+  //
+  // ⛔ IT CANNOT BE MEASURED HERE. The decisive specimen is a PR with more than
+  // 250 commits, and there is none to measure against: a census of the 100
+  // most-recently-updated pull requests in each of `Blockcast/paperclip` and
+  // `Blockcast/penstock-llm-proxy-core` on 2026-11-15 returned a MAXIMUM of 16
+  // commits (6 and 16 respectively). So the choice is between inheriting an
+  // unmeasured loosening and staying conservative in a band that provably
+  // contains no pull request in either repo. This stays conservative: behaviour
+  // is byte-identical to the REST reader on every input, and if GraphQL turns
+  // out to cap silently too, this arm still covers it.
   if (commits.length >= GITHUB_PR_COMMITS_ENDPOINT_LIMIT) truncated = true;
 
   return { commits, truncated };
@@ -3054,8 +3087,7 @@ export type PullRequestReviewsResult =
  * for a missing key rather than dropping the row. Dropping it would be a
  * silent truncation of the very list the polarity note above refuses to
  * truncate.
- */
-/**
+ *
  * PEN-6341 item 2 (deferred nit, `#3768`): `commit { oid }` is the GraphQL
  * field standing in for REST's `commit_id`, and NOTHING HERE ESTABLISHES
  * whether GraphQL re-anchors an `APPROVED` review's commit forward onto a new
@@ -3400,6 +3432,298 @@ export async function ghGraphQlListPullRequests(input: {
   const rawCursor: unknown = connection.pageInfo?.endCursor;
   const endCursor = typeof rawCursor === "string" && rawCursor.length > 0 ? rawCursor : null;
   return { ok: true, pullRequests, malformed, hasNextPage, endCursor };
+}
+
+const COMMIT_ASSOCIATED_PULL_REQUESTS_QUERY = `
+query($owner: String!, $name: String!, $oid: GitObjectID!, $first: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $oid) {
+      ... on Commit {
+        associatedPullRequests(first: $first, after: $cursor) {
+          totalCount
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            number
+            url
+            state
+            headRefOid
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/** One row of `Commit.associatedPullRequests`, reduced to the two predicates the caller filters on. */
+export type GraphQlCommitPullRequest = {
+  number: number;
+  url: string | null;
+  /** The GraphQL enum, UPPERCASE -- `OPEN` where REST answered `"open"`. */
+  state: string | null;
+  headRefOid: string | null;
+};
+
+export type GraphQlCommitPullRequestPage =
+  | {
+      ok: true;
+      pullRequests: GraphQlCommitPullRequest[];
+      /**
+       * Rows the connection counted but this read could not turn into a usable
+       * row -- an unresolvable `null` node, a non-object, or an unreadable
+       * `number`. Counted rather than dropped, and the caller MUST consult it:
+       * see {@link ghGraphQlCommitAssociatedPullRequests}.
+       */
+      malformed: number;
+      hasNextPage: boolean;
+      endCursor: string | null;
+    }
+  | { ok: false; reason: string };
+
+type CommitPullRequestNode = {
+  number?: unknown;
+  url?: unknown;
+  state?: unknown;
+  headRefOid?: unknown;
+};
+
+type CommitAssociatedPullRequestsResponse = {
+  repository?: {
+    object?: {
+      associatedPullRequests?: {
+        totalCount?: unknown;
+        pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+        nodes?: unknown;
+      } | null;
+    } | null;
+  } | null;
+};
+
+/**
+ * ONE page of `Commit.associatedPullRequests` (PEN-6341 item 2, slice 4).
+ *
+ * Replaces `GET /repos/{repo}/commits/{sha}/pulls`. Both of the caller's
+ * predicates become FIRST-CLASS FIELDS here -- `state` and `headRefOid` --
+ * where the REST parse had to reach into `head.sha`.
+ *
+ * `totalCount` IS SELECTED AND IS LOAD-BEARING, and this is the one place the
+ * migration is stricter than the REST reader it replaces. A GraphQL connection
+ * counts rows the token cannot resolve and renders each as a `null` node, so
+ * mapping `nodes[]` alone hands back a well-formed, confident, SHORTER list:
+ * not an error, not an empty, not a 403, and invisible to every polarity guard
+ * that keys on absence. Measured on `PullRequest.reviewRequests` during this
+ * item's slice-4 semantics review -- 15 of 15 open PRs returned
+ * `totalCount: 2` with exactly ONE node resolving. For THIS enumeration a
+ * short list is the PEN-3818 bypass itself, so the shortfall is folded into
+ * `malformed` and the parse refuses on it.
+ *
+ * Fails closed on every path. `object: null` -- an unknown oid, or a commit
+ * this token cannot read -- is UNREADABLE, never "associated with no pull
+ * requests".
+ *
+ * ⚠ `GitObjectID!` requires the FULL 40-hex sha; an abbreviation is rejected
+ * by the server as a variable-coercion error where REST resolved it. Measured
+ * live 2026-11-15. That lands on `graphql_errors`, i.e. fail-CLOSED, which is
+ * the right side for this gate -- but it is a real narrowing, so callers must
+ * pass the full head sha they already hold.
+ */
+export async function ghGraphQlCommitAssociatedPullRequests(input: {
+  token: string;
+  repoFullName: string;
+  sha: string;
+  first: number;
+  cursor?: string | null;
+  signal?: AbortSignal;
+}): Promise<GraphQlCommitPullRequestPage> {
+  const [owner, name, ...rest] = input.repoFullName.split("/");
+  if (!owner || !name || rest.length > 0) return { ok: false, reason: "repo_full_name_invalid" };
+
+  const result = await ghGraphQlQuery<CommitAssociatedPullRequestsResponse>({
+    token: input.token,
+    query: COMMIT_ASSOCIATED_PULL_REQUESTS_QUERY,
+    variables: {
+      owner,
+      name,
+      oid: input.sha,
+      first: input.first,
+      cursor: input.cursor ?? null,
+    },
+    signal: input.signal,
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+
+  // A null `object` is NOT an empty association set: REST answered 404 for a
+  // commit it could not see, and the caller mapped that onto unreadable.
+  const commit = result.data.repository?.object;
+  if (!commit || typeof commit !== "object") return { ok: false, reason: "commit_absent" };
+  const connection = commit.associatedPullRequests;
+  if (!connection || typeof connection !== "object") return { ok: false, reason: "commit_absent" };
+  if (!Array.isArray(connection.nodes)) return { ok: false, reason: "payload_malformed" };
+
+  const pullRequests: GraphQlCommitPullRequest[] = [];
+  let malformed = 0;
+  for (const node of connection.nodes) {
+    if (!node || typeof node !== "object") {
+      malformed += 1;
+      continue;
+    }
+    const row = node as CommitPullRequestNode;
+    if (typeof row.number !== "number" || !Number.isInteger(row.number)) {
+      malformed += 1;
+      continue;
+    }
+    pullRequests.push({
+      number: row.number,
+      url: typeof row.url === "string" ? row.url : null,
+      state: typeof row.state === "string" ? row.state.toUpperCase() : null,
+      headRefOid: typeof row.headRefOid === "string" ? row.headRefOid : null,
+    });
+  }
+
+  // The resolve-shortfall arm. `nodes` is capped at `first`, so compare against
+  // the page that was actually asked for, never against the whole connection.
+  const total = typeof connection.totalCount === "number" ? connection.totalCount : null;
+  if (total !== null) {
+    const expectedOnThisPage = Math.min(total, input.first);
+    const shortfall = expectedOnThisPage - (pullRequests.length + malformed);
+    if (shortfall > 0) malformed += shortfall;
+  }
+
+  const hasNextPage = connection.pageInfo?.hasNextPage === true;
+  const rawCursor: unknown = connection.pageInfo?.endCursor;
+  const endCursor = typeof rawCursor === "string" && rawCursor.length > 0 ? rawCursor : null;
+  return { ok: true, pullRequests, malformed, hasNextPage, endCursor };
+}
+
+const PULL_REQUEST_COMMITS_QUERY = `
+query($owner: String!, $name: String!, $number: Int!, $first: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(first: $first, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          commit {
+            oid
+            author { email name }
+            parents { totalCount }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+/**
+ * Map a `ghGraphQlPullRequestCommits` failure onto the `pr_commits_*`
+ * vocabulary the REST pager emitted.
+ *
+ * Deliberately NOT {@link graphQlListFailureReason}, which is the same shape
+ * and a DIFFERENT mapping: that one spells a malformed payload
+ * `<surface>_malformed`, where this reader spelled it
+ * `pr_commits_unexpected_shape`. Folding the two would silently re-spell a
+ * reason that is already in the foreign-commit notice's warn diagnostics.
+ */
+function graphQlPrCommitsFailureReason(reason: string): string {
+  if (reason === "transport") return "pr_commits_fetch_failed";
+  if (reason === "payload_malformed") return "pr_commits_unexpected_shape";
+  return `pr_commits_${reason}`;
+}
+
+export type GraphQlPullRequestCommitPage =
+  | {
+      ok: true;
+      commits: GitHubPullRequestCommit[];
+      hasNextPage: boolean;
+      endCursor: string | null;
+    }
+  | { ok: false; reason: string };
+
+type PullRequestCommitNode = {
+  commit?: {
+    oid?: unknown;
+    author?: { email?: unknown; name?: unknown } | null;
+    parents?: { totalCount?: unknown } | null;
+  } | null;
+};
+
+type PullRequestCommitsResponse = {
+  repository?: {
+    pullRequest?: {
+      commits?: {
+        totalCount?: unknown;
+        pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+        nodes?: unknown;
+      } | null;
+    } | null;
+  } | null;
+};
+
+/**
+ * ONE page of `PullRequest.commits` (PEN-6341 item 2, slice 4).
+ *
+ * Replaces `GET /repos/{repo}/pulls/{n}/commits`. Every field the caller
+ * decides on survives the move and two of them get BETTER defined:
+ * `parents { totalCount }` IS `parents.length` without materialising the
+ * parents, and `commit.author.email` is still the per-agent git identity
+ * BLO-19528 needs rather than the shared App login.
+ *
+ * A node whose `commit` is unreadable is SKIPPED, exactly as the REST parse
+ * skipped an entry with no `sha`. That is deliberately NOT the stricter
+ * treatment {@link ghGraphQlCommitAssociatedPullRequests} gives a shortfall:
+ * there a short list is a merge-control bypass, here it is reported to the
+ * caller as `truncated` through the ordinary completeness path, which already
+ * exists and already fails closed.
+ */
+export async function ghGraphQlPullRequestCommits(input: {
+  token: string;
+  repoFullName: string;
+  prNumber: number;
+  first: number;
+  cursor?: string | null;
+  signal?: AbortSignal;
+}): Promise<GraphQlPullRequestCommitPage> {
+  const [owner, name, ...rest] = input.repoFullName.split("/");
+  if (!owner || !name || rest.length > 0) return { ok: false, reason: "repo_full_name_invalid" };
+
+  const result = await ghGraphQlQuery<PullRequestCommitsResponse>({
+    token: input.token,
+    query: PULL_REQUEST_COMMITS_QUERY,
+    variables: {
+      owner,
+      name,
+      number: input.prNumber,
+      first: input.first,
+      cursor: input.cursor ?? null,
+    },
+    signal: input.signal,
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+
+  // `pullRequest: null` is REST's 404 for an absent PR or an unreadable repo;
+  // the REST reader turned that into an error, never an empty commit list.
+  const connection = result.data.repository?.pullRequest?.commits;
+  if (!connection || typeof connection !== "object") return { ok: false, reason: "not_found" };
+  if (!Array.isArray(connection.nodes)) return { ok: false, reason: "payload_malformed" };
+
+  const commits: GitHubPullRequestCommit[] = [];
+  for (const node of connection.nodes) {
+    if (!node || typeof node !== "object") continue;
+    const commit = (node as PullRequestCommitNode).commit;
+    const oid = commit?.oid;
+    if (typeof oid !== "string" || oid.length === 0) continue;
+    const parents = commit?.parents?.totalCount;
+    commits.push({
+      sha: oid,
+      authorEmail: typeof commit?.author?.email === "string" ? commit.author.email : null,
+      authorName: typeof commit?.author?.name === "string" ? commit.author.name : null,
+      parentCount: typeof parents === "number" && Number.isInteger(parents) ? parents : 0,
+    });
+  }
+
+  const hasNextPage = connection.pageInfo?.hasNextPage === true;
+  const rawCursor: unknown = connection.pageInfo?.endCursor;
+  const endCursor = typeof rawCursor === "string" && rawCursor.length > 0 ? rawCursor : null;
+  return { ok: true, commits, hasNextPage, endCursor };
 }
 
 /**
