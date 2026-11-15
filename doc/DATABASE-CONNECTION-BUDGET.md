@@ -9,7 +9,7 @@ budget to check it against. BLO-37330.
 
 ## The ceiling
 
-Read 2026-09-28 from the production instance, via the `pg_settings_*` metrics
+Read 2026-11-15 from the production instance, via the `pg_settings_*` metrics
 the `heartbeat-run-queue-latency-exporter` postgres-exporter publishes to
 Prometheus. No credential is needed to re-read this.
 
