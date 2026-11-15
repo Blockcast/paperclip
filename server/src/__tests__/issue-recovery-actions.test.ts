@@ -12994,6 +12994,81 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(issue!.assigneeAgentId).not.toBe(coderId);
     });
 
+    // PEN-6735: `classifyRunLiveness` returns `completed` from its
+    // `issueStatus === "done" || issueStatus === "cancelled"` branch, which short-circuits
+    // ABOVE the first consultation of `concreteEvidence`. So a succeeded run that merely
+    // woke onto an already-terminal row is classified `completed` whether or not it did
+    // anything, and the classification writes a null `lastUsefulActionAt` alongside it.
+    // The recency `coalesce` then falls through to `finishedAt`, so before the fix this
+    // no-op satisfied the gate and the strand was handed back to an owner that had not
+    // recovered. The terminal row is a DIFFERENT row from the one being handed back — the
+    // predicate is agent-scoped by design — so "a done row has nothing to recover" does
+    // not reach this.
+    it("skips when the return owner's only positive run is a no-op classified `completed` on a terminal row", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedMisownedBlockedRow({
+        withRunEvidence: false,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "succeeded",
+        livenessState: "completed",
+        startedAt: new Date(NOW.getTime() - 60 * 60 * 1000),
+        finishedAt: new Date(NOW.getTime() - 30 * 60 * 1000),
+        lastOutputAt: new Date(NOW.getTime() - 30 * 60 * 1000),
+        // What `classifyAndPersistRunLiveness` writes in the SAME `UPDATE` as
+        // `livenessState` when `concreteEvidence` is false, whatever the terminal state
+        // (PEN-4035). Recent `finishedAt` and `lastOutputAt` are the point: the run is
+        // inside the window on every clock the recency check can reach, and is still
+        // not evidence of work.
+        lastUsefulActionAt: null,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 0, noRunEvidenceSkipped: 1 });
+      expect(result.residual).toContainEqual(
+        expect.objectContaining({ issueId: sourceIssueId, reason: "no_positive_run_evidence" }),
+      );
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).not.toBe(coderId);
+    });
+
+    // The must-pass arm of the same change, and the reason the PEN-6735 conjunct sits
+    // INSIDE the `completed` arm rather than beside it. `advanced` is reachable only from
+    // `if (concreteEvidence)`, so the state is already the evidence; and the recency
+    // `coalesce` is what keeps this arm honest for adapters (`opencode_k8s`) that never
+    // stamp `lastUsefulActionAt` during the run. A regression that hoists the conjunct up
+    // to the whole predicate would silently exclude every agent on those adapters, and
+    // fails here rather than in production.
+    it("still accepts an `advanced` run whose `lastUsefulActionAt` was never stamped", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedMisownedBlockedRow({
+        withRunEvidence: false,
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId: coderId,
+        invocationSource: "manual",
+        status: "succeeded",
+        livenessState: "advanced",
+        startedAt: new Date(NOW.getTime() - 60 * 60 * 1000),
+        finishedAt: new Date(NOW.getTime() - 30 * 60 * 1000),
+        lastOutputAt: new Date(NOW.getTime() - 30 * 60 * 1000),
+        lastUsefulActionAt: null,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn(async () => null) } as any);
+
+      const result = await recovery.reconcileStrandedRecoveryHandBacks({ companyId, now: NOW });
+
+      expect(result).toMatchObject({ checked: 1, handedBack: 1, failed: 0 });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(issue!.assigneeAgentId).toBe(coderId);
+    });
+
     it("enqueues no wake, leaving the blockers-resolved sweep to wake the new owner", async () => {
       const { companyId } = await seedMisownedBlockedRow();
       const enqueueWakeup = vi.fn(async () => null);
