@@ -84,6 +84,15 @@ test("API deployment hard-enforces node spread by default (BLO-20901)", () => {
   assert.match(rendered, /preferredDuringSchedulingIgnoredDuringExecution:/);
 });
 
+test("API deployment also spreads across hypervisor zones (BLO-57414)", () => {
+  const rendered = renderTemplate();
+  // Soft, so a hypervisor loss can never park the replacement Pending.
+  assert.match(
+    rendered,
+    /topologyKey: topology\.kubernetes\.io\/zone\n\s+whenUnsatisfiable: ScheduleAnyway\n\s+matchLabelKeys:\n\s+- pod-template-hash\n\s+labelSelector:\n\s+matchLabels:\n(\s+.*\n)*?\s+app\.kubernetes\.io\/component: api/,
+  );
+});
+
 test("API deployment drops the hard constraint when spreadAcrossNodes is disabled", () => {
   const rendered = renderTemplate(["--set", "api.spreadAcrossNodes=false"]);
 

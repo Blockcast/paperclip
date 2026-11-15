@@ -170,6 +170,20 @@ spec:
           labelSelector:
             matchLabels:
               {{- include "paperclip.apiSelectorLabels" . | nindent 14 }}
+        # BLO-57414: the hostname spread above lets both replicas share one
+        # hypervisor (zone = Proxmox host). On 2026-11-15 both sat on pve2
+        # nodes, pve2 dropped, and the API was down 77 min. ScheduleAnyway, not
+        # DoNotSchedule: after a hypervisor loss the replacement must still
+        # schedule even if only the surviving pod's zone has capacity. The
+        # PaperclipApiSingleZone alert covers the case where scoring loses.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              {{- include "paperclip.apiSelectorLabels" . | nindent 14 }}
       {{- else }}
       {{- with .Values.affinity }}
       affinity:
