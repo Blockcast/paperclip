@@ -8,6 +8,7 @@ import {
   readGitOriginUrl,
   readOriginUrlFromGitConfig,
 } from "../services/workspace-runtime.js";
+import { parseGitConfigValue, readLocalGitConfigValue } from "../services/git-local-config-file.js";
 
 // BLO-56438: readGitOriginUrl reads the config file instead of spawning git.
 
@@ -80,5 +81,53 @@ describe("readGitOriginUrl agrees with git", () => {
     execFileSync("mkdir", [sub]);
     writeFileSync(path.join(sub, "f"), "");
     expect(await readOriginUrlFromGitConfig(sub)).toBeUndefined();
+  });
+});
+
+// BLO-57549: the same reader now serves the push guard and the agent identity.
+describe("readLocalGitConfigValue agrees with git config --local --get", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "local-config-reader-"));
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  const git = (cwd: string, ...args: string[]) =>
+    execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  const gitLocal = (cwd: string, key: string) => {
+    try {
+      return git(cwd, "config", "--local", "--get", key).replace(/\n$/, "");
+    } catch {
+      return null;
+    }
+  };
+
+  it("matches for every key the push guard and identity read", async () => {
+    const repo = path.join(root, "repo");
+    git(root, "init", "-q", repo);
+    git(repo, "config", "user.name", "Staff Engineer");
+    git(repo, "config", "user.email", "staff@example.com");
+    git(repo, "config", "receive.denyDeletes", "true");
+    git(repo, "config", "receive.denyCurrentBranch", "refuse");
+    git(repo, "config", "paperclip.pushGuard.displacedHooksPath", "/srv/hooks");
+    git(repo, "config", "paperclip.pushguard.displacedHooksPath", "/wrong-subsection-case");
+    const keys = [
+      "user.name",
+      "USER.EMAIL",
+      "receive.denyDeletes",
+      "receive.denyNonFastForwards",
+      "receive.denyCurrentBranch",
+      "paperclip.pushGuard.displacedHooksPath",
+      "core.hooksPath",
+    ];
+    for (const key of keys) {
+      expect(await readLocalGitConfigValue(repo, key), key).not.toBeUndefined();
+      expect(await readLocalGitConfigValue(repo, key), key).toBe(gitLocal(repo, key));
+    }
+  });
+
+  it.each([
+    ["[receive]\n\tdenyDeletes\n", "receive.denyDeletes"],
+    ['[user]\n\tname = "  padded  "\n', "user.name"],
+    ["[user] name = inline\n", "user.name"],
+    ["nokey", "nokey"],
+  ])("defers to git when the shape is ambiguous: %j", (text, key) => {
+    expect(parseGitConfigValue(text, key)).toBeUndefined();
   });
 });

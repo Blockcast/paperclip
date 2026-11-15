@@ -54,6 +54,7 @@ import {
   buildAgentGitIdentityEnv,
   ensureCheckoutGitIdentity,
 } from "./git-checkout-identity.js";
+import { parseGitConfigValue, readLocalGitConfigValue } from "./git-local-config-file.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
 import {
@@ -1590,10 +1591,16 @@ const GIT_IN_PROGRESS_OPERATION_QUIT_ARGS: Record<GitWorktreeInProgressOperation
 async function detectGitWorktreeInProgressOperation(
   worktreePath: string,
 ): Promise<GitWorktreeInProgressOperation | null> {
-  for (const { operation, marker } of GIT_IN_PROGRESS_OPERATION_MARKERS) {
-    const markerPath = await runGit(["rev-parse", "--git-path", marker], worktreePath).catch(() => null);
-    if (!markerPath) continue;
-    if (existsSync(path.resolve(worktreePath, markerPath))) return operation;
+  // BLO-57549: one rev-parse for every marker. Each git spawn forks the ~1.6 GB
+  // worker and costs it event-loop time; this used to be six spawns per call.
+  // Relative paths git prints are relative to its cwd, i.e. `worktreePath`.
+  const markerPaths = await runGit(
+    ["rev-parse", ...GIT_IN_PROGRESS_OPERATION_MARKERS.flatMap(({ marker }) => ["--git-path", marker])],
+    worktreePath,
+  ).then((stdout) => stdout.split("\n")).catch(() => null);
+  if (!markerPaths || markerPaths.length !== GIT_IN_PROGRESS_OPERATION_MARKERS.length) return null;
+  for (const [index, { operation }] of GIT_IN_PROGRESS_OPERATION_MARKERS.entries()) {
+    if (existsSync(path.resolve(worktreePath, markerPaths[index]))) return operation;
   }
   return null;
 }
@@ -3746,10 +3753,12 @@ function parseGitWorktreeListPorcelain(raw: string): GitWorktreeListEntry[] {
 }
 
 async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
-  const checkoutRoot = path.resolve(await runGit(["rev-parse", "--show-toplevel"], cwd));
-  const commonDir = await runGit(["rev-parse", "--git-common-dir"], checkoutRoot).catch(() => null);
+  // BLO-57549: one spawn, not two. A relative `--git-common-dir` is relative to
+  // git's cwd, so it resolves against `cwd`, not the toplevel.
+  const [toplevel, commonDir] = (await runGit(["rev-parse", "--show-toplevel", "--git-common-dir"], cwd)).split("\n");
+  const checkoutRoot = path.resolve(toplevel);
   if (!commonDir) return checkoutRoot;
-  return path.dirname(path.resolve(checkoutRoot, commonDir));
+  return path.dirname(path.resolve(cwd, commonDir));
 }
 
 // One `git worktree list` for callers that need to resolve more than one thing
@@ -3894,54 +3903,12 @@ export async function readGitOriginUrl(
   return runGit(["config", "--get", "remote.origin.url"], cwd, options).catch(() => null);
 }
 
-/**
- * `remote.origin.url` from `<cwd>/.git` config without spawning git, matching
- * `git config --get` (last value wins). Returns `undefined` -- "ask git" --
- * whenever the answer could differ from git's: no `.git` at `cwd` (cwd may be
- * a subdirectory), `include`/`includeIf`, legacy `[remote.origin]`, or a value
- * carrying quotes, escapes or comment characters.
- */
-export async function readOriginUrlFromGitConfig(cwd: string): Promise<string | null | undefined> {
-  const dotGit = path.join(cwd, ".git");
-  const stat = await fs.stat(dotGit).catch(() => null);
-  if (!stat) return undefined;
-  let gitDir = dotGit;
-  if (stat.isFile()) {
-    const match = /^gitdir:\s*(.+?)\s*$/m.exec(await fs.readFile(dotGit, "utf8"));
-    if (!match) return undefined;
-    gitDir = path.resolve(cwd, match[1]);
-    // Linked worktree: shared config lives in the common dir.
-    const commondir = await fs.readFile(path.join(gitDir, "commondir"), "utf8").catch(() => null);
-    if (commondir !== null) gitDir = path.resolve(gitDir, commondir.trim());
-  }
-  const text = await fs.readFile(path.join(gitDir, "config"), "utf8");
-  return parseOriginUrlFromGitConfig(text);
+export function readOriginUrlFromGitConfig(cwd: string): Promise<string | null | undefined> {
+  return readLocalGitConfigValue(cwd, "remote.origin.url");
 }
 
 export function parseOriginUrlFromGitConfig(text: string): string | null | undefined {
-  let inOrigin = false;
-  let url: string | null = null;
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
-    if (line.startsWith("[")) {
-      const header = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"([^"\\]*)")?\s*\]$/.exec(line);
-      if (!header) return undefined;
-      const section = header[1].toLowerCase();
-      // `[remote.origin]` is the legacy subsection spelling; let git read it.
-      if (section === "include" || section === "includeif" || section.includes(".")) return undefined;
-      inOrigin = section === "remote" && header[2] === "origin";
-      continue;
-    }
-    if (!inOrigin) continue;
-    const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$/.exec(line);
-    if (!kv || kv[1].toLowerCase() !== "url") continue;
-    const value = kv[2].trim();
-    // Quotes, escapes and comment chars change git's reading of the value.
-    if (/["\\#;]/.test(value)) return undefined;
-    url = value;
-  }
-  return url;
+  return parseGitConfigValue(text, "remote.origin.url");
 }
 
 async function validateProjectPrimaryRepoOrigin(input: {
