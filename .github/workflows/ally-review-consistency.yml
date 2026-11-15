@@ -53,15 +53,33 @@ name: Ally Review Consistency Guard
 # date, and classifies each by K — how many other heads the reviewer attested in
 # the same window — to separate a single-PR strand from a reviewer-wide stall.
 #
-# It REPORTS and does not fail the run. A strand is a latency condition that
-# resolves itself, it carries no stable fingerprint, and it must not enter the
-# baseline ratchet above. More to the point, the pr_review dispatch backlog this
-# detector observes is currently saturated (PEN-5793 done-when #3: a floor of 2
-# and a 72-hour high of 11 unresolved terminal failures as of 2026-11-12), so a
-# failing detector would go red most hours and carry no more information than no
-# detector — the same argument the ratchet paragraph above makes. Set
-# ALLY_STRAND_FAIL=1 to promote it to a hard failure once that backlog is
-# drained, which is the sequencing PEN-5793 itself records.
+# It now FAILS the run (ALLY_STRAND_FAIL=1 below), scoped exactly as the shape
+# audit is: every strand is REPORTED, and only a strand on a PR GitHub would
+# still merge from fails. See partitionStrandsByDormancy() in the script.
+#
+# That promotion was gated on PEN-5793 done-when #3 - the pr_review dispatch
+# backlog draining - on the reasoning that a saturated backlog would produce
+# strands most hours and make a failing detector a constant. That gate is
+# retired on direct measurement rather than on the proxy, because the proxy was
+# measured not to predict what it was chosen to predict. Over the 43 scheduled
+# runs from 2026-11-13T18:25Z to 2026-11-15T12:28Z, spanning a backlog that ran
+# from 8 down to 0: 39 runs reported 0 strands, and the only 4 that reported any
+# were consecutive, on 2026-11-15 06:31Z-09:25Z, while the backlog was ZERO. The
+# run at 2026-11-14T13:25Z sat inside a sustained non-zero backlog and reported
+# 0. In the only two windows where either signal moved they moved opposite ways,
+# so the backlog is not evidence about the strand rate in either direction.
+#
+# What those 4 runs caught is the measured cost and the measured benefit at once.
+# They are one real strand: #3807, head c2a65fe7, pushed 2026-11-15T05:49:02Z,
+# unattested for 4h27m08s - LONGER than the 3h23m53s #3452 incident this detector
+# was built for - while the reviewer stayed demonstrably healthy, the K classifier
+# moving 0 -> 3 -> 7 as it attested other heads. It did not resolve itself. It
+# ended 2m56s after a human-shaped re-request carrying a start-of-body
+# `paperclip:review-request` marker, which is this repo's measured healthy median
+# (2m56s, n=29). So the trigger from the push was lost, the detector was right
+# four times running, and nothing acted on it: the strand was cleared by a seat
+# that found it by its own route while the finding sat in a green run's log
+# annotations. A notice inside a passing run is not a signal. Hence the promotion.
 
 on:
   schedule:
@@ -93,4 +111,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ALLY_REVIEW_REPO: ${{ inputs.repo || 'Blockcast/paperclip' }}
+          # Promotes the strand detector from reporting to failing. Dormant
+          # strands still only report; see the paragraph above for the 43-run
+          # measurement this was promoted on.
+          ALLY_STRAND_FAIL: "1"
         run: node scripts/check-ally-review-consistency.mjs

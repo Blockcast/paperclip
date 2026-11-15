@@ -57,6 +57,7 @@ import {
   fetchHeadClock,
   findStrands,
   formatStrand,
+  partitionStrandsByDormancy,
   formatUnclocked,
   isAttestedAtHead,
   parseStrandThresholdMinutes,
@@ -3428,6 +3429,49 @@ describe("unattested-head strand detector (PEN-5793 done-when #4)", () => {
     });
   });
 
+  describe("partitionStrandsByDormancy", () => {
+    const strand = (number) => ({ number, headSha: OTHER, pushedAtMs: PUSHED, ageMs: NOW - PUSHED });
+
+    it("keeps a strand on a mergeable PR live", () => {
+      const { live, dormant } = partitionStrandsByDormancy([strand(3452)], [openPr()], NOW);
+      assert.equal(live.length, 1);
+      assert.equal(dormant.length, 0);
+    });
+
+    it("defers a strand on a conflicting PR and says why", () => {
+      const prs = [openPr({ mergeStateStatus: "DIRTY" })];
+      const { live, dormant } = partitionStrandsByDormancy([strand(3452)], prs, NOW);
+      assert.equal(live.length, 0);
+      assert.equal(dormant.length, 1);
+      assert.match(dormant[0].reason, /merge state DIRTY/);
+      assert.equal(dormant[0].number, 3452, "the strand itself must survive the partition");
+    });
+
+    it("defers a strand on a long-idle PR whose merge state GitHub never computed", () => {
+      const prs = [
+        openPr({
+          mergeStateStatus: "UNKNOWN",
+          updatedAt: new Date(NOW - (MAX_IDLE_DAYS + 1) * 24 * 60 * minutes(1)).toISOString(),
+        }),
+      ];
+      assert.equal(partitionStrandsByDormancy([strand(3452)], prs, NOW).dormant.length, 1);
+    });
+
+    // Polarity control, and the one that matters: a lookup that silently
+    // failed must not read as "this one does not matter". Mirrors
+    // partitionByMergeEligibility.
+    it("keeps a strand LIVE when its PR is not in the list at all", () => {
+      const { live, dormant } = partitionStrandsByDormancy([strand(9999)], [openPr()], NOW);
+      assert.equal(live.length, 1, "an unresolvable PR must fail loud, not defer");
+      assert.equal(dormant.length, 0);
+    });
+
+    it("handles empty input", () => {
+      assert.deepEqual(partitionStrandsByDormancy([], []), { live: [], dormant: [] });
+      assert.deepEqual(partitionStrandsByDormancy(undefined, undefined), { live: [], dormant: [] });
+    });
+  });
+
   describe("fetchHeadClock", () => {
     it("reads the earliest check-suite stamp", () => {
       const clock = fetchHeadClock("o/r", { headSha: HEAD }, () => "2026-11-06T10:49:51Z\n");
@@ -3543,6 +3587,39 @@ describe("unattested-head strand detector (PEN-5793 done-when #4)", () => {
       const { errs, exits } = run([cleanLive, unreviewed], { strandFail: true });
       assert.deepEqual(exits, [1]);
       assert.match(errs, /unattested past 30m/);
+    });
+
+    // The dormancy tier is on the FAILING predicate, never on the detector.
+    // PEN-5793 measured that a detector-level exclusion (there, the
+    // review-request conjunct) would have muted 44-56% of live PRs and the
+    // founding incident itself for its first 71 minutes.
+    const unreviewedDormant = { ...unreviewed, number: 3453, mergeStateStatus: "DIRTY" };
+
+    it("still REPORTS a strand on a PR GitHub will not merge from", () => {
+      const { out } = run([cleanLive, unreviewedDormant]);
+      assert.match(out, /::warning title=Unattested PR head on an unmergeable PR::#3453/);
+      assert.match(out, /merge state DIRTY/);
+      assert.match(out, /1 strand\(s\) \(0 live, 1 dormant\)/);
+    });
+
+    it("does not fail on a dormant strand even with the switch set", () => {
+      const { exits } = run([cleanLive, unreviewedDormant], { strandFail: true });
+      assert.deepEqual(exits, [], "an abandoned never-attested PR must not pin the run red");
+    });
+
+    it("fails on the live strand only, and counts only it", () => {
+      const { errs, exits } = run([cleanLive, unreviewed, unreviewedDormant], { strandFail: true });
+      assert.deepEqual(exits, [1]);
+      assert.match(errs, /1 non-draft open head\(s\) unattested past 30m/);
+      assert.match(errs, /#3452/);
+      assert.doesNotMatch(errs.split("further strand")[0], /#3453/);
+      assert.match(errs, /1 further strand\(s\) are reported above/);
+    });
+
+    it("tells the reader a strand is not baselineable and names the remedy", () => {
+      const { errs } = run([cleanLive, unreviewed], { strandFail: true });
+      assert.match(errs, /NOT baselineable/);
+      assert.match(errs, /paperclip:review-request/);
     });
 
     it("prints the detector summary even when nothing is stranded", () => {
