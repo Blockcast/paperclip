@@ -99,9 +99,69 @@ async function makeTempDir(prefix: string): Promise<string> {
   tempDirs.add(dir);
   return dir;
 }
+// Upper bound on how many dirs `tempDirs` can hold when the hook below runs:
+// 61 direct `makeTempDir` call sites in test/module scope, plus
+// `createTempRepo` (1 dir) invoked 64x and `createClonedRepoWithRemote`
+// (3 dirs) invoked 8x -- 61 + 64 + 24. No call site sits inside a loop or an
+// `.each`, so no site can run more than once. Pinned in the hook so the budget
+// derived from it cannot decay silently as tests are added.
+const MAX_REGISTERED_TEMP_DIRS = 149;
+
+// What one temp dir is allowed to cost to remove. Measured on a 4-CPU cgroup
+// against this file's own fixture shape (a `createTempRepo` repo: 45 entries,
+// 128 KB), removing all 149 under the same `Promise.all` the hook uses:
+//
+//   spinners   bulk wall time for 149 dirs     amortised (bulk/149)
+//     0 (ambient)   483 / 557 / 673 ms          4.5 ms
+//    24           2305 / 2605 ms               17.5 ms
+//    48           4920 / 5220 ms               35.0 ms
+//   128           6504 / 9812 ms               65.9 ms
+//
+// 1_500 ms is 23x the worst of those. The headroom is deliberate and is NOT a
+// fit to the failure below, because that failure does not reproduce locally:
+// crossing 120_000 ms needs >805 ms amortised per dir, which is 12x beyond the
+// heaviest arm here at 32x CPU oversubscription. CPU contention therefore
+// cannot account for it, and the hypothesis that survives is pathologically
+// slow unlinks on a contended CI filesystem -- the same one PEN-6455 was left
+// with when its own local measurement (291 ms for 45 repos) could not
+// reproduce an overrun that had just evicted #3583 from the merge queue.
+const TEMP_DIR_RM_ALLOWANCE_MS = 1_500;
+
+// Why this hook has a budget at all, rather than riding the package-wide
+// `hookTimeout` in server/vitest.config.ts.
+//
+// That 120_000 ms is sized for embedded-Postgres startup (BLO-17026), not for
+// this teardown, and on 2026-11-13 the teardown crossed it: job 131796741204
+// of `merge_group` run 43397409445 (`General tests (server 5/6)`, queue ref
+// gh-readonly-queue/master/pr-3151-1066504e) reported
+// `Error: Hook timed out in 120000ms` at this hook with `Tests 2290 passed
+// (2290)` -- every test in the shard passed and the shard still went red. Its
+// five sibling server shards, same commit and same job definition, finished in
+// 33-40 min on other runners; this one took 59 min. The cost of that red is a
+// 48-71 min re-run, and on a queue ref it is the eviction of an entry no agent
+// seat can re-enqueue.
+//
+// Nothing here asserts how long cleanup takes -- the hook's only job is to not
+// leave throwaway repos behind in $TMPDIR (BLO-44941) -- so unlike a deadline
+// that IS the claim under test, headroom weakens no detector. The trade it does
+// cost is that a genuinely hung teardown now sits for this long before it
+// reports, which is why the allowance above is 23x the measured ceiling rather
+// than an arbitrarily large number.
+const TEMP_DIR_CLEANUP_BUDGET_MS = MAX_REGISTERED_TEMP_DIRS * TEMP_DIR_RM_ALLOWANCE_MS;
+
 afterAll(async () => {
+  const registered = tempDirs.size;
   await Promise.all(Array.from(tempDirs, (dir) => fs.rm(dir, { recursive: true, force: true })));
-});
+  // After the removal, so a drifted bound still reports rather than leaking the
+  // dirs it was complaining about.
+  if (registered > MAX_REGISTERED_TEMP_DIRS) {
+    throw new Error(
+      `This file registered ${registered} temp dirs, above the ${MAX_REGISTERED_TEMP_DIRS} ` +
+        `that TEMP_DIR_CLEANUP_BUDGET_MS is derived from. Raise MAX_REGISTERED_TEMP_DIRS to the ` +
+        `new bound -- the budget scales with it -- rather than raising the budget on its own.`,
+    );
+  }
+}, TEMP_DIR_CLEANUP_BUDGET_MS);
 
 // Captured before any test can prepend a `git` shim directory. See the PATH
 // backstop in the global `afterEach`.
