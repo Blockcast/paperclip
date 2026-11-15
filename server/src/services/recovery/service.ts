@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import type { SQL } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import {
@@ -3224,9 +3224,32 @@ export function recoveryService(
    * `livenessState` is the classifier's verdict on whether the run advanced anything, which
    * is the signal the plan required in place of the dry run's liveness proxy.
    *
-   * `lastUsefulActionAt` is coalesced with `lastOutputAt` because some adapters
-   * (`opencode_k8s`) never write the former, and a bare `is not null` on it would silently
-   * exclude every agent on those adapters.
+   * PEN-6735: THAT RATIONALE HOLDS FOR ONE OF THE TWO ACCEPTED STATES. `classifyRunLiveness`
+   * returns `completed` from `if (issueStatus === "done" || issueStatus === "cancelled")`,
+   * which short-circuits ABOVE the first consultation of `concreteEvidence` — so a succeeded
+   * run that merely woke onto an already-terminal row is classified `completed` whether or
+   * not it did anything. `advanced` is evidence-derived; `completed` is row-state-derived.
+   * Accepting both re-admitted exactly the no-op class `livenessState` was chosen to exclude,
+   * and it does so in the fail-open direction: the row is handed back to an owner that has
+   * not demonstrably recovered. The guard is therefore scoped to the `completed` arm.
+   *
+   * `lastUsefulActionAt` is a sound stand-in for `concreteEvidence` HERE, and only here,
+   * because of what this predicate already selects. `classifyAndPersistRunLiveness` writes
+   * `livenessState` and `lastUsefulActionAt` in a SINGLE `UPDATE`, from one classification
+   * whose stamp is `concreteEvidence ? evidence.latestEvidenceAt : null` — so on every row
+   * this query can match (`livenessState` is non-null by construction), the stamp is the
+   * classifier's, not the in-run one, and `is not null` ⇒ `concreteEvidence`. The evidence
+   * itself is collected from durable DB rows (comments, document revisions, work products,
+   * workspace operations, activity, run events), never from adapter output, so the stamp is
+   * adapter-independent on classified rows. It can only be stricter than `concreteEvidence`,
+   * never looser: a run with evidence but a null `latestEvidenceAt` reads null and is
+   * excluded, which is the safe direction for a gate that was failing open.
+   *
+   * The `coalesce` below is a separate question — RECENCY, not existence — and it stays.
+   * It is what keeps the `advanced` arm honest for adapters (`opencode_k8s`) that never
+   * write `lastUsefulActionAt` during the run: a bare `is not null` applied to the WHOLE
+   * predicate would silently exclude those agents, which is why the new conjunct is inside
+   * the `completed` arm rather than beside it.
    */
   async function hasPositiveRunEvidence(agentId: string, cutoff: Date): Promise<boolean> {
     // Bind the cutoff as an ISO string with an explicit cast: postgres.js cannot serialize a
@@ -3239,7 +3262,17 @@ export function recoveryService(
       .where(and(
         eq(heartbeatRuns.agentId, agentId),
         eq(heartbeatRuns.status, "succeeded"),
-        inArray(heartbeatRuns.livenessState, ["completed", "advanced"]),
+        or(
+          // Evidence-derived: `classifyRunLiveness` reaches this state only under
+          // `if (concreteEvidence)`, so the state IS the evidence and needs no second term.
+          eq(heartbeatRuns.livenessState, "advanced"),
+          // Row-state-derived: carries no evidence guarantee of its own, so require the
+          // stamp the same classification wrote alongside it.
+          and(
+            eq(heartbeatRuns.livenessState, "completed"),
+            isNotNull(heartbeatRuns.lastUsefulActionAt),
+          ),
+        ),
         sql`coalesce(${heartbeatRuns.lastUsefulActionAt}, ${heartbeatRuns.lastOutputAt}, ${heartbeatRuns.finishedAt}) > ${cutoffIso}::timestamptz`,
       ))
       .limit(1);
