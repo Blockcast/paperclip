@@ -5197,6 +5197,60 @@ describeEmbeddedPostgres("productivity review service", () => {
   // rows this detector exists to catch are exactly the rows NULLS FIRST can
   // permanently preempt. Coalescing to `createdAt` makes the key a strict FIFO
   // and closes it.
+  // BLO-57547: the candidate loop stops at its wall-clock budget, and every
+  // candidate it did not reach gets its pre-pass watermark back -- including a
+  // NULL one -- so it is not pushed to the back of the FIFO unscanned.
+  it("restores the watermark of candidates the loop budget did not reach (BLO-57547)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: new Date(now.getTime() - 60 * 1000) });
+    const priorA = new Date("2026-04-20T00:00:00.000Z");
+    const priorB = new Date("2026-04-21T00:00:00.000Z");
+    await db.update(issues).set({ productivityScannedAt: priorA }).where(eq(issues.id, seeded.issueId));
+    const extra = [
+      { id: randomUUID(), scannedAt: priorB },
+      { id: randomUUID(), scannedAt: null },
+    ];
+    await db.insert(issues).values(
+      extra.map((row, i) => ({
+        id: row.id,
+        companyId: seeded.companyId,
+        title: `Budget ${i}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: seeded.coderId,
+        originKind: "manual",
+        issueNumber: 20_000 + i,
+        identifier: `${seeded.issuePrefix}-${20_000 + i}`,
+        startedAt: new Date(now.getTime() - 60 * 1000),
+        productivityScannedAt: row.scannedAt,
+        createdAt: new Date("2026-04-22T00:00:00.000Z"),
+        updatedAt: new Date("2026-04-22T00:00:00.000Z"),
+      })),
+    );
+
+    // Loop start and the first candidate's check read 0; every later check is past budget.
+    const clock = [0, 0];
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+      loopBudgetMs: 500,
+      nowMs: () => clock.shift() ?? 1_000,
+    });
+
+    expect(result.scanned).toBe(3);
+    expect(result.reached).toBe(1);
+    expect(result.budgetExhausted).toBe(true);
+    const rows = await db
+      .select({ id: issues.id, productivityScannedAt: issues.productivityScannedAt })
+      .from(issues)
+      .where(inArray(issues.id, [seeded.issueId, ...extra.map((row) => row.id)]));
+    const scannedAt = new Map(rows.map((row) => [row.id, row.productivityScannedAt?.toISOString() ?? null]));
+    // FIFO order is priorA, priorB, then the NULL row (coalesced to createdAt 04-22).
+    expect(scannedAt.get(seeded.issueId)).toBe(now.toISOString());
+    expect(scannedAt.get(extra[0]!.id)).toBe(priorB.toISOString());
+    expect(scannedAt.get(extra[1]!.id)).toBeNull();
+  }, 120_000);
+
   it("re-reaches an already-scanned issue under a sustained influx of never-scanned rows (BLO-30303)", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
