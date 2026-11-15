@@ -2222,7 +2222,65 @@ jobs:
     # That argues FOR the headroom rather than against it -- absorbing a bad
     # runner day instead of converting it into discarded work is what the
     # margin is for -- but do not read 800/window as a steady-state rate.
-    timeout-minutes: 50
+    #
+    # 60, not 50 -- and this is a BRIDGE with a stated expiry, not a fix.
+    # PEN-6723 re-ran the sweep above with the same instrument over two
+    # windows: SEPT 2026-09-04..09-12 (stride-3 of 707 runs, n=183 successful)
+    # and NOV 2026-11-09..11-15 (stride-2 of 1000, n=337 successful).
+    #
+    #            p50     p90     p95     p99     p100
+    #   SEPT    21.0    26.7    29.6    33.0    35.4  (71% of the 50 cap)
+    #   NOV     23.9    38.4    41.9    48.9    49.9  (100%)
+    #
+    # The median barely moved (+14%) and the TAIL blew out (p99 +48%). That is
+    # the shape that eats a cap: a job cap bounds the tail, so a lane can run
+    # out of budget without ever looking slow. Successful runs above 85% of
+    # cap went 0 -> 15. So the row's own "p100 <= 85% of cap" test now fails,
+    # at weight rather than on one morning: it needs a cap >= 49.9/0.85 = 58.7.
+    #
+    # Cap-band kills, classified by fetching all 90 cancelled jobs in the
+    # November sample individually: 5 kills (49.0-51.5 min with a runner
+    # assigned), ALL FIVE on arc-merge-queue. In a 1-in-2 sample over 6.5 days
+    # that is ~10/week, against ~2 per 9 days in BLO-33313's window. The kill
+    # rate is up roughly 7x while the budget is 25% larger.
+    #
+    # Why every kill is a merge_group run, and why that is the expensive half:
+    # a pull_request run heading for the ceiling is usually superseded by a
+    # push first (29 such cancels in the same sample), while a merge_group run
+    # has nothing to interrupt it, so it runs all the way to the cap. A kill
+    # there evicts the entry and SPENDS A HUMAN ENQUEUE ACT -- #3806 consumed
+    # three of kkroo's on 2026-11-15 alone. The lane itself is not pool
+    # dependent: at n=337 the two pools' medians are indistinguishable (23.8
+    # vs 24.3), and arc-merge-queue's tail only READS lower because the cap
+    # right-censors it.
+    #
+    # ⛔ The expiry, because a third raise on the same lane is a treadmill and
+    # should be dated rather than discovered: at the measured p99 growth
+    # (+48% over 64 days) 60 is consumed around mid-January 2027. Do not
+    # simply raise it again then. The lane is a SERIAL CHAIN OF FIVE
+    # INDEPENDENT typecheck/build units -- @paperclipai/ui 428s, the
+    # @paperclipai/server build inside typecheck:build-gaps 385s, the server
+    # test identifier check 365s, cli 324s, the allowlisted server tests 300s
+    # -- about 1800s of a 2390s job, and the cap bounds their SUM. Two fixes
+    # cost no extra runner slot and are preferred over splitting this into
+    # parallel jobs, because arc-paperclip-general is separately starving (13
+    # jobs in the same sample never got a runner at all, one waiting 136
+    # minutes, so a job split spends capacity on the pool already short):
+    #   (a) parallelise those units inside this job -- expected wall clock
+    #       max(unit) + fixed, ~14 min against ~24 today;
+    #   (b) stop rebuilding the server here. typecheck:build-gaps runs a full
+    #       `pnpm --filter @paperclipai/server build` = 385s = 16% of the job,
+    #       and Build builds the server too. Unverified whether that dist is
+    #       restorable here -- a candidate, not a finding.
+    #
+    # Re-measuring note, because two instrument faults invert the reading: a
+    # job that never got a runner reports started_at == created_at, so its
+    # "duration" is QUEUE TIME (discriminate on runner_name -- `steps` is
+    # pruned to [] on jobs more than a few weeks old and cannot do it); and
+    # the `created=<range>` filter on the runs API returned 0 for whole weeks
+    # that demonstrably had traffic, so validate every window with a per-day
+    # histogram before trusting a count.
+    timeout-minutes: 60
 
     steps:
       # Path-scoped on pull_request only. The job always runs and reports, so
