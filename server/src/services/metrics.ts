@@ -200,8 +200,12 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  * {@link TRANSIENT_DB_SQLSTATES} plus an `other` bucket, so the subset adds at
  * most a handful of series per route that actually refuses — and none at all
  * for a route that never does, because nothing is zero-initialized here.
- * `variant` is the two values of {@link normalizeHttpQueryVariant}, and it
- * multiplies only the routes that actually refuse in BOTH shapes.
+ * `variant` is the two values of {@link normalizeHttpQueryVariant}. On THIS
+ * counter it multiplies only the routes that actually refuse in BOTH shapes.
+ * ⚠️ That bound is specific to this family and does NOT describe the label
+ * generally: {@link HTTP_REQUEST_DURATION_METRIC} carries the same label and
+ * observes every completed response, so there it multiplies any route a
+ * caller sends a non-empty `?q=` to. See that metric's own cost table.
  *
  * ## ⚠️ `variant` changes series identity: aggregate, do not select
  *
@@ -402,7 +406,7 @@ export const BACKGROUND_DB_ERRORS_METRIC = "paperclip_background_db_errors_total
  * getting worse?", which is the question that would have caught 0098's
  * regression while it was still cheap.
  *
- * ## Labels: route and method only, deliberately
+ * ## Labels: route, method and variant -- and deliberately not status
  *
  * {@link HTTP_REQUESTS_METRIC} carries route x method x status. A histogram
  * multiplies every label combination by its bucket count, so this family drops
@@ -435,6 +439,31 @@ export const BACKGROUND_DB_ERRORS_METRIC = "paperclip_background_db_errors_total
  * `method` is kept despite the same pressure because it is nearly free and
  * genuinely discriminating: 96 pairs over 89 routes is +8%, and a GET and a
  * POST on one template are different work with different expected cost.
+ *
+ * `variant` is added on the same test and PEN-3596 is what forced it: this
+ * route's p50 is 0.1-0.5s while 0.14% of its requests exceed 30s, so the
+ * family was reporting one number for two populations and no query could
+ * separate them. Re-measured on the live registry 2026-11-15, one api replica:
+ *
+ * | quantity | value |
+ * |---|---|
+ * | this metric's `_bucket` series | 1,023 -- the largest single `paperclip_*` metric |
+ * | next largest (`paperclip_retry_schedule_outcome_total`) | 238, so 4.3x |
+ * | distinct (route, method) pairs | 93 |
+ * | whole `paperclip_*` family | 2,781 |
+ * | this family (`_bucket` + `_sum` + `_count`) | 1,209 -- 43.5% of it |
+ *
+ * So the 2026-10-31 forecast above has already come true: this IS the largest
+ * metric in the process. `variant` costs +8% expected -- about 7 of 93 pairs
+ * read `q` at all -- which is `method`'s admitted figure. Its WORST case is
+ * 2x, because {@link normalizeHttpQueryVariant} is total and the middleware
+ * reads `req.query.q` on every request, so a caller appending `?q=1` to an
+ * unrelated route mints a `search` series there. That worst case is +1,023
+ * series on this replica, the same order as the ~1,150 at which `status` was
+ * refused above -- and it is admitted anyway, because the two differ on the
+ * other half of the test: `status` answered nothing this family is asked, and
+ * `variant` answers the question the family was built for. Fleet-wide the
+ * worst case is +2,134 against 1.55M head series, or +0.14%.
  *
  * ⚠️ These are counts of what has been *observed*, not of what is declared, so
  * they are a floor: a route that has not been hit since process start mints no
@@ -6558,7 +6587,7 @@ let httpTransientDbResponses:
   | Counter<"route" | "method" | "status" | "code" | "sqlstate" | "variant">
   | null = null;
 let backgroundDbErrors: Counter<"table" | "sqlstate" | "writer"> | null = null;
-let httpRequestDuration: Histogram<"route" | "method"> | null = null;
+let httpRequestDuration: Histogram<"route" | "method" | "variant"> | null = null;
 let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -6747,7 +6776,7 @@ function ensureRegistry(): {
     "route" | "method" | "status" | "code" | "sqlstate" | "variant"
   >;
   backgroundDbErrorsCounter: Counter<"table" | "sqlstate" | "writer">;
-  httpRequestDurationHistogram: Histogram<"route" | "method">;
+  httpRequestDurationHistogram: Histogram<"route" | "method" | "variant">;
   gbrainRecallCounter: Counter<"status">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -9476,8 +9505,18 @@ function ensureRegistry(): {
         + "blind to exactly this family's worst case. Nothing is zero-initialized -- an "
         + "absent series means no completed "
         + "response was ever observed for that route, not that it was observed as zero. No "
-        + "user, company, agent, query string, or status is exposed.",
-      labelNames: ["route", "method"],
+        + "user, company, agent, query string, or status is exposed. The variant label splits "
+        + "one route template's two query shapes (PEN-3596): a request carrying a non-empty "
+        + "?q= runs a different statement from one that does not, and on "
+        + "/api/companies/:companyId/issues those are two populations with different "
+        + "distributions -- a 0.1-0.5s p50 and a 1-in-700 tail past the 30s statement_timeout "
+        + "-- which a single distribution per route reports as one misleading number. ⚠️ It "
+        + "CHANGES SERIES IDENTITY: a reading taken before this label selected one series per "
+        + "bucket per route and now selects one PER VARIANT, so aggregate (sum by (le, route, "
+        + "variant), or sum without (variant) to reproduce the pre-label distribution exactly) "
+        + "rather than selecting a bare series. Only whether ?q= was a non-empty string is "
+        + "exposed; the term itself never is.",
+      labelNames: ["route", "method", "variant"],
       buckets: [...HTTP_REQUEST_DURATION_BUCKETS_SECONDS],
       registers: [registry],
     });
@@ -13157,8 +13196,9 @@ export function recordHttpRequest(input: {
   transientDb?: { code: string | null | undefined; sqlstate: string | null | undefined } | null;
   /**
    * The raw `req.query.q` of this request, used ONLY to derive the bounded
-   * `variant` label on the transient-database subset (PEN-3596). Passed raw
-   * and normalized here rather than at the middleware so the counter and its
+   * `variant` label -- on the transient-database subset and on
+   * {@link HTTP_REQUEST_DURATION_METRIC} (PEN-3596). Passed raw and
+   * normalized here rather than at the middleware so both recorders and their
    * tests share one definition of the split; see
    * {@link normalizeHttpQueryVariant} for why that definition is the query
    * builder's own predicate.
@@ -13167,13 +13207,29 @@ export function recordHttpRequest(input: {
    * non-empty string. A search term is user text and would be unbounded
    * cardinality and a privacy leak at once.
    *
-   * Deliberately NOT applied to {@link HTTP_REQUESTS_METRIC}: that counter is
-   * the largest family in the process, and the question this label exists to
-   * answer (did a SEARCH-shape request time out) is an absolute count, not a
-   * rate, so it needs no per-variant denominator. The consequence is worth
-   * stating plainly rather than discovering later -- after this you can count
+   * Deliberately NOT applied to {@link HTTP_REQUESTS_METRIC}: the question
+   * that label was first added to answer (did a SEARCH-shape request time
+   * out) is an absolute count, not a rate, so it needed no per-variant
+   * denominator.
+   *
+   * ⚠️ The second ground this used to give -- that the counter "is the largest
+   * family in the process" -- is measured FALSE and is dropped rather than
+   * carried: on one api replica 2026-11-15 that counter holds 161 series
+   * against {@link HTTP_REQUEST_DURATION_METRIC}'s 1,209, so the histogram is
+   * the larger family by 7.5x and the exclusion rests on the count-not-a-rate
+   * ground alone.
+   *
+   * ⚠️ The consequence that used to be recorded here -- "you can count
    * search-shape refusals exactly and you still cannot divide them by
-   * search-shape requests.
+   * search-shape requests" -- was true when it was written and is now stale,
+   * so it is corrected rather than left for a reader to trip over.
+   * {@link HTTP_REQUEST_DURATION_METRIC}'s `_count` IS a per-variant
+   * denominator, and the exclusion above does not reach it. Read the bound
+   * exactly though: that family observes only COMPLETED responses, so the
+   * denominator is completed search-shape RESPONSES, never search-shape
+   * REQUESTS -- it is lower than the counter by the abort rate, by design.
+   * The two coincide on a route with no abandonment and diverge silently on
+   * one with it, which is why this says responses and not requests.
    */
   searchQuery?: unknown;
   /**
@@ -13204,17 +13260,23 @@ export function recordHttpRequest(input: {
   if (input.emptyList) {
     registered.httpEmptyListResponsesCounter.inc(labels);
   }
+  // Normalized unconditionally rather than only when a `q` was supplied:
+  // `no_search` is a positive claim about the request, not a default for "the
+  // caller did not tell me". A caller that omits this argument is therefore
+  // recorded as `no_search`, which is right for every route that has no search
+  // shape and is the reason the middleware always passes it.
+  //
+  // Derived ONCE, above both recorders, so the histogram and the transient-db
+  // subset cannot drift apart on what counts as a search: a second call site
+  // would have to re-derive the split and could disagree with this one, which
+  // is the same reasoning that keeps the route label single-sourced here.
+  const queryVariant = normalizeHttpQueryVariant(input.searchQuery);
   let transientDb: { code: string; sqlstate: string; variant: string } | null = null;
   if (input.transientDb) {
     transientDb = {
       code: normalizeHttpTransientDbCode(input.transientDb.code),
       sqlstate: normalizeHttpTransientDbSqlstate(input.transientDb.sqlstate),
-      // Normalized unconditionally rather than only when a `q` was supplied:
-      // `no_search` is a positive claim about the request, not a default for
-      // "the caller did not tell me". A caller that omits this argument is
-      // therefore recorded as `no_search`, which is right for every route that
-      // has no search shape and is the reason the middleware always passes it.
-      variant: normalizeHttpQueryVariant(input.searchQuery),
+      variant: queryVariant,
     };
     // `labels.status`, not a literal "503": an abandoned refusal records "0"
     // on the parent, and reusing the same value is what keeps this a strict
@@ -13233,7 +13295,7 @@ export function recordHttpRequest(input: {
       : null;
   if (durationSeconds !== null) {
     registered.httpRequestDurationHistogram.observe(
-      { route: labels.route, method: labels.method },
+      { route: labels.route, method: labels.method, variant: queryVariant },
       durationSeconds,
     );
   }
