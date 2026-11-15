@@ -891,6 +891,7 @@ export async function githubListOpenPullRequestsForHeadSha(input: {
       sha: input.sha,
       first: OPEN_PRS_AT_HEAD_PAGE_SIZE,
       cursor,
+      alreadyRead: pullRequests.length,
       signal: input.signal,
     });
     const parsed = parseOpenPullRequestsAtHeadPage(result, input.sha);
@@ -3532,6 +3533,12 @@ export async function ghGraphQlCommitAssociatedPullRequests(input: {
   sha: string;
   first: number;
   cursor?: string | null;
+  /**
+   * Rows this caller has already taken from EARLIER pages of the same
+   * connection. Load-bearing for the resolve-shortfall arm below, and `0` on
+   * the first page.
+   */
+  alreadyRead?: number;
   signal?: AbortSignal;
 }): Promise<GraphQlCommitPullRequestPage> {
   const [owner, name, ...rest] = input.repoFullName.split("/");
@@ -3579,11 +3586,23 @@ export async function ghGraphQlCommitAssociatedPullRequests(input: {
     });
   }
 
-  // The resolve-shortfall arm. `nodes` is capped at `first`, so compare against
-  // the page that was actually asked for, never against the whole connection.
+  // The resolve-shortfall arm.
+  //
+  // `totalCount` counts the WHOLE connection while `nodes` is one page, so the
+  // comparison has to be against what THIS page should hold: the rows not yet
+  // read, capped at the page size. `alreadyRead` is what makes that
+  // computable -- the helper is single-page by design and cannot know it
+  // otherwise, and leaving it out is not a smaller version of this check but a
+  // different and broken one. Without it, page 2 of a 150-row connection
+  // resolves its 50 remaining rows and is scored 50 short, so any head
+  // associated with more than one page of pull requests could NEVER enumerate
+  // and the gate withheld its green on every webhook for that head. It fails
+  // CLOSED, so it was a liveness defect rather than a bypass -- which is
+  // exactly why only a multi-page test finds it.
   const total = typeof connection.totalCount === "number" ? connection.totalCount : null;
   if (total !== null) {
-    const expectedOnThisPage = Math.min(total, input.first);
+    const remaining = Math.max(0, total - Math.max(0, input.alreadyRead ?? 0));
+    const expectedOnThisPage = Math.min(remaining, input.first);
     const shortfall = expectedOnThisPage - (pullRequests.length + malformed);
     if (shortfall > 0) malformed += shortfall;
   }
@@ -3599,7 +3618,6 @@ query($owner: String!, $name: String!, $number: Int!, $first: Int!, $cursor: Str
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       commits(first: $first, after: $cursor) {
-        totalCount
         pageInfo { hasNextPage endCursor }
         nodes {
           commit {
@@ -3650,7 +3668,6 @@ type PullRequestCommitsResponse = {
   repository?: {
     pullRequest?: {
       commits?: {
-        totalCount?: unknown;
         pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
         nodes?: unknown;
       } | null;
@@ -3668,11 +3685,15 @@ type PullRequestCommitsResponse = {
  * BLO-19528 needs rather than the shared App login.
  *
  * A node whose `commit` is unreadable is SKIPPED, exactly as the REST parse
- * skipped an entry with no `sha`. That is deliberately NOT the stricter
- * treatment {@link ghGraphQlCommitAssociatedPullRequests} gives a shortfall:
- * there a short list is a merge-control bypass, here it is reported to the
- * caller as `truncated` through the ordinary completeness path, which already
- * exists and already fails closed.
+ * skipped an entry with no `sha`, and NOTHING reports that to the caller --
+ * it only shortens the list. That is deliberately NOT the stricter treatment
+ * {@link ghGraphQlCommitAssociatedPullRequests} gives a shortfall, and the
+ * asymmetry is a judgement about the two CONSUMERS rather than about the two
+ * connections: there a short list is a merge-control bypass, here the only
+ * consumer is the advisory foreign-commit notice, which already says in its
+ * own words that a short listing is unproven rather than empty. Tightening it
+ * would mean failing a notice closed over an unreadable commit, which trades
+ * "missed one commit" for "missed all of them".
  */
 export async function ghGraphQlPullRequestCommits(input: {
   token: string;

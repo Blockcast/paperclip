@@ -32,6 +32,7 @@ import {
   githubListIssueCommentsWithTimestamps,
   githubListPrReviewsWithTimestamps,
   githubListPullRequestCommits,
+  githubListOpenPullRequestsForHeadSha,
   GITHUB_PR_COMMITS_ENDPOINT_LIMIT,
   githubPostCommitStatus,
   githubPostCommitStatusDetailed,
@@ -1986,6 +1987,81 @@ describe("githubHasReviewerEvidenceForPr", () => {
 // the end. A truncated read that reports itself complete turns "I could not
 // check the older commits" into "there are no foreign commits", which is the
 // exact silent-gap failure the notice exists to close.
+/**
+ * PEN-6341 item 2 slice 4: the SHA-scoped peer enumeration pages, and its
+ * resolve-shortfall arm has to be computed against the rows NOT YET READ.
+ *
+ * Caught by Ally on `#3804` as an Important finding, and only a MULTI-PAGE
+ * case can find it: comparing `totalCount` against one page's rows is exactly
+ * right on page 1 and scores every later page short, so every single-page
+ * fixture agrees with the broken form. It fails CLOSED -- the gate withholds
+ * its green rather than publishing a false one -- which is what keeps it
+ * invisible: a head with more than one page of associated pull requests could
+ * never enumerate, and every webhook returned the same refusal.
+ */
+describe("githubListOpenPullRequestsForHeadSha paging (PEN-6341)", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const SHA = "44d8a0abf47d975aef78620239b1e9e1f85b04d9";
+
+  function peerNodes(count: number, startNumber: number) {
+    return Array.from({ length: count }, (_, index) => ({
+      number: startNumber + index,
+      url: `https://github.com/${repoFullName}/pull/${startNumber + index}`,
+      state: "OPEN",
+      headRefOid: SHA,
+    }));
+  }
+
+  /** Two pages: 100 then 50, over a connection of `totalCount` 150. */
+  function stubPages(opts: { secondPageNodes?: unknown[] } = {}) {
+    setCreds();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const value = String(url);
+        if (value.includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        if (value.includes("/commits/")) throw new Error(`REST peer enumeration regressed: ${value}`);
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          variables?: { cursor?: string | null };
+        };
+        const first = body.variables?.cursor === null || body.variables?.cursor === undefined;
+        const nodes = first ? peerNodes(100, 1000) : (opts.secondPageNodes ?? peerNodes(50, 1100));
+        return jsonResponse({
+          data: {
+            repository: {
+              object: {
+                associatedPullRequests: {
+                  totalCount: 150,
+                  pageInfo: { hasNextPage: first, endCursor: first ? "cursor-1" : null },
+                  nodes,
+                },
+              },
+            },
+          },
+        });
+      }),
+    );
+  }
+
+  it("follows the cursor and returns every peer across both pages", async () => {
+    stubPages();
+    const result = await githubListOpenPullRequestsForHeadSha({ repoFullName, sha: SHA });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.pullRequests).toHaveLength(150);
+  });
+
+  it("still refuses a page the token could not fully resolve", async () => {
+    // The arm must keep firing after the arithmetic fix: page 2 owes 50 rows
+    // and renders 40 plus 10 unresolvable nulls.
+    stubPages({ secondPageNodes: [...peerNodes(40, 1100), ...Array.from({ length: 10 }, () => null)] });
+    const result = await githubListOpenPullRequestsForHeadSha({ repoFullName, sha: SHA });
+    expect(result).toEqual({ error: "open_pull_requests_at_head_malformed" });
+  });
+});
+
 describe("githubListPullRequestCommits truncation", () => {
   const repoFullName = "Blockcast/paperclip";
   const prNumber = 1760;
