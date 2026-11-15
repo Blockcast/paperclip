@@ -295,4 +295,68 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     // `updatedAt` is a liveness signal; a no-op sweep must not refresh it.
     expect(after.updatedAt.toISOString()).toBe(before.updatedAt.toISOString());
   });
+  /**
+   * PEN-6733. The rollup must distinguish "nothing to repair" from "could not
+   * read the work".
+   *
+   * `workProductsOffered: 0` is the correct report for a clean estate AND the
+   * report a sweep gives when every pull request in the window was unreadable.
+   * That is how the repair above ran for a full deployment and produced
+   * nothing with no surface saying so: the failure mode and the success mode
+   * were the same number on the same line.
+   */
+  it("reports unreadable pull-request nodes rather than a clean zero (PEN-6733)", async () => {
+    const { company } = await seed("ready_for_review", {
+      lastEventAction: "opened",
+      sourceEventOrder: 10,
+      sourceEventActionOrder: 10,
+      sourceEventTimestamp: "2026-10-29T18:40:57Z",
+      sourceEventTimestampMs: Date.parse("2026-10-29T18:40:57Z"),
+    });
+
+    // A node that SAYS it is a pull request and carries no usable number, so
+    // `readMergedPullRequestNode` refuses it. The plain Issue beside it is NOT
+    // a loss and must not be counted -- that is the control that keeps this
+    // assertion about unreadable rows rather than about every dropped node.
+    githubResponses.searchNodes = [
+      { __typename: "PullRequest", number: null, title: "unreadable" },
+      { __typename: "Issue", number: 12, title: "not a pull request" },
+    ];
+
+    const result = await runReconciler(db, company.id);
+
+    // The zero that used to be the whole report...
+    expect(result.workProductsOffered).toBe(0);
+    expect(result.enumerated).toBe(0);
+    // ...and the two fields that now say it is not a clean one. The Issue is
+    // excluded, so this counts 1 and not 2.
+    expect(result.unreadableNodes).toBe(1);
+    // No readable item on the page, so the enumeration stopped early: the
+    // count above is a PREFIX of the window, not a measurement of it.
+    expect(result.enumerationTruncated).toBe(true);
+
+    // Nothing was repaired on work that was never read.
+    const row = await readRow(company.id);
+    expect(row.status).toBe("ready_for_review");
+  });
+
+  it("reports a genuinely clean sweep as clean (PEN-6733 control)", async () => {
+    // The control arm. Without it the assertions above pass just as well
+    // against an implementation that reports every sweep as unreadable.
+    const { company } = await seed("ready_for_review", {
+      lastEventAction: "opened",
+      sourceEventOrder: 10,
+      sourceEventActionOrder: 10,
+      sourceEventTimestamp: "2026-10-29T18:40:57Z",
+      sourceEventTimestampMs: Date.parse("2026-10-29T18:40:57Z"),
+    });
+
+    const result = await runReconciler(db, company.id);
+
+    expect(result.unreadableNodes).toBe(0);
+    expect(result.enumerationTruncated).toBe(false);
+    // The repair still lands, so the two fields above are reporting on a sweep
+    // that actually did its work.
+    expect(result.workProductsOffered).toBe(1);
+  });
 });

@@ -366,6 +366,15 @@ query($q: String!, $first: Int!, $cursor: String) {
   }
 }`;
 
+/**
+ * Pages of 100 the merged-PR search will follow before giving up (PEN-6733).
+ *
+ * Named rather than inlined because the truncation test at the bottom of the
+ * loop compares against it: as two literals they could drift apart silently,
+ * and the symptom would be a prefix enumeration reported as a complete one.
+ */
+const MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES = 10;
+
 type SearchPullRequestsResponse = {
   search?: {
     pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
@@ -429,6 +438,28 @@ export async function reconcileMergedPullRequests(
   unlinked: number;
   enriched: number;
   workProductsOffered: number;
+  /**
+   * PEN-6733: merged pull-request nodes the enumeration could NOT read, summed
+   * over every page.
+   *
+   * This is the field that makes `workProductsOffered` readable. On its own a
+   * `0` there spans two opposite states -- a clean estate with nothing to
+   * repair, and a sweep that could not read the work it was meant to do --
+   * and nothing else on the rollup, or on the work product itself, separates
+   * them. That is how the repair this reconciler carries ran for its first
+   * full deployment and produced nothing, visibly to no one.
+   */
+  unreadableNodes: number;
+  /**
+   * PEN-6733: true when the enumeration stopped before the window was
+   * exhausted, so `enumerated` is a PREFIX rather than a count.
+   *
+   * Both truncating paths below already log, and a log line is not a value a
+   * caller can act on: the rollup still reported a clean pass. A sweep that
+   * covered part of a window must not be arithmetically indistinguishable
+   * from one that covered all of it.
+   */
+  enumerationTruncated: boolean;
 }> {
   // Author-agnostic enumeration. Intentionally NO `author:` qualifier.
   const q = `repo:${input.repoFullName} is:pr is:merged merged:${toYmd(input.since)}..${toYmd(input.until)}`;
@@ -453,6 +484,8 @@ export async function reconcileMergedPullRequests(
   }
 
   let enumerated = 0;
+  let unreadableNodes = 0;
+  let enumerationTruncated = false;
   let linked = 0;
   let unlinked = 0;
   let enriched = 0;
@@ -460,7 +493,7 @@ export async function reconcileMergedPullRequests(
   const workProducts = workProductService(db);
 
   let cursor: string | null = null;
-  for (let page = 1; page <= 10; page += 1) {
+  for (let page = 1; page <= MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES; page += 1) {
     const result = await ghGraphQlQuery<SearchPullRequestsResponse>({
       token,
       query: MERGED_PULL_REQUESTS_SEARCH_QUERY,
@@ -477,7 +510,7 @@ export async function reconcileMergedPullRequests(
     }
 
     const items: GithubMergedPullRequestNode[] = [];
-    let unreadableNodes = 0;
+    let unreadableNodesThisPage = 0;
     for (const node of connection.nodes) {
       const row = readMergedPullRequestNode(node);
       // A non-PullRequest node is an ORDINARY Issue and is not a loss -- the
@@ -487,19 +520,38 @@ export async function reconcileMergedPullRequests(
       // counted and reported rather than silently skipped.
       if (row === null) {
         if (node && typeof node === "object" && (node as Record<string, unknown>).__typename === "PullRequest") {
-          unreadableNodes += 1;
+          unreadableNodesThisPage += 1;
         }
         continue;
       }
       items.push(row);
     }
-    if (unreadableNodes > 0) {
+    unreadableNodes += unreadableNodesThisPage;
+    if (unreadableNodesThisPage > 0) {
       logger.warn(
-        { repoFullName: input.repoFullName, page, unreadableNodes },
+        { repoFullName: input.repoFullName, page, unreadableNodes: unreadableNodesThisPage },
         "reconciler: merged-PR search returned pull-request nodes this token could not read",
       );
     }
-    if (items.length === 0) break;
+    if (items.length === 0) {
+      // PEN-6733: an empty page is not always the end of the results. A page
+      // whose pull-request nodes ALL failed to read yields no items and is
+      // indistinguishable here from a genuinely exhausted window -- so the
+      // break below truncates the enumeration, and `enumerated` then reads as
+      // a complete count of a window that was never finished.
+      //
+      // The break itself is KEPT, and not because it is right: `endCursor` is
+      // on this page and could be followed. It is kept because paging on
+      // through unreadable results is a behavioural change with its own
+      // budget cost, and the case for it should be made from a non-zero
+      // `truncatedTargets` in production rather than guessed at here. What
+      // changes is that the caller is TOLD, which is what makes that
+      // measurement possible at all.
+      if (unreadableNodesThisPage > 0 || connection.pageInfo?.hasNextPage === true) {
+        enumerationTruncated = true;
+      }
+      break;
+    }
 
     for (const item of items) {
       enumerated += 1;
@@ -681,11 +733,38 @@ export async function reconcileMergedPullRequests(
         { repoFullName: input.repoFullName, page },
         "reconciler: merged-PR search reported another page with no cursor; enumeration is a prefix",
       );
+      // PEN-6733: the comment above already called this a prefix. Say so in
+      // the RETURN VALUE as well, so a caller aggregating these numbers is not
+      // the one reader who cannot tell.
+      enumerationTruncated = true;
       break;
+    }
+    // PEN-6733: the third truncation, and the only one with no log line of its
+    // own -- the server says there is another page and the loop simply runs
+    // out of iterations. A window wider than the cap returns a PREFIX that is
+    // arithmetically identical to a complete sweep.
+    if (page === MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES) {
+      logger.warn(
+        {
+          repoFullName: input.repoFullName,
+          page,
+          maxPages: MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES,
+        },
+        "reconciler: merged-PR search hit the page cap with more results pending; enumeration is a prefix",
+      );
+      enumerationTruncated = true;
     }
   }
 
-  return { enumerated, linked, unlinked, enriched, workProductsOffered };
+  return {
+    enumerated,
+    linked,
+    unlinked,
+    enriched,
+    workProductsOffered,
+    unreadableNodes,
+    enumerationTruncated,
+  };
 }
 
 // Test-only re-exports.
