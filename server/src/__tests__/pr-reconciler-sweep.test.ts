@@ -13,6 +13,8 @@ const zero: ReconcileResult = {
   unlinked: 0,
   enriched: 0,
   workProductsOffered: 0,
+  unreadableNodes: 0,
+  enumerationTruncated: false,
 };
 
 describe("computeReconcilerWindow", () => {
@@ -35,7 +37,16 @@ describe("runReconcilerSweep", () => {
     const seenWindows: string[] = [];
     const reconcile = vi.fn(async (_t: ReconcilerTarget, w: { since: Date; until: Date }) => {
       seenWindows.push(`${w.since.toISOString()}..${w.until.toISOString()}`);
-      return { enumerated: 5, linked: 3, unlinked: 2, enriched: 1, workProductsOffered: 4 };
+      return {
+        ...zero,
+        enumerated: 5,
+        linked: 3,
+        unlinked: 2,
+        enriched: 1,
+        workProductsOffered: 4,
+        unreadableNodes: 2,
+        enumerationTruncated: true,
+      };
     });
 
     const res = await runReconcilerSweep({ targets, now, windowDays: 21, reconcile });
@@ -51,6 +62,15 @@ describe("runReconcilerSweep", () => {
       // PEN-6413: repaired work-product rows aggregate like every other total,
       // so an operator can see whether the backfill is doing anything.
       workProductsOffered: 8,
+      // PEN-6733: the unreadable tail aggregates beside it, because
+      // `workProductsOffered` alone cannot tell a clean estate from a sweep
+      // that read nothing.
+      unreadableNodes: 4,
+      // ...and the per-repo BOOLEAN becomes a COUNT of targets whose
+      // `enumerated` is a prefix. Both targets truncated, so this is 2 and not
+      // `true` -- an `||` across targets would have flattened it to
+      // "at least one" and lost the scale.
+      truncatedTargets: 2,
     });
     // Both repos reconciled against one identical window.
     expect(new Set(seenWindows).size).toBe(1);
@@ -61,7 +81,7 @@ describe("runReconcilerSweep", () => {
     const onError = vi.fn();
     const reconcile = vi.fn(async (t: ReconcilerTarget) => {
       if (t.repoFullName === "Blockcast/a") throw new Error("rate limited");
-      return { enumerated: 4, linked: 4, unlinked: 0, enriched: 0, workProductsOffered: 0 };
+      return { ...zero, enumerated: 4, linked: 4 };
     });
 
     const res = await runReconcilerSweep({ targets, now, windowDays: 7, reconcile, onError });
@@ -74,15 +94,54 @@ describe("runReconcilerSweep", () => {
       unlinked: 0,
       enriched: 0,
       workProductsOffered: 0,
+      unreadableNodes: 0,
+      truncatedTargets: 0,
     });
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onError.mock.calls[0][0]).toEqual({ companyId: "c1", repoFullName: "Blockcast/a" });
   });
 
+  it("separates a clean estate from a sweep that could not read it (PEN-6733)", async () => {
+    // The two states that were one number. Both repos offer ZERO work-product
+    // repairs; one has nothing to repair, the other could not read a single
+    // pull request. Before `unreadableNodes` the rollup was identical.
+    const reconcile = vi.fn(async (t: ReconcilerTarget) =>
+      t.repoFullName === "Blockcast/a"
+        ? { ...zero, enumerated: 12, linked: 12 }
+        : { ...zero, unreadableNodes: 97, enumerationTruncated: true },
+    );
+
+    const res = await runReconcilerSweep({ targets, now, windowDays: 21, reconcile });
+
+    // Both repos "succeeded" -- neither threw -- which is exactly why the
+    // rollup has to carry the distinction itself.
+    expect(res.ok).toBe(2);
+    expect(res.failed).toBe(0);
+    expect(res.totals.workProductsOffered).toBe(0);
+    // ...and these are the two fields that say the zero above is not clean.
+    expect(res.totals.unreadableNodes).toBe(97);
+    expect(res.totals.truncatedTargets).toBe(1);
+  });
+
   it("returns zeros for an empty target set without calling reconcile", async () => {
     const reconcile = vi.fn(async () => zero);
     const res = await runReconcilerSweep({ targets: [], now, windowDays: 21, reconcile });
-    expect(res).toMatchObject({ targets: 0, ok: 0, failed: 0, totals: zero });
+    expect(res).toMatchObject({
+      targets: 0,
+      ok: 0,
+      failed: 0,
+      // Not `zero`: the empty-sweep totals are the AGGREGATE shape, which
+      // counts truncated targets where a per-repo result carries a boolean.
+      totals: {
+        enumerated: 0,
+        linked: 0,
+        unlinked: 0,
+        enriched: 0,
+        workProductsOffered: 0,
+        unreadableNodes: 0,
+        truncatedTargets: 0,
+      },
+    });
     expect(reconcile).not.toHaveBeenCalled();
   });
 });

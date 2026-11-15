@@ -43,13 +43,58 @@ export interface ReconcileResult {
    * reason.
    */
   workProductsOffered: number;
+  /**
+   * PEN-6733: merged pull-request nodes the enumeration could not read.
+   *
+   * Read this WITH `workProductsOffered`, never instead of it. Alone,
+   * `workProductsOffered: 0` spans two opposite states and nothing on this
+   * rollup separates them:
+   *
+   *   `{workProductsOffered: 0, unreadableNodes: 0}`   a clean estate
+   *   `{workProductsOffered: 0, unreadableNodes: 912}` a sweep that read nothing
+   *
+   * The second is how the work-product repair ran for a full deployment and
+   * produced nothing with no surface reporting it.
+   */
+  unreadableNodes: number;
+  /**
+   * PEN-6733: this repo's enumeration stopped before the window was exhausted,
+   * so `enumerated` is a PREFIX rather than a count.
+   *
+   * Three paths reach it -- a page whose pull-request nodes all failed to
+   * read, a `hasNextPage` with no cursor, and the page cap -- and all three
+   * previously logged and returned nothing, so a coverage percentage computed
+   * from `enumerated` was an OVERSTATEMENT presented as a measurement.
+   */
+  enumerationTruncated: boolean;
+}
+
+/**
+ * The summed rollup over every target (PEN-6733).
+ *
+ * Split from {@link ReconcileResult} rather than reusing it, because the two
+ * disagree on exactly one field and reusing the name would force a per-repo
+ * BOOLEAN to stand in for a COUNT. `enumerationTruncated` answers "is this
+ * repo's number a prefix?"; summed over targets the useful question is "HOW
+ * MANY of these numbers are prefixes?", which a boolean cannot carry and an
+ * `||` across targets would silently flatten to "at least one".
+ */
+export interface SweepTotals {
+  enumerated: number;
+  linked: number;
+  unlinked: number;
+  enriched: number;
+  workProductsOffered: number;
+  unreadableNodes: number;
+  /** Targets whose `enumerated` is a prefix. See `ReconcileResult.enumerationTruncated`. */
+  truncatedTargets: number;
 }
 
 export interface SweepResult {
   targets: number;
   ok: number;
   failed: number;
-  totals: ReconcileResult;
+  totals: SweepTotals;
   window: { since: Date; until: Date };
 }
 
@@ -97,12 +142,14 @@ export async function runReconcilerSweep(input: {
   onError?: (target: ReconcilerTarget, err: unknown) => void;
 }): Promise<SweepResult> {
   const window = computeReconcilerWindow(input.now, input.windowDays);
-  const totals: ReconcileResult = {
+  const totals: SweepTotals = {
     enumerated: 0,
     linked: 0,
     unlinked: 0,
     enriched: 0,
     workProductsOffered: 0,
+    unreadableNodes: 0,
+    truncatedTargets: 0,
   };
   let ok = 0;
   let failed = 0;
@@ -115,6 +162,8 @@ export async function runReconcilerSweep(input: {
       totals.unlinked += r.unlinked;
       totals.enriched += r.enriched;
       totals.workProductsOffered += r.workProductsOffered;
+      totals.unreadableNodes += r.unreadableNodes;
+      if (r.enumerationTruncated) totals.truncatedTargets += 1;
       ok += 1;
     } catch (err) {
       failed += 1;
@@ -146,7 +195,15 @@ export async function reconcilerSweepTick(
       targets: 0,
       ok: 0,
       failed: 0,
-      totals: { enumerated: 0, linked: 0, unlinked: 0, enriched: 0, workProductsOffered: 0 },
+      totals: {
+        enumerated: 0,
+        linked: 0,
+        unlinked: 0,
+        enriched: 0,
+        workProductsOffered: 0,
+        unreadableNodes: 0,
+        truncatedTargets: 0,
+      },
       window: computeReconcilerWindow(now, input.windowDays),
     };
   }
