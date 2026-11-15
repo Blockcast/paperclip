@@ -882,6 +882,20 @@ export async function githubListOpenPullRequestsForHeadSha(input: {
   const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return { error: "open_pull_requests_at_head_no_token" };
   const pullRequests: OpenPullRequestAtHead[] = [];
+  // Rows this loop has taken off the CONNECTION, which is not the same number
+  // as `pullRequests.length` and must never be replaced by it. The helper's
+  // resolve-shortfall arm compares `totalCount` -- a count of every associated
+  // pull request -- against what THIS page should hold, so the offset it needs
+  // is the RAW node count already consumed. `pullRequests` is the FILTERED
+  // list: `parseOpenPullRequestsAtHeadPage` drops every row that is not OPEN
+  // at this exact head, and `associatedPullRequests` has no `states:` filter,
+  // so in the realistic case most rows a commit is associated with are
+  // dropped. Passing the filtered count under-states what page 1 consumed,
+  // which over-states what page 2 owes, and page 2 is then scored short and
+  // refused. That fails CLOSED -- the gate withholds its green -- so it is a
+  // liveness defect rather than a bypass, and it is invisible to any fixture
+  // whose rows all survive the filter.
+  let rawRead = 0;
 
   let cursor: string | null = null;
   for (let page = 1; page <= OPEN_PRS_AT_HEAD_HARD_LIMIT_PAGES; page += 1) {
@@ -891,13 +905,11 @@ export async function githubListOpenPullRequestsForHeadSha(input: {
       sha: input.sha,
       first: OPEN_PRS_AT_HEAD_PAGE_SIZE,
       cursor,
-      alreadyRead: pullRequests.length,
+      alreadyRead: rawRead,
       signal: input.signal,
     });
     const parsed = parseOpenPullRequestsAtHeadPage(result, input.sha);
     if ("error" in parsed) return parsed;
-    pullRequests.push(...parsed.pullRequests);
-
     // PEN-6341: the stop condition is now `pageInfo.hasNextPage`, an explicit
     // statement by the server, where the REST loop had to INFER it from a page
     // coming back short. Same direction as the base-list reader: it moves only
@@ -906,6 +918,11 @@ export async function githubListOpenPullRequestsForHeadSha(input: {
     // speculative request. `result.ok` is implied -- `parsed` would have
     // returned above otherwise -- but is narrowed explicitly for the compiler.
     if (!result.ok) return { error: "open_pull_requests_at_head_malformed" };
+    pullRequests.push(...parsed.pullRequests);
+    // The parser refuses any page carrying `malformed > 0`, so past that check
+    // `result.pullRequests` IS every node the page returned.
+    rawRead += result.pullRequests.length;
+
     if (!result.hasNextPage) return { pullRequests };
     cursor = result.endCursor;
     // A cursorless "there is more" cannot be followed, and silently stopping
@@ -3534,9 +3551,16 @@ export async function ghGraphQlCommitAssociatedPullRequests(input: {
   first: number;
   cursor?: string | null;
   /**
-   * Rows this caller has already taken from EARLIER pages of the same
-   * connection. Load-bearing for the resolve-shortfall arm below, and `0` on
-   * the first page.
+   * RAW nodes this caller has already consumed from EARLIER pages of the same
+   * connection -- every row the connection returned, not the subset the caller
+   * kept. Load-bearing for the resolve-shortfall arm below, and `0` on the
+   * first page.
+   *
+   * ⛔ A caller that passes its own FILTERED count under-states the offset,
+   * which over-states what the next page owes and refuses it as short. The
+   * arm fails closed, so that renders as a gate that never goes green rather
+   * than as an error, and every fixture whose rows all survive the filter
+   * agrees with the broken form.
    */
   alreadyRead?: number;
   signal?: AbortSignal;

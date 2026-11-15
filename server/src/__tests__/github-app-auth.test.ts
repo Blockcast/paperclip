@@ -1981,12 +1981,6 @@ describe("githubHasReviewerEvidenceForPr", () => {
   });
 });
 
-// BLO-19528, Ally review of #1760. Foreign-commit notification is only as good
-// as the commit listing it reads, and GitHub truncates that listing at 250
-// without saying so -- the page loop sees a short page and concludes it reached
-// the end. A truncated read that reports itself complete turns "I could not
-// check the older commits" into "there are no foreign commits", which is the
-// exact silent-gap failure the notice exists to close.
 /**
  * PEN-6341 item 2 slice 4: the SHA-scoped peer enumeration pages, and its
  * resolve-shortfall arm has to be computed against the rows NOT YET READ.
@@ -2002,6 +1996,23 @@ describe("githubHasReviewerEvidenceForPr", () => {
 describe("githubListOpenPullRequestsForHeadSha paging (PEN-6341)", () => {
   const repoFullName = "Blockcast/paperclip";
   const SHA = "44d8a0abf47d975aef78620239b1e9e1f85b04d9";
+  const OTHER_SHA = "0b1c2d3e4f5061728394a5b6c7d8e9f001122334";
+
+  /**
+   * Rows the filter DROPS: closed, merged, or open at a different head. The
+   * connection has no `states:` filter, so this is the ordinary shape of a
+   * page rather than an edge case, and it is the only shape that can tell a
+   * raw offset from a filtered one.
+   */
+  function droppedNodes(count: number, startNumber: number) {
+    return Array.from({ length: count }, (_, index) => {
+      const number = startNumber + index;
+      const row = { number, url: `https://github.com/${repoFullName}/pull/${number}` };
+      if (index % 3 === 0) return { ...row, state: "CLOSED", headRefOid: OTHER_SHA };
+      if (index % 3 === 1) return { ...row, state: "MERGED", headRefOid: SHA };
+      return { ...row, state: "OPEN", headRefOid: OTHER_SHA };
+    });
+  }
 
   function peerNodes(count: number, startNumber: number) {
     return Array.from({ length: count }, (_, index) => ({
@@ -2013,7 +2024,7 @@ describe("githubListOpenPullRequestsForHeadSha paging (PEN-6341)", () => {
   }
 
   /** Two pages: 100 then 50, over a connection of `totalCount` 150. */
-  function stubPages(opts: { secondPageNodes?: unknown[] } = {}) {
+  function stubPages(opts: { firstPageNodes?: unknown[]; secondPageNodes?: unknown[] } = {}) {
     setCreds();
     vi.stubGlobal(
       "fetch",
@@ -2027,7 +2038,9 @@ describe("githubListOpenPullRequestsForHeadSha paging (PEN-6341)", () => {
           variables?: { cursor?: string | null };
         };
         const first = body.variables?.cursor === null || body.variables?.cursor === undefined;
-        const nodes = first ? peerNodes(100, 1000) : (opts.secondPageNodes ?? peerNodes(50, 1100));
+        const nodes = first
+          ? (opts.firstPageNodes ?? peerNodes(100, 1000))
+          : (opts.secondPageNodes ?? peerNodes(50, 1100));
         return jsonResponse({
           data: {
             repository: {
@@ -2053,6 +2066,20 @@ describe("githubListOpenPullRequestsForHeadSha paging (PEN-6341)", () => {
     expect(result.pullRequests).toHaveLength(150);
   });
 
+  it("offsets page 2 by the RAW rows read, not by the ones that survived the filter", async () => {
+    // Page 1 is 100 raw rows of which only 3 are OPEN at this head. Offsetting
+    // by the FILTERED count tells page 2 it owes min(150 - 3, 100) = 100 rows;
+    // it renders its 50 and is refused `..._malformed`. Offsetting by the raw
+    // 100 asks for the 50 that are actually left. Every other fixture here has
+    // all 100 rows survive the filter, which is exactly why they agree with
+    // both forms.
+    stubPages({ firstPageNodes: [...peerNodes(3, 1000), ...droppedNodes(97, 2000)] });
+    const result = await githubListOpenPullRequestsForHeadSha({ repoFullName, sha: SHA });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.pullRequests).toHaveLength(53);
+  });
+
   it("still refuses a page the token could not fully resolve", async () => {
     // The arm must keep firing after the arithmetic fix: page 2 owes 50 rows
     // and renders 40 plus 10 unresolvable nulls.
@@ -2062,6 +2089,12 @@ describe("githubListOpenPullRequestsForHeadSha paging (PEN-6341)", () => {
   });
 });
 
+// BLO-19528, Ally review of #1760. Foreign-commit notification is only as good
+// as the commit listing it reads, and GitHub truncates that listing at 250
+// without saying so -- the page loop sees a short page and concludes it reached
+// the end. A truncated read that reports itself complete turns "I could not
+// check the older commits" into "there are no foreign commits", which is the
+// exact silent-gap failure the notice exists to close.
 describe("githubListPullRequestCommits truncation", () => {
   const repoFullName = "Blockcast/paperclip";
   const prNumber = 1760;
