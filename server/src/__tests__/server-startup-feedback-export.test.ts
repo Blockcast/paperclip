@@ -291,6 +291,14 @@ const singletonStarts = vi.hoisted(() => {
   const stop = () => {};
   return {
     reconcilerSweepTick: vi.fn(async () => undefined),
+    // PEN-6413: startServer destructures this alongside reconcilerSweepTick and
+    // resolves a token per tick, so the mock below must export it too -- vitest
+    // throws on an undefined export rather than yielding undefined.
+    resolveReconcilerToken: vi.fn(async () => ({
+      ok: true as const,
+      token: "test-token",
+      source: "env" as const,
+    })),
     startStrandedBlockedIssueReconciler: vi.fn(() => stop),
     startApprovalEnforcementReconciler: vi.fn(() => stop),
     startIsolationWorkspaceReaper: vi.fn(() => stop),
@@ -302,6 +310,7 @@ const singletonStarts = vi.hoisted(() => {
 });
 vi.mock("../services/pr-reconciler-sweep.js", () => ({
   reconcilerSweepTick: singletonStarts.reconcilerSweepTick,
+  resolveReconcilerToken: singletonStarts.resolveReconcilerToken,
 }));
 vi.mock("../services/stranded-blocked-issue-reconciler.js", () => ({
   startStrandedBlockedIssueReconciler: singletonStarts.startStrandedBlockedIssueReconciler,
