@@ -180,7 +180,7 @@ esac
 
 describe("production Dockerfile k8s adapter runtime pins", () => {
   it("pins gh to a checksummed upstream release, not Debian's stale package", () => {
-    expect(runtimeDockerfile).toContain("ARG GH_CLI_VERSION=2.102.0");
+    expect(runtimeDockerfile).toContain("ARG GH_CLI_VERSION=2.104.0");
     expect(runtimeDockerfile).toMatch(/ARG GH_CLI_DEB_SHA256=[0-9a-f]{64}\n/);
     expect(runtimeDockerfile).toContain('sha256sum -c -');
     expect(runtimeDockerfile).toContain('gh --version | grep -Fq "gh version ${GH_CLI_VERSION} "');

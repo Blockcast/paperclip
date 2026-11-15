@@ -51,8 +51,8 @@ RUN npm install -g "npm@${NPM_VERSION}" \
 # gh_${GH_CLI_VERSION}_checksums.txt entry for the amd64 .deb (the image is
 # linux/amd64 only, docker-agent.yml). It installs to /usr/bin/gh, which the
 # wrapper step below moves to /usr/bin/gh.real.
-ARG GH_CLI_VERSION=2.102.0
-ARG GH_CLI_DEB_SHA256=7e54a307f90afdc59796c325ec0c49fb09e6c18537727207a8ac7513584ea5b0
+ARG GH_CLI_VERSION=2.104.0
+ARG GH_CLI_DEB_SHA256=f90d578cbc4c3b067dfc4a1a540cef41faef64eebfb280b548ab32455977a21f
 RUN curl -fsSL -o /tmp/gh.deb \
       "https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.deb" \
   && echo "${GH_CLI_DEB_SHA256}  /tmp/gh.deb" | sha256sum -c - \
