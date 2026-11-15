@@ -170,6 +170,24 @@ spec:
           labelSelector:
             matchLabels:
               {{- include "paperclip.apiSelectorLabels" . | nindent 14 }}
+        # Same rule one level up, per Proxmox hypervisor (BLO-19366). Distinct
+        # hostnames are not distinct failure domains: on 2026-11-15 both
+        # replicas sat on two guests of pve2 and the API had zero ready pods
+        # for ~77 min when that host dropped off the network (BLO-57408,
+        # BLO-40187). `topology.kubernetes.io/zone` is the hypervisor on every
+        # k8s-paperclip node (checked against pve_guest_info);
+        # `blockcast.net/pve-storage-domain` is NOT (it differs on -13, -14).
+        # It parks a replica Pending only if fewer than 2 hypervisors have a
+        # Ready eligible node, when one replica is all that is reachable anyway.
+        - maxSkew: 1
+          minDomains: 2
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          matchLabelKeys:
+            - pod-template-hash
+          labelSelector:
+            matchLabels:
+              {{- include "paperclip.apiSelectorLabels" . | nindent 14 }}
       {{- else }}
       {{- with .Values.affinity }}
       affinity:
