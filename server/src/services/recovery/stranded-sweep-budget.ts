@@ -23,9 +23,13 @@
  * line already reports as `candidatesScanned - candidates.count` (= never reached).
  */
 
+// BLO-57547: 450 s -> 300 s. At 450 s the stranded pass alone was half the 900 s
+// chain target, and with an unbounded productivity pass beside it a 2026-11-15 DB
+// latency excursion still ran chains to 853 s. Chains run back to back, so a lower
+// budget re-slices the same wall clock between passes rather than losing coverage.
 export const STRANDED_SWEEP_BUDGET_MS = Math.max(
   60_000,
-  Number(process.env.STRANDED_SWEEP_BUDGET_MS) || 450_000,
+  Number(process.env.STRANDED_SWEEP_BUDGET_MS) || 300_000,
 );
 
 export type StrandedSweepKey = {

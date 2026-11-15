@@ -148,6 +148,16 @@ const TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed", "cancelled"
 // terminal complement instead — see `issue-execution-lock.ts`.
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
+// BLO-57547: wall-clock budget for the source-candidate loop. The population is
+// fixed at MAX_CANDIDATE_ISSUES, so the loop's duration is 250 x DB latency; on
+// 2026-11-15 it ran 33-60 s healthy and up to 463 s while
+// `paperclip_pg:probe_latency_seconds:p50_1h` climbed 0.27 -> 1.53 s, which put the
+// recovery chain at 853 s of 900. Unreached candidates get their watermark back,
+// so a slow database costs review latency (more passes) instead of chain length.
+const PRODUCTIVITY_REVIEW_LOOP_BUDGET_MS = Math.max(
+  30_000,
+  Number(process.env.PRODUCTIVITY_REVIEW_LOOP_BUDGET_MS) || 90_000,
+);
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_NEXT_ACTION_COMMENT_CANDIDATES = 20;
 const NEXT_ACTION_COMMENT_CANDIDATE_PATTERN = [
@@ -6936,11 +6946,17 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     companyId?: string;
     thresholds?: Partial<ProductivityReviewThresholds>;
     issueCreatedAtGte?: Date | null;
+    loopBudgetMs?: number;
+    nowMs?: () => number;
   }) {
     const now = opts?.now ?? new Date();
     const thresholds = buildThresholds(opts?.thresholds);
     const result = {
       scanned: 0,
+      // BLO-57547: candidates the loop reached before its budget; < `scanned` only
+      // when `budgetExhausted`.
+      reached: 0,
+      budgetExhausted: false,
       created: 0,
       updated: 0,
       existing: 0,
@@ -7150,7 +7166,15 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       candidates.map((candidate) => ({ id: candidate.id, executionState: candidate.executionState })),
     );
 
+    const loopBudgetMs = opts?.loopBudgetMs ?? PRODUCTIVITY_REVIEW_LOOP_BUDGET_MS;
+    const nowMs = opts?.nowMs ?? Date.now;
+    const loopStartedAt = nowMs();
     for (const candidate of candidates) {
+      if (nowMs() - loopStartedAt > loopBudgetMs) {
+        result.budgetExhausted = true;
+        break;
+      }
+      result.reached += 1;
       if (recoveredReservations.recoveredSourceIssueIds.has(candidate.id)) {
         continue;
       }
@@ -7313,6 +7337,31 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           "productivity review reconciliation skipped malformed candidate",
         );
       }
+    }
+
+    // BLO-57547: hand unreached candidates their pre-pass watermark back, so they
+    // stay at the head of the FIFO instead of waiting ceil(N/250) passes for a scan
+    // they never got. Only the budget stop lands here; a throw still leaves the
+    // stamp in place, which is the BLO-30320 poison-row guarantee above.
+    const unreached = candidates.slice(result.reached);
+    if (result.budgetExhausted && unreached.length > 0) {
+      await db
+        .update(issues)
+        .set({
+          productivityScannedAt: sql`case ${issues.id} ${sql.join(
+            unreached.map(
+              (candidate) =>
+                sql`when ${candidate.id}::uuid then ${candidate.productivityScannedAt?.toISOString() ?? null}::timestamptz`,
+            ),
+            sql` `,
+          )} end`,
+        })
+        .where(
+          inArray(
+            issues.id,
+            unreached.map((candidate) => candidate.id),
+          ),
+        );
     }
 
     return result;
