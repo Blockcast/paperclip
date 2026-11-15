@@ -30,9 +30,11 @@
  * cite those. The decision is reversible by deleting this file and its pr.yml
  * step; the entries it forced in stay, and `include` still only grows.
  *
- * Four arms. The first three defend the gate; the fourth defends the ratchet,
+ * Five arms. The first three defend the gate; the fourth defends the ratchet,
  * because a guard that forces files IN while leaving a one-line exit OUT is
  * defeatable, and a defeatable guard is worse than none once people cite it.
+ * The fifth defends the file's mergeability, because a ratchet every PR must
+ * edit is only sustainable if two PRs can edit it at the same time.
  *
  *   1. no globs      -- every `include` entry is a literal path. This guard
  *                       matches by exact path; a glob entry would be silently
@@ -50,10 +52,29 @@
  *                       header names dropping the entry as "the cheapest-looking
  *                       repair", which "silently retires the gate and leaves
  *                       `typecheck` green".
+ *   5. sorted+unique -- `include` is sorted ascending and lists nothing twice.
+ *                       PEN-6734. In append order every test-adding PR rewrites
+ *                       the SAME final line (the last entry gains a comma), so
+ *                       any two concurrent ones conflict by construction -- and
+ *                       a list append conflicts with a NON-EMPTY diff3 base
+ *                       section, which scores as "choose a side" when the answer
+ *                       is keep-both, so the cheapest-looking resolution
+ *                       silently drops one side's entry. Measured: #3818 sat
+ *                       UNMERGEABLE in the merge queue for 4h+ on exactly this,
+ *                       and #3748 hit the same shape two days earlier. Sorting
+ *                       spreads the edits across the file so two appends
+ *                       normally land in different hunks and git merges them
+ *                       unaided. It is NOT conflict immunity: two entries whose
+ *                       names sort within a few lines of each other still
+ *                       collide. It replaces "every pair collides" with
+ *                       "adjacent names collide". The duplicate half is the
+ *                       same incident from the other side -- a duplicated entry
+ *                       is the signature of a union-style resolution of that
+ *                       conflict, and tsc accepts it silently.
  *
- * Arms 1, 2 read the working tree (in CI, the merge tree -- which is what gets
- * typechecked). Arms 3, 4 read the base...head diff. Each arm is internally
- * consistent; they are not compared against each other.
+ * Arms 1, 2, 5 read the working tree (in CI, the merge tree -- which is what
+ * gets typechecked). Arms 3, 4 read the base...head diff. Each arm is
+ * internally consistent; they are not compared against each other.
  *
  * KNOWN CEILING: base, not siblings. Two concurrent PRs can each add a test
  * file and both pass; neither needs the other's entry. That is correct -- the
@@ -86,6 +107,32 @@ export const toIncludeEntry = (repoPath) => repoPath.slice(TSCONFIG_DIR.length +
 
 export const isGatedTestFile = (repoPath) =>
   repoPath.startsWith(`${TESTS_DIR}/`) && TEST_FILE.test(repoPath);
+
+/** Why arm 5 exists, quoted into its message and into arm 3's. */
+export const SORTED_ORDER_NOTE =
+  "`include` is kept SORTED so that two concurrent test-adding PRs edit different lines of it; " +
+  "appending to the end makes every such pair conflict, and the natural resolution drops one side's " +
+  "entry (PEN-6734). The order is plain ascending string order -- exactly what `[...include].sort()` gives.";
+
+/**
+ * Where `entry` belongs in a sorted `include`, as prose the author can act on.
+ *
+ * Arm 5 requires sorted order, so arm 3's "add this line" is only mechanical if
+ * it also says WHERE -- otherwise the author appends, arm 5 reddens, and the
+ * remedy costs a second CI round trip for a one-line edit.
+ *
+ * `entry` may or may not already be in `include` (arm 3 passes one that is not,
+ * arm 5 one that is), so its own copies are removed before the neighbours are
+ * read; otherwise a misplaced entry is told to move next to itself.
+ */
+export function insertionHint(include, entry) {
+  const others = include.filter((e) => typeof e === "string" && e !== entry).sort();
+  if (others.length === 0) return "as the only entry";
+  const at = others.findIndex((e) => e > entry);
+  if (at === -1) return `at the END of \`include\`, after "${others[others.length - 1]}"`;
+  if (at === 0) return `at the TOP of \`include\`, before "${others[0]}"`;
+  return `between "${others[at - 1]}" and "${others[at]}"`;
+}
 
 /**
  * @param {object} args
@@ -138,8 +185,14 @@ export function checkAllowlist({
   if (uncovered.length > 0) {
     problems.push(
       `${uncovered.length} test file(s) added in this diff are absent from ${TSCONFIG_PATH} \`include\`, so nothing typechecks them and \`pnpm typecheck\` passes vacuously on them (PEN-4186). Add to \`include\`:\n` +
-        uncovered.map((p) => `      "${toIncludeEntry(p)}",`).join("\n") +
-        `\n    This is scoped to files ADDED in this diff only -- it never asks for the pre-existing backlog.`,
+        uncovered
+          .map((p) => {
+            const entry = toIncludeEntry(p);
+            return `      "${entry}",\n          ^ belongs ${insertionHint(include, entry)}`;
+          })
+          .join("\n") +
+        `\n    This is scoped to files ADDED in this diff only -- it never asks for the pre-existing backlog.` +
+        `\n    ${SORTED_ORDER_NOTE}`,
     );
   }
 
@@ -164,6 +217,30 @@ export function checkAllowlist({
           `\n    ${TSCONFIG_PATH}'s own header names this as "the cheapest-looking repair", which "silently retires the gate and leaves \`typecheck\` green". If a merge-tree typecheck error landed on lines your diff never touched, rebase and sweep the new call sites. Never shrink \`include\`.`,
       );
     }
+  }
+
+  // --- arm 5: sorted, and nothing listed twice ----------------------------
+  // The mergeability arm. See the header: in append order every test-adding PR
+  // rewrites the same final line, so any two concurrent ones conflict by
+  // construction, and the natural resolution of that conflict drops one side.
+  // Both halves are checked against the head tree (in CI, the merge tree), so a
+  // PR that merges cleanly into an unsorted master is still asked to sort.
+  const duplicated = [...new Set(include.filter((entry, i) => include.indexOf(entry) !== i))].sort();
+  if (duplicated.length > 0) {
+    problems.push(
+      `${TSCONFIG_PATH}: \`include\` lists ${duplicated.length} entr(y/ies) more than once:\n` +
+        duplicated.map((entry) => `      "${entry}"`).join("\n") +
+        `\n    tsc accepts a duplicate silently, so nothing else reports this. It is the signature of an \`include\` conflict resolved by keeping both sides of one overlapping region -- the two sides added DIFFERENT entries and share only the line they both put a comma on. Keep one copy of each entry, and keep both new entries.`,
+    );
+  }
+
+  const misordered = include.filter((entry, i) => i > 0 && entry < include[i - 1]);
+  if (misordered.length > 0) {
+    problems.push(
+      `${TSCONFIG_PATH}: \`include\` is not sorted -- ${misordered.length} entr(y/ies) sort before the entry they follow:\n` +
+        misordered.map((entry) => `      "${entry}"\n          ^ belongs ${insertionHint(include, entry)}`).join("\n") +
+        `\n    ${SORTED_ORDER_NOTE}`,
+    );
   }
 
   return problems;
