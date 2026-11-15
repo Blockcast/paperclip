@@ -9,6 +9,7 @@ import { httpMetricsMiddleware } from "../middleware/http-metrics.js";
 import {
   HTTP_REQUESTS_METRIC,
   HTTP_REQUEST_DURATION_METRIC,
+  HTTP_TRANSIENT_DB_RESPONSES_METRIC,
   __resetMetricsForTest,
   getMetricsRegistry,
   recordHttpRequest,
@@ -135,7 +136,7 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
     expect(counter).toHaveLength(1);
   });
 
-  it("does not carry a status label, so one route is one series per bucket", async () => {
+  it("carries variant but not status or code, so a route splits only by query shape", async () => {
     const app = buildApp();
     await call(app, "/api/companies/c1/issues", 200);
     await call(app, "/api/companies/c1/throws", 503);
@@ -145,6 +146,9 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
     for (const s of values) {
       expect(s.labels).not.toHaveProperty("status");
       expect(s.labels).not.toHaveProperty("code");
+      // `variant` IS carried (PEN-3596); pinned so dropping it fails loudly
+      // rather than silently re-merging two populations into one curve.
+      expect(s.labels).toHaveProperty("variant");
     }
     // Two routes, each observed once, and no status split between them.
     expect(await observedCount({ route: "/api/companies/:companyId/issues" })).toBe(1);
@@ -300,6 +304,96 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
     expect(String(counter[0]?.labels.status)).toBe("0");
     // ... and the histogram mints no series for it at all.
     expect(await seriesFor(HTTP_REQUEST_DURATION_METRIC)).toHaveLength(0);
+  });
+
+  /**
+   * PEN-3596. The defect that forced this label: `/api/companies/:companyId/issues`
+   * runs a different statement when `?q=` is present, and measured in production
+   * the route's p50 is 0.1-0.5s while 0.14% of requests exceed the inherited 30s
+   * statement_timeout. One distribution per route reports those two populations as
+   * a single number, and no query could separate them -- so a mix shift toward the
+   * cheap shape is indistinguishable from the expensive shape getting faster.
+   */
+  describe("query-shape variant label (PEN-3596)", () => {
+    it("splits one route template by query shape", async () => {
+      const app = buildApp();
+      await call(app, "/api/companies/c1/issues?q=timeout", 200);
+      await call(app, "/api/companies/c1/issues", 200);
+
+      const route = "/api/companies/:companyId/issues";
+      expect(await observedCount({ route, variant: "search" })).toBe(1);
+      expect(await observedCount({ route, variant: "no_search" })).toBe(1);
+    });
+
+    /**
+     * The label changes series identity, so the guarantee that matters to every
+     * existing reader is that nothing is LOST: aggregating the variant away must
+     * reproduce the pre-label distribution exactly.
+     */
+    it("reproduces the pre-label total when the variant is aggregated away", async () => {
+      const app = buildApp();
+      await call(app, "/api/companies/c1/issues?q=a", 200);
+      await call(app, "/api/companies/c1/issues?q=b", 200);
+      await call(app, "/api/companies/c1/issues", 200);
+
+      const route = "/api/companies/:companyId/issues";
+      expect(await observedCount({ route })).toBe(3);
+      expect(await observedCount({ route, variant: "search" })).toBe(2);
+      expect(await observedCount({ route, variant: "no_search" })).toBe(1);
+    });
+
+    /**
+     * `no_search` is a positive claim about the request, not a default for "the
+     * caller did not tell me" -- which is what makes an absent `search` series
+     * mean "none observed" rather than "not instrumented here".
+     */
+    it("records an empty q as no_search rather than minting a third value", async () => {
+      const app = buildApp();
+      await call(app, "/api/companies/c1/issues?q=", 200);
+      await call(app, "/api/companies/c1/issues?q=%20%20", 200);
+
+      const route = "/api/companies/:companyId/issues";
+      expect(await observedCount({ route, variant: "no_search" })).toBe(2);
+      expect(await observedCount({ route, variant: "search" })).toBe(0);
+    });
+
+    /**
+     * A search term is user text: unbounded cardinality and a privacy leak at
+     * once. Only WHETHER one was supplied may ever reach a label.
+     */
+    it("never exposes the search term itself", async () => {
+      await call(buildApp(), "/api/companies/c1/issues?q=secret-term", 200);
+
+      const rendered = (await renderMetrics()).body;
+      expect(rendered).not.toContain("secret-term");
+      for (const s of await seriesFor(HTTP_REQUEST_DURATION_METRIC)) {
+        expect(["search", "no_search"]).toContain(String(s.labels.variant));
+      }
+    });
+
+    /**
+     * The histogram and the transient-db subset derive the split from one call
+     * to one normalizer, so they cannot disagree about what counts as a search.
+     */
+    it("agrees with the transient-db subset on one request's shape", async () => {
+      recordHttpRequest({
+        route: "/api/companies/:companyId/issues",
+        method: "GET",
+        status: 503,
+        emptyList: false,
+        searchQuery: "timeout",
+        transientDb: { code: "statement_timeout", sqlstate: "57014" },
+        durationSeconds: 31,
+      });
+
+      const route = "/api/companies/:companyId/issues";
+      expect(await observedCount({ route, variant: "search" })).toBe(1);
+      const subset = (await seriesFor(HTTP_TRANSIENT_DB_RESPONSES_METRIC)).filter(
+        (s) => String(s.labels.route) === route,
+      );
+      expect(subset).toHaveLength(1);
+      expect(String(subset[0]?.labels.variant)).toBe("search");
+    });
   });
 
   describe("recordHttpRequest duration guard", () => {
