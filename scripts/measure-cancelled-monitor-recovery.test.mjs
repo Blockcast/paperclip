@@ -3,6 +3,9 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  CLEAR_ROUTE_PATCH,
+  CLEAR_ROUTE_UNDELIVERABLE,
+  cancelledClears,
   carriersBySource,
   classifyMultiCarrier,
   classifyRow,
@@ -15,8 +18,10 @@ import {
   isMainModule,
   isOwnerlessSource,
   nextCursor,
+  patchRouteClears,
   recoveryObligationKeys,
   summarize,
+  tallyOwedClears,
 } from "./measure-cancelled-monitor-recovery.mjs";
 
 function issue(overrides = {}) {
@@ -368,6 +373,175 @@ describe("destroyedDueTimes", () => {
     ];
     assert.deepEqual(destroyedDueTimes(withoutDue).map((row) => row.dueAt), [null]);
     assert.deepEqual(destroyedDueTimes([]), []);
+  });
+
+  // PEN-5487. The two clear actions use DISJOINT key vocabularies for the same
+  // two facts: the bare `issue.monitor_cleared` keys its reason as `reason`
+  // (never `clearReason`) and its due time as `previousNextCheckAt` (never
+  // `nextCheckAt`). Verified at master 8b240102 across both bare emitters in
+  // `server/src/routes/issues.ts` -- the monitor route (`via:
+  // "issue_monitor_route"`) and the issue PATCH route -- and all three
+  // `..._cleared_undeliverable` emitters in `server/src/services/heartbeat.ts`.
+  //
+  // So widening this predicate to "also catch the sibling action" admits this
+  // event, and `?? null` then reports its very real destroyed due time as
+  // unrecoverable rather than as mis-keyed. The details below are shaped as the
+  // emitter emits them, which is what also catches the widening that matches on
+  // `reason`. `patchRouteClears` is the reader that does handle this event, with
+  // the right keys.
+  it("excludes the sibling manual-clear action, whose due time lives under a different key", () => {
+    assert.deepEqual(
+      destroyedDueTimes([
+        {
+          action: "issue.monitor_cleared",
+          createdAt: "2026-11-03T22:52:34.948Z",
+          details: { reason: "cancelled", previousNextCheckAt: "2026-11-04T08:15:00.000Z" },
+        },
+      ]),
+      [],
+    );
+  });
+});
+
+// PEN-5518 -- the other half of the same key-vocabulary defect: the reader that
+// DOES see the sibling action, and the pairing that reports it.
+describe("patchRouteClears", () => {
+  const sibling = {
+    action: "issue.monitor_cleared",
+    createdAt: "2026-11-03T22:52:34.948Z",
+    details: {
+      identifier: "PEN-1",
+      reason: "cancelled",
+      previousNextCheckAt: "2026-11-04T08:15:00.000Z",
+      notes: "Outstanding: ONE human approval",
+    },
+  };
+
+  it("recovers the due time from previousNextCheckAt, not nextCheckAt", () => {
+    const found = patchRouteClears([sibling]);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].dueAt, "2026-11-04T08:15:00.000Z");
+    assert.equal(found[0].clearedAt, "2026-11-03T22:52:34.948Z");
+    assert.equal(found[0].notes, "Outstanding: ONE human approval");
+  });
+
+  it("ignores the undeliverable action, which destroyedDueTimes already owns", () => {
+    assert.deepEqual(
+      patchRouteClears([
+        {
+          action: "issue.monitor_cleared_undeliverable",
+          createdAt: "2026-11-03T01:11:40.383Z",
+          details: { clearReason: "cancelled", nextCheckAt: "2026-11-03T12:00:00.000Z" },
+        },
+      ]),
+      [],
+    );
+  });
+
+  it("ignores a sibling clear for any other reason, and an empty feed", () => {
+    // `manual` is 87/100 of the live sibling population: selecting on the action
+    // alone would swamp the owed set with clears this measurement is not about.
+    const manual = { ...sibling, details: { ...sibling.details, reason: "manual" } };
+    assert.deepEqual(patchRouteClears([manual]), []);
+    assert.deepEqual(patchRouteClears([]), []);
+    assert.deepEqual(patchRouteClears(null), []);
+  });
+
+  it("reports a missing due time as null rather than dropping the clear", () => {
+    const withoutDue = { ...sibling, details: { reason: "cancelled" } };
+    assert.deepEqual(patchRouteClears([withoutDue]).map((row) => row.dueAt), [null]);
+  });
+});
+
+describe("cancelledClears", () => {
+  const undeliverable = {
+    action: "issue.monitor_cleared_undeliverable",
+    createdAt: "2026-11-03T01:11:40.383Z",
+    details: { clearReason: "cancelled", nextCheckAt: "2026-11-03T12:00:00.000Z" },
+  };
+  const sibling = {
+    action: "issue.monitor_cleared",
+    createdAt: "2026-11-03T22:52:34.948Z",
+    details: { reason: "cancelled", previousNextCheckAt: "2026-11-04T08:15:00.000Z" },
+  };
+
+  it("tags each clear with the route that emitted it", () => {
+    const found = cancelledClears([undeliverable, sibling]);
+    assert.deepEqual(
+      found.map((row) => [row.route, row.dueAt]),
+      [
+        [CLEAR_ROUTE_UNDELIVERABLE, "2026-11-03T12:00:00.000Z"],
+        [CLEAR_ROUTE_PATCH, "2026-11-04T08:15:00.000Z"],
+      ],
+    );
+  });
+
+  // The regression this row exists for: before `patchRouteClears` an owed row
+  // whose only clear went out on the PATCH route produced NO entry at all -- not
+  // even one with `dueAt: null` -- so it lowered `cancelled-clear-events-on-owed`
+  // silently instead of surfacing. It carried a genuinely destroyed due time and
+  // was reported strictly less than a clear we could not recover.
+  it("sees an owed row whose only clear went out on the sibling action", () => {
+    const found = cancelledClears([sibling]);
+    assert.equal(found.length, 1);
+    assert.equal(found[0].route, CLEAR_ROUTE_PATCH);
+    assert.equal(found[0].dueAt, "2026-11-04T08:15:00.000Z");
+  });
+});
+
+describe("tallyOwedClears", () => {
+  const feed = (identifier, clears) => ({ ok: true, value: { identifier, clears } });
+  const undeliverable = {
+    clearedAt: "2026-11-03T01:11:40.383Z",
+    dueAt: "2026-11-03T12:00:00.000Z",
+    route: CLEAR_ROUTE_UNDELIVERABLE,
+  };
+  const sibling = {
+    clearedAt: "2026-11-03T22:52:34.948Z",
+    dueAt: "2026-11-04T08:15:00.000Z",
+    route: CLEAR_ROUTE_PATCH,
+  };
+
+  it("counts both routes, and reports the sibling route on its own counter", () => {
+    const tally = tallyOwedClears([feed("PEN-1", [undeliverable]), feed("PEN-2", [sibling])]);
+    assert.equal(tally.clears, 2);
+    assert.equal(tally.withDueTime, 2);
+    // The discrepancy is reachable from the summary line rather than only from a
+    // reader diffing `owed=` against `cancelled-clear-events-on-owed=`.
+    assert.equal(tally.viaPatchRoute, 1);
+    assert.deepEqual(tally.lines, [
+      "DUE PEN-1 cleared=2026-11-03T01:11:40.383Z due=2026-11-03T12:00:00.000Z route=undeliverable",
+      "DUE PEN-2 cleared=2026-11-03T22:52:34.948Z due=2026-11-04T08:15:00.000Z route=patch",
+    ]);
+  });
+
+  it("reports an unrecovered due time as MISSING rather than dropping the line", () => {
+    const tally = tallyOwedClears([feed("PEN-3", [{ ...sibling, dueAt: null }])]);
+    assert.equal(tally.clears, 1);
+    assert.equal(tally.withDueTime, 0);
+    assert.equal(tally.viaPatchRoute, 1);
+    assert.deepEqual(tally.lines, [
+      "DUE PEN-3 cleared=2026-11-03T22:52:34.948Z due=MISSING route=patch",
+    ]);
+  });
+
+  it("skips an unreadable feed, which the caller counts and exits on", () => {
+    const tally = tallyOwedClears([
+      { ok: false, item: { identifier: "PEN-4" }, error: "boom" },
+      feed("PEN-5", [undeliverable]),
+    ]);
+    assert.equal(tally.clears, 1);
+    assert.equal(tally.lines.length, 1);
+  });
+
+  it("is empty for no feeds at all", () => {
+    assert.deepEqual(tallyOwedClears([]), {
+      clears: 0,
+      withDueTime: 0,
+      viaPatchRoute: 0,
+      lines: [],
+    });
+    assert.equal(tallyOwedClears(null).clears, 0);
   });
 });
 

@@ -392,6 +392,102 @@ export function destroyedDueTimes(activityEvents) {
     }));
 }
 
+/** The clear routes, as a `DUE` line reports them. */
+export const CLEAR_ROUTE_UNDELIVERABLE = "undeliverable";
+export const CLEAR_ROUTE_PATCH = "patch";
+
+/**
+ * PEN-5518 — the same two facts on the OTHER clear action, which keys both of
+ * them differently.
+ *
+ * A `PATCH /api/issues/:id` setting `status: "cancelled"` on a row holding an
+ * armed monitor, without writing the monitor in the same request, leaves
+ * `monitorExplicitlyUpdated` false. The clear reason then comes from the row
+ * rather than being forced to `"manual"`, so `executionState.monitor.clearReason`
+ * is written `"cancelled"` -- the row IS selected as owed by `isCancelledClear`
+ * -- while the activity row goes out as the bare `issue.monitor_cleared`:
+ *
+ *     fact          undeliverable action      bare action
+ *     why-cleared   `clearReason`             `reason`
+ *     due time      `nextCheckAt`             `previousNextCheckAt`
+ *
+ * The vocabularies are disjoint, so `destroyedDueTimes` above cannot see such a
+ * clear. Before this reader an owed row on that route contributed no `DUE` line
+ * at all -- not even `due=MISSING`. It carried strictly worse data than a clear
+ * we did report (a due time that genuinely was destroyed) and was reported
+ * strictly less, lowering `cancelled-clear-events-on-owed` silently. That is the
+ * same dishonest output the `unreadable-feeds` counter exists to prevent on the
+ * other axis; the principle was already written down in this file and applied to
+ * one axis only.
+ *
+ * Note the emit guard at the bare site: it fires only when the previous monitor
+ * HAD a `nextCheckAt`, so on that path a null `dueAt` means the other emit site,
+ * not a benign clear.
+ *
+ * Do NOT collapse this into `destroyedDueTimes` by widening its action filter.
+ * Admitting the action without re-keying the read resolves `nextCheckAt` to
+ * undefined and `?? null` renders it `dueAt: null` -- a recoverable due time
+ * reported as unrecoverable, which reads as "recorded, genuinely lost" rather
+ * than as mis-keyed. `destroyedDueTimes` is pinned against exactly that mutation
+ * (PEN-5487). The readers stay separate because the emitters disagree about the
+ * keys, not about the facts.
+ */
+export function patchRouteClears(activityEvents) {
+  return (activityEvents ?? [])
+    .filter(
+      (event) =>
+        event?.action === "issue.monitor_cleared" && event?.details?.reason === "cancelled",
+    )
+    .map((event) => ({
+      clearedAt: event.createdAt,
+      dueAt: event.details?.previousNextCheckAt ?? null,
+      notes: event.details?.notes ?? null,
+      attemptCount: event.details?.attemptCount ?? null,
+    }));
+}
+
+/**
+ * Every cancelled clear on one owed row's feed, tagged with the route that
+ * emitted it. Tagging rather than merging: the two routes are reported together
+ * because they are the same fact, and kept distinguishable because only one of
+ * them was ever counted before.
+ */
+export function cancelledClears(activityEvents) {
+  return [
+    ...destroyedDueTimes(activityEvents).map((clear) => ({
+      ...clear,
+      route: CLEAR_ROUTE_UNDELIVERABLE,
+    })),
+    ...patchRouteClears(activityEvents).map((clear) => ({ ...clear, route: CLEAR_ROUTE_PATCH })),
+  ];
+}
+
+/**
+ * PEN-5518 — the row-to-clear pairing, lifted out of `main()` so it can be
+ * pinned. It was inline accounting over `feeds`, exported nowhere, so the one
+ * reading this instrument exists to produce was the one reading no test could
+ * reach.
+ *
+ * Unreadable feeds are skipped here and counted by the caller, which already
+ * reports and exits on them.
+ */
+export function tallyOwedClears(feeds) {
+  const tally = { clears: 0, withDueTime: 0, viaPatchRoute: 0, lines: [] };
+  for (const feed of feeds ?? []) {
+    if (!feed?.ok) continue;
+    for (const clear of feed.value?.clears ?? []) {
+      tally.clears += 1;
+      if (clear.dueAt) tally.withDueTime += 1;
+      if (clear.route === CLEAR_ROUTE_PATCH) tally.viaPatchRoute += 1;
+      tally.lines.push(
+        `DUE ${feed.value.identifier} cleared=${clear.clearedAt} ` +
+          `due=${clear.dueAt ?? "MISSING"} route=${clear.route}`,
+      );
+    }
+  }
+  return tally;
+}
+
 async function request(path) {
   const base = (process.env.PAPERCLIP_API_URL ?? "").replace(/\/$/, "");
   const key = process.env.PAPERCLIP_API_KEY;
@@ -526,25 +622,15 @@ async function main() {
   );
   const feeds = await mapSettled(owedIssues, concurrency, async (issue) => ({
     identifier: issue.identifier,
-    clears: destroyedDueTimes(await api(`/api/issues/${issue.id}/activity`)),
+    clears: cancelledClears(await api(`/api/issues/${issue.id}/activity`)),
   }));
 
-  let clears = 0;
-  let withDueTime = 0;
   // Counted, not skipped: a feed we could not read lowers `clears` without
   // lowering the confidence anyone reads off it, which is the same dishonest
   // output as a silently short scan.
   const feedFailures = feeds.filter((feed) => !feed.ok);
-  for (const feed of feeds) {
-    if (!feed.ok) continue;
-    for (const clear of feed.value.clears) {
-      clears += 1;
-      if (clear.dueAt) withDueTime += 1;
-      console.log(
-        `DUE ${feed.value.identifier} cleared=${clear.clearedAt} due=${clear.dueAt ?? "MISSING"}`,
-      );
-    }
-  }
+  const { clears, withDueTime, viaPatchRoute, lines } = tallyOwedClears(feeds);
+  for (const line of lines) console.log(line);
 
   // The post-condition check. Without this the "after" run reports `emitted=N`
   // from the stamp alone, i.e. it trusts the very stamp whose correctness is the
@@ -617,6 +703,7 @@ async function main() {
       `unresolved-multi-carrier=${unresolved.length} ` +
       `auto-discharged=${autoDischarged.length} ` +
       `cancelled-clear-events-on-owed=${clears} carrying-due-time=${withDueTime} ` +
+      `via-patch-route=${viaPatchRoute} ` +
       `unreadable-feeds=${feedFailures.length}`,
   );
 
