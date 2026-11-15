@@ -1990,34 +1990,72 @@ describe("githubListPullRequestCommits truncation", () => {
   const repoFullName = "Blockcast/paperclip";
   const prNumber = 1760;
 
-  function commitPage(count: number, label: string) {
+  function commitNodes(count: number, label: string) {
     return Array.from({ length: count }, (_, index) => ({
-      sha: `${label}-${index}`,
-      commit: { author: { email: `a${index}@blockcast.net`, name: `A${index}` } },
-      parents: [{ sha: "parent" }],
+      commit: {
+        oid: `${label}-${index}`,
+        author: { email: `a${index}@blockcast.net`, name: `A${index}` },
+        parents: { totalCount: 1 },
+      },
     }));
   }
 
-  /** Serve `total` commits across 100-per-page requests. */
-  function stubPages(total: number) {
+  /**
+   * Serve `total` commits across 100-per-page GraphQL requests.
+   *
+   * PEN-6341 item 2 slice 4: this stubs the GRAPHQL document, not the REST
+   * route, and the `/pulls/` arm below is a regression guard rather than a
+   * fixture -- a transport migration's blast radius is the set of suites that
+   * stub the TRANSPORT, and a double left in the old shape would make these
+   * assertions a tautology about their own fixture.
+   */
+  function stubPages(total: number, opts: { cursorless?: boolean } = {}) {
     setCreds();
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (url: string | URL) => {
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
         const value = String(url);
         if (value.includes("/access_tokens")) {
           return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
         }
-        const page = Number(value.match(/[?&]page=(\d+)/)?.[1] ?? "1");
-        const offset = (page - 1) * 100;
-        return jsonResponse(commitPage(Math.max(0, Math.min(100, total - offset)), `p${page}`));
+        if (value.includes("/pulls/")) throw new Error(`REST PR-commits read regressed: ${value}`);
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          variables?: { cursor?: string | null };
+        };
+        const cursor = body.variables?.cursor ?? null;
+        const pageIndex = cursor === null ? 0 : Number(cursor);
+        const offset = pageIndex * 100;
+        const count = Math.max(0, Math.min(100, total - offset));
+        const hasNextPage = offset + count < total;
+        return jsonResponse({
+          data: {
+            repository: {
+              pullRequest: {
+                commits: {
+                  totalCount: total,
+                  pageInfo: {
+                    hasNextPage,
+                    endCursor: hasNextPage && opts.cursorless ? null : String(pageIndex + 1),
+                  },
+                  nodes: commitNodes(count, `p${pageIndex + 1}`),
+                },
+              },
+            },
+          },
+        });
       }),
     );
   }
 
   it("flags a listing that lands on GitHub's 250-commit ceiling", async () => {
-    // What a >250-commit PR actually returns: 100, 100, 50. The 50 looks like
-    // a natural last page, so nothing but the total gives the truncation away.
+    // KEPT DELIBERATELY ACROSS THE TRANSPORT MOVE. Under REST this arm was
+    // forced: 100, 100, 50 -- the 50 looked like a natural last page and only
+    // the total gave the truncation away. GraphQL states `hasNextPage`, so the
+    // inference is gone and this arm is now CONSERVATIVE rather than forced.
+    // Dropping it would loosen a fail-closed input to a review-gate authorship
+    // decision, and the specimen that would settle whether GraphQL caps at 250
+    // too does not exist in either repo (max 16 commits over 200 recent PRs,
+    // measured 2026-11-15). So behaviour stays byte-identical to REST.
     stubPages(GITHUB_PR_COMMITS_ENDPOINT_LIMIT);
     const result = await githubListPullRequestCommits({ repoFullName, prNumber });
     expect("error" in result).toBe(false);
@@ -2035,6 +2073,49 @@ describe("githubListPullRequestCommits truncation", () => {
     if ("error" in result) return;
     expect(result.commits).toHaveLength(150);
     expect(result.truncated).toBe(false);
+  });
+
+  it("flags a listing cut short by this reader's own page budget", async () => {
+    // The arm the REST loop had to infer from a FULL last page. 301 commits
+    // means page 3 comes back full with `hasNextPage` still true, so the cap
+    // bites before the 250 ceiling does -- and the caller is told.
+    stubPages(301);
+    const result = await githubListPullRequestCommits({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.commits).toHaveLength(300);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("flags a 'there is more' the server gave no cursor to follow", async () => {
+    // A cursorless hasNextPage cannot be paged. Stopping silently would report
+    // a PREFIX as the whole listing, which is the one thing `truncated` exists
+    // to stop.
+    stubPages(150, { cursorless: true });
+    const result = await githubListPullRequestCommits({ repoFullName, prNumber });
+    expect("error" in result).toBe(false);
+    if ("error" in result) return;
+    expect(result.commits).toHaveLength(100);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("fails closed on an unreadable pull request rather than reporting no commits", async () => {
+    // `pullRequest: null` is REST's 404, and the REST reader made that an
+    // error. An empty commit list would read as "this PR has no foreign
+    // commits", which is the silent gap the notice exists to close.
+    setCreds();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string | URL) => {
+        const value = String(url);
+        if (value.includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        return jsonResponse({ data: { repository: { pullRequest: null } } });
+      }),
+    );
+    const result = await githubListPullRequestCommits({ repoFullName, prNumber });
+    expect(result).toEqual({ error: "pr_commits_not_found" });
   });
 });
 

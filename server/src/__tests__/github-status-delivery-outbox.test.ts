@@ -127,6 +127,33 @@ function isReviewsQuery(init?: unknown): boolean {
   return typeof body === "string" && body.includes("reviews(first:");
 }
 
+/**
+ * True when this GraphQL POST is the SHA-scoped peer enumeration (PEN-6341
+ * item 2 slice 4). Three documents now arrive on one `/graphql` url and are
+ * told apart by the document, never by the url.
+ */
+function isCommitPullsQuery(init?: unknown): boolean {
+  const body = (init as { body?: unknown } | undefined)?.body;
+  return typeof body === "string" && body.includes("associatedPullRequests(");
+}
+
+/** Wrap peer rows in the `Commit.associatedPullRequests` envelope the reader parses. */
+function graphQlCommitPullsEnvelope(nodes: unknown[]) {
+  return {
+    data: {
+      repository: {
+        object: {
+          associatedPullRequests: {
+            totalCount: nodes.length,
+            pageInfo: { hasNextPage: false, endCursor: null },
+            nodes,
+          },
+        },
+      },
+    },
+  };
+}
+
 function setCreds() {
   h.cfg.githubAppId = "3966421";
   h.cfg.githubAppInstallationId = "12345678";
@@ -287,7 +314,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     // live write succeeding while a retired-context supersede does not. 422 is
     // classified non-retryable, which keeps the bounded retry from sleeping.
     failPostContexts?: string[];
-    // `GET /commits/{sha}/pulls` — every open pull request at this head. The
+    // `Commit.associatedPullRequests` — every pull request at this head. The
     // gate sweeps it before publishing a `success` so a green means no PR at
     // this head is red (PEN-3818). It MUST be routed even when a test has no
     // peers to describe: left unstubbed the fetch throws, the enumeration fails
@@ -302,11 +329,20 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse(options.latestStatuses ?? []);
-      if (/\/commits\/[^/]+\/pulls(?:\?|$)/.test(u)) return jsonResponse(options.openPullRequestsAtHead ?? []);
+      // PEN-6341 item 2 slice 4: this enumeration is GraphQL now. A REST hit
+      // here is a REGRESSION, not a fixture - a double left in the old
+      // transport's shape would make every assertion below a tautology about
+      // its own stub rather than a test of the migrated reader.
+      if (/\/commits\/[^/]+\/pulls(?:\?|$)/.test(u)) {
+        throw new Error("REST peer enumeration regressed: " + u);
+      }
       // TWO GraphQL documents now arrive on this ONE url, and they are told
       // apart by the document rather than by the url: the reviews pager
       // (PEN-6341 item 2) and the PR-author field read.
       if (u.endsWith("/graphql")) {
+        if (isCommitPullsQuery(init)) {
+          return jsonResponse(graphQlCommitPullsEnvelope(options.openPullRequestsAtHead ?? []));
+        }
         if (isReviewsQuery(init)) {
           if (options.reviewsStatus && options.reviewsStatus >= 400) {
             return jsonResponse(
@@ -1188,16 +1224,16 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       };
     }
 
-    // The realistic `GET /commits/{sha}/pulls` page for these rows: the only
+    // The realistic `Commit.associatedPullRequests` page for these rows: only
     // open pull request at this head is the one being re-evaluated. The sweep
     // skips its own row, so this is the self-skip branch rather than a peer.
     function selfOnlyPullsPage() {
       return [
         {
           number: 105,
-          state: "open",
-          head: { sha: HEAD_SHA },
-          html_url: "https://github.com/Blockcast/frr/pull/105",
+          state: "OPEN",
+          headRefOid: HEAD_SHA,
+          url: "https://github.com/Blockcast/frr/pull/105",
         },
       ];
     }
