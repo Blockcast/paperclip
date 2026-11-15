@@ -2118,6 +2118,46 @@ export function formatUnclocked(unclocked) {
   );
 }
 
+/**
+ * Splits strands into the ones that fail the run and the ones that only report.
+ *
+ * The strand arm is promoted to a hard failure by `ALLY_STRAND_FAIL`, and a
+ * hard failure needs the same scoping the shape audit already has: a strand on
+ * a PR GitHub will not merge from cannot reach master, and an abandoned
+ * never-attested PR would otherwise pin this hourly run red forever — "an
+ * auditor whose output is a constant carries no more information than no
+ * auditor", the ratchet argument PEN-2847 makes and PEN-5793 restates.
+ *
+ * The tier is on the FAILING predicate and deliberately NOT on the detector:
+ * `findStrands` still returns every strand and `main` still reports every one
+ * of them. Exclusion-minimalism here is hard-won — PEN-5793 measured that the
+ * review-request exclusion, which looked equally reasonable, would have muted
+ * 44-56% of live PRs and the founding #3452 incident itself for its first 71
+ * minutes. A dormant strand is still information; it is just not a reason to
+ * turn the trunk red. Drafts remain the only detector-level exclusion.
+ *
+ * Mirrors `partitionByMergeEligibility`, including its polarity: a strand whose
+ * PR is not in `prs` gets no dormancy reason and so stays LIVE and fails. A
+ * lookup that silently failed must not read as "this one does not matter".
+ */
+export function partitionStrandsByDormancy(strands, prs, now = Date.now()) {
+  const byNumber = new Map((prs ?? []).map((pr) => [String(pr?.number), pr]));
+  const live = [];
+  const dormant = [];
+
+  for (const strand of strands ?? []) {
+    const pr = byNumber.get(String(strand?.number));
+    const reason = pr ? prDormancy(pr, now) : null;
+    if (reason) {
+      dormant.push({ ...strand, reason });
+    } else {
+      live.push(strand);
+    }
+  }
+
+  return { live, dormant };
+}
+
 export function main({
   fetchPrs = fetchOpenPrs,
   fetchClock = fetchHeadClock,
@@ -2156,12 +2196,28 @@ export function main({
     now,
   });
 
+  // REPORT every strand; FAIL only on the non-dormant ones. The tier lives on
+  // the failing predicate, never on the detector — see partitionStrandsByDormancy.
+  const { live: liveStrands, dormant: dormantStrands } = partitionStrandsByDormancy(
+    strands,
+    prs,
+    now,
+  );
+
   log(
     `Unattested-head strand detector (threshold ${formatDuration(STRAND_THRESHOLD_MS)}): ` +
-      `${strands.length} strand(s), ${unclocked.length} unclocked head(s).`,
+      `${strands.length} strand(s)` +
+      `${dormantStrands.length > 0 ? ` (${liveStrands.length} live, ${dormantStrands.length} dormant)` : ""}, ` +
+      `${unclocked.length} unclocked head(s).`,
   );
-  for (const strand of strands) {
+  for (const strand of liveStrands) {
     log(`::warning title=Unattested PR head::${formatStrand(strand)}`);
+  }
+  for (const strand of dormantStrands) {
+    log(
+      `::warning title=Unattested PR head on an unmergeable PR::` +
+        `${formatStrand(strand)} [${strand.reason}] — reported, and does not fail this run.`,
+    );
   }
   if (unclocked.length > 0) {
     log(`::warning title=Ally strand clock unreadable::${formatUnclocked(unclocked)}`);
@@ -2218,12 +2274,25 @@ export function main({
     return;
   }
 
-  if (strandFail && strands.length > 0) {
+  if (strandFail && liveStrands.length > 0) {
     err(
-      `Ally review-consistency guard FAILED for ${repo}: ${strands.length} non-draft open ` +
+      `Ally review-consistency guard FAILED for ${repo}: ${liveStrands.length} non-draft open ` +
         `head(s) unattested past ${formatDuration(STRAND_THRESHOLD_MS)}.\n`,
     );
-    for (const strand of strands) err(`  ${formatStrand(strand)}`);
+    for (const strand of liveStrands) err(`  ${formatStrand(strand)}`);
+    if (dormantStrands.length > 0) {
+      err(
+        `\n${dormantStrands.length} further strand(s) are reported above on PR(s) GitHub will ` +
+          `not merge from and do not fail this run. Each returns to failing the moment its PR ` +
+          `becomes mergeable.`,
+      );
+    }
+    err(
+      `\nA strand means the reviewer has produced no verdict at this head. It is a latency ` +
+        `condition with no stable fingerprint, so it is NOT baselineable: it clears when the ` +
+        `head is reviewed. If the reviewer is healthy, the trigger was lost — re-request a ` +
+        `review on the PR with a start-of-body \`paperclip:review-request\` marker. See PEN-5793.`,
+    );
     exit(1);
     return;
   }
