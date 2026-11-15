@@ -11,6 +11,8 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  classifyGitHubCliRefusal,
+  formatGitHubCliRefusalNotice,
   prepareGitHubCliInvocation,
   runGitHubCliEgressRuntime,
 } from "./github-cli-egress-runtime.js";
@@ -64,6 +66,31 @@ function makeFixture(): {
   );
 
   return { directory, target, record };
+}
+
+/** A target that writes the given chunks to STDERR, flushing between them so
+ *  they arrive as separate reads, then exits non-zero as a refused `gh` does.
+ *  Used to exercise the PEN-6243 refusal scan over real chunk boundaries. */
+function makeSplittingFixture(chunks: readonly string[]): { directory: string; target: string } {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "paperclip-gh-egress-refusal-"));
+  temporaryDirectories.push(directory);
+  const target = path.join(directory, "gh-target.mjs");
+  writeFileSync(
+    target,
+    [
+      "#!/usr/bin/env node",
+      `const chunks = ${JSON.stringify(chunks)};`,
+      "let i = 0;",
+      "const next = () => {",
+      "  if (i >= chunks.length) { process.exit(chunks.length > 0 ? 1 : 0); return; }",
+      "  process.stderr.write(chunks[i++], () => setTimeout(next, 5));",
+      "};",
+      "next();",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return { directory, target };
 }
 
 describe("github-cli-egress-runtime", () => {
@@ -442,5 +469,111 @@ describe("PEN-5734: a rewrite is announced, never silent", () => {
         },
       }),
     ).toThrow(/refusing to rewrite GitHub repository content/);
+  });
+});
+describe("PEN-6243: a seat's rate-limit refusal is counted, and nothing else is", () => {
+  // The classifier is the whole discrimination, so it is tested directly:
+  // a spawn test can only ever show that SOME path fired.
+  it("classifies a primary installation rate-limit refusal", () => {
+    const stderr =
+      "gh: API rate limit exceeded for installation ID 138085375. " +
+      "(HTTP 403)\n";
+    expect(classifyGitHubCliRefusal(stderr)).toBe("rate_limit");
+    expect(formatGitHubCliRefusalNotice("rate_limit", stderr)).toBe(
+      "[paperclip] github-egress-refusal reason=rate_limit installation=138085375",
+    );
+  });
+
+  it("classifies a secondary rate-limit refusal, which names no installation", () => {
+    const stderr =
+      "gh: You have exceeded a secondary rate limit. " +
+      "Please wait a few minutes before you try again.\n";
+    expect(classifyGitHubCliRefusal(stderr)).toBe("secondary_rate_limit");
+    expect(formatGitHubCliRefusalNotice("secondary_rate_limit", stderr)).toBe(
+      "[paperclip] github-egress-refusal reason=secondary_rate_limit installation=unknown",
+    );
+  });
+
+  // The discipline DEFINITE_ABSENCE_PATTERN states: anything indeterminate
+  // falls through uncounted. These are the refusals that are NOT budget ones,
+  // and counting any of them would make the series invent blocked work.
+  it.each([
+    ["a bare 403, which is an authorization failure far more often", "gh: HTTP 403: Resource not accessible by integration\n"],
+    ["a 404", "gh: Not Found (HTTP 404)\n"],
+    ["a 5xx", "gh: HTTP 502: Bad gateway\n"],
+    ["a DNS failure", "gh: Get \"https://api.github.com\": dial tcp: lookup api.github.com: no such host\n"],
+    ["an auth prompt", "gh: To get started with GitHub CLI, please run: gh auth login\n"],
+    ["empty stderr", ""],
+  ])("does not count %s", (_label, stderr) => {
+    expect(classifyGitHubCliRefusal(stderr)).toBeNull();
+  });
+
+  it("counts a refusal split across two stderr chunks", async () => {
+    const fixture = makeSplittingFixture([
+      "gh: API rate limit exce",
+      "eded for installation ID 138085375.\n",
+    ]);
+    const notices: string[] = [];
+    await runGitHubCliEgressRuntime({
+      target: fixture.target,
+      argv: ["api", "/rate_limit"],
+      io: { notify: (message) => notices.push(message) },
+    });
+    expect(notices).toEqual([
+      "[paperclip] github-egress-refusal reason=rate_limit installation=138085375",
+    ]);
+  });
+
+  it("emits ONE line even when gh prints the refusal on every retry", async () => {
+    const line = "gh: API rate limit exceeded for installation ID 138085375.\n";
+    const fixture = makeSplittingFixture([line, line, line]);
+    const notices: string[] = [];
+    await runGitHubCliEgressRuntime({
+      target: fixture.target,
+      argv: ["api", "/rate_limit"],
+      io: { notify: (message) => notices.push(message) },
+    });
+    expect(notices).toHaveLength(1);
+  });
+
+  it("re-emits the target's stderr byte-exact, refusal or not", async () => {
+    const payload = "gh: API rate limit exceeded for installation ID 138085375.\nsecond line\n";
+    const fixture = makeSplittingFixture([payload]);
+    const captured: Buffer[] = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (process.stderr as any).write = (chunk: any, ...rest: any[]) => {
+      captured.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+      return true;
+    };
+    try {
+      await runGitHubCliEgressRuntime({
+        target: fixture.target,
+        argv: ["api", "/rate_limit"],
+        io: { notify: () => {} },
+      });
+    } finally {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (process.stderr as any).write = realWrite;
+    }
+    expect(Buffer.concat(captured).toString("utf8")).toBe(payload);
+  });
+
+  it("says nothing on a call the target completes cleanly", async () => {
+    const fixture = makeSplittingFixture([]);
+    const notices: string[] = [];
+    await runGitHubCliEgressRuntime({
+      target: fixture.target,
+      argv: ["api", "/rate_limit"],
+      io: { notify: (message) => notices.push(message) },
+    });
+    expect(notices).toEqual([]);
+  });
+
+  it("carries no argv, repository or payload in the notice", () => {
+    const stderr = "gh: API rate limit exceeded for installation ID 138085375.\n";
+    const notice = formatGitHubCliRefusalNotice("rate_limit", stderr);
+    expect(notice).not.toMatch(/Blockcast|repos|pulls|ghp_|Bearer/);
+    expect(notice.split(/\s+/)).toHaveLength(4);
   });
 });
