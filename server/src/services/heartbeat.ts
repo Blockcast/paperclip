@@ -13798,8 +13798,8 @@ export function triggeredMonitorForPrompt(
       maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
       serviceName: monitor.serviceName ?? null,
       // PEN-6476: the only field here that carries INTENT rather than schedule.
-      // `derivePersistedMonitorState` already resolves it -- `monitorNotes` column,
-      // then policy, then JSON state, in that precedence -- so dropping it on the
+      // `derivePersistedMonitorState` already resolves it -- the armed POLICY note,
+      // then the `monitorNotes` column, then JSON state -- so dropping it on the
       // way out handed the woken run four scheduling scalars and none of the reason
       // the monitor was armed. The run a monitor fires is the run that note was
       // written for, which is the one moment it is worth prompt space.
