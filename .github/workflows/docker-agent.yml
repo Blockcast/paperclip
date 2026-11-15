@@ -606,10 +606,14 @@ jobs:
       #                   the guard it is supposed to be subject to.
       #   chmod o+w       the same, by mode rather than owner.
       #
-      # `docker commit` rather than a one-layer `docker build`: the builder in
-      # this job may be a remote BuildKit endpoint (see "Select BuildKit
-      # endpoint"), and a control must not depend on `--load` round-tripping an
-      # image back from it. Nothing here is pushed; the tags are local and
+      # A one-layer `buildx build --builder default --load` per control, the
+      # same pattern as the PEN-4541 controls above. `--builder default` is the
+      # local daemon's own docker driver, so the remote BuildKit endpoint (see
+      # "Select BuildKit endpoint") is never involved and nothing round-trips.
+      # This used to be `docker run` + `docker commit`; under dind's containerd
+      # snapshotter that commit stalled for 70m+ per control on a busy disk
+      # while the BuildKit path above finished in 10m on the same daemon, disk
+      # and image (BLO-55708). Nothing here is pushed; the tags are local and
       # removed at the end.
       - name: Prove the publish-guard assertion reds on a bad image (PEN-4932 positive controls)
         env:
@@ -617,23 +621,23 @@ jobs:
         run: |
           set -euo pipefail
           hooks=/usr/local/libexec/paperclip/hooks
+          ctx=$(mktemp -d)
           n=0
           while IFS='|' read -r mutation mode; do
             [ -n "$mutation" ] || continue
             n=$((n + 1))
-            cname="pen4932-control-$n"
             tag="pen4932-control:$n"
 
             # Fail AT the mutation if it does not apply. A mutation that silently
-            # no-ops would commit an unmutated image, the arm would pass, and this
+            # no-ops would build an unmutated image, the arm would pass, and this
             # step would print CONTROL FAILED against a good image -- blaming the
             # image for a broken control. Same lesson as the PEN-4682 plant above.
-            docker rm -f "$cname" >/dev/null 2>&1 || true
-            docker run --user 0:0 --network none --name "$cname" \
-              --entrypoint sh "$AGENT_IMAGE" -ec "$mutation" ||
+            # A failing RUN fails the build, which lands here.
+            printf 'FROM %s\nUSER 0:0\nRUN set -e; %s\n' "$AGENT_IMAGE" "$mutation" \
+              > "$ctx/Dockerfile"
+            docker buildx build --builder default --load --network none \
+              --tag "$tag" "$ctx" ||
               { echo "CONTROL BROKEN: mutation '$mutation' did not apply to the image; nothing below was measured." >&2; exit 1; }
-            docker commit "$cname" "$tag" >/dev/null
-            docker rm -f "$cname" >/dev/null
 
             if docker run --rm -i --user 1000:1000 --read-only \
                  --security-opt no-new-privileges --cap-drop ALL --network none \
