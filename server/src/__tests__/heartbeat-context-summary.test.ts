@@ -5197,6 +5197,17 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
   // convenience: notes carry FACTS and this surface carries INSTRUMENTS, so a note never
   // needs rewriting when the instrument changes. PEN-4656's note survived the outage on
   // exactly this split.
+  // BLO-57576: the plain-URL clone rule must reach every company, so it lives here.
+  it("tells every wake to clone with a plain URL, never an embedded token", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+    expect(markdown).toContain("Cloning a GitHub repository:");
+    expect(markdown).toContain("NEVER put a token in the URL");
+    const containmentOnly = buildPaperclipTaskMarkdown({
+      issue: null,
+      recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE,
+    });
+    expect(containmentOnly).toContain("Cloning a GitHub repository:");
+  });
   it("tells a note author to name the fact, not the command", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
