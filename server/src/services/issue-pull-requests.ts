@@ -372,6 +372,9 @@ query($q: String!, $first: Int!, $cursor: String) {
  * Named rather than inlined because the truncation test at the bottom of the
  * loop compares against it: as two literals they could drift apart silently,
  * and the symptom would be a prefix enumeration reported as a complete one.
+ * Re-exported as `__test_MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES` for the same
+ * reason -- `pr-reconciler-work-product-repair.test.ts` drives the loop to the
+ * cap and must not hard-code a third copy of the number.
  */
 const MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES = 10;
 
@@ -534,11 +537,22 @@ export async function reconcileMergedPullRequests(
       );
     }
     if (items.length === 0) {
-      // PEN-6733: an empty page is not always the end of the results. A page
-      // whose pull-request nodes ALL failed to read yields no items and is
-      // indistinguishable here from a genuinely exhausted window -- so the
-      // break below truncates the enumeration, and `enumerated` then reads as
-      // a complete count of a window that was never finished.
+      // PEN-6733: an empty page is not always the end of the results, and the
+      // two reasons it can be empty take DIFFERENT reports.
+      //
+      // `hasNextPage === true` is the server's own statement that more results
+      // exist, so breaking here leaves `enumerated` a PREFIX of the window.
+      // That is a truncation and is reported as one.
+      //
+      // `hasNextPage === false` is the end of the window. A page whose
+      // pull-request nodes ALL failed to read has LOST rows -- but it lost
+      // them from a window this walk reached the end of, so the enumeration is
+      // SHORT, not truncated, and `unreadableNodes` already reports the loss.
+      // Setting the flag here as well would put one number across two states,
+      // which is the exact conflation this change exists to remove, one field
+      // over. Keeping the two orthogonal is what lets a consumer rely on
+      // `enumerated + unreadableNodes` accounting for the whole window
+      // whenever `enumerationTruncated` is false.
       //
       // The break itself is KEPT, and not because it is right: `endCursor` is
       // on this page and could be followed. It is kept because paging on
@@ -547,7 +561,7 @@ export async function reconcileMergedPullRequests(
       // `truncatedTargets` in production rather than guessed at here. What
       // changes is that the caller is TOLD, which is what makes that
       // measurement possible at all.
-      if (unreadableNodesThisPage > 0 || connection.pageInfo?.hasNextPage === true) {
+      if (connection.pageInfo?.hasNextPage === true) {
         enumerationTruncated = true;
       }
       break;
@@ -770,3 +784,4 @@ export async function reconcileMergedPullRequests(
 // Test-only re-exports.
 export const __test_LINK_SOURCE_STRENGTH = LINK_SOURCE_STRENGTH;
 export const __test_selectIssuePerCompany = selectIssuePerCompany;
+export const __test_MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES = MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES;

@@ -55,7 +55,28 @@ vi.hoisted(() => {
  * their own fixture. `ghFetch` stays mocked too, and now serves NOTHING: any
  * REST read from this path is a regression, not a fixture.
  */
-const githubResponses = vi.hoisted(() => ({ searchNodes: [] as unknown[] }));
+const githubResponses = vi.hoisted(() => ({
+  searchNodes: [] as unknown[],
+  /**
+   * PEN-6733: the envelope's `pageInfo`, as a fixture INPUT.
+   *
+   * The default is the single-page shape every assertion above the truncation
+   * block relies on. The three paths that end the page loop early are
+   * distinguished only by this object, so a test that wants to reach one has
+   * to be able to set it -- with it hard-coded, two of the three were
+   * unreachable and therefore untested.
+   */
+  pageInfo: { hasNextPage: false, endCursor: null } as {
+    hasNextPage: boolean;
+    endCursor: string | null;
+  },
+  /**
+   * How many pages the reconciler actually asked for. The page-cap test
+   * asserts the loop STOPPED at the cap: without this it would pass just as
+   * well against a loop that ran forever and was killed by the test timeout.
+   */
+  pageCalls: 0,
+}));
 
 vi.mock("../services/github-fetch.js", () => ({
   gitHubApiBase: () => "https://api.github.com",
@@ -67,15 +88,18 @@ vi.mock("../services/github-fetch.js", () => ({
 }));
 
 vi.mock("../services/github-app-auth.js", () => ({
-  ghGraphQlQuery: async () => ({
-    ok: true as const,
-    data: {
-      search: {
-        pageInfo: { hasNextPage: false, endCursor: null },
-        nodes: githubResponses.searchNodes,
+  ghGraphQlQuery: async () => {
+    githubResponses.pageCalls += 1;
+    return {
+      ok: true as const,
+      data: {
+        search: {
+          pageInfo: githubResponses.pageInfo,
+          nodes: githubResponses.searchNodes,
+        },
       },
-    },
-  }),
+    };
+  },
 }));
 
 const {
@@ -83,7 +107,10 @@ const {
   PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
 } = await import("../services/pull-request-work-products.js");
-const { reconcileMergedPullRequests } = await import("../services/issue-pull-requests.js");
+const {
+  reconcileMergedPullRequests,
+  __test_MERGED_PULL_REQUESTS_SEARCH_MAX_PAGES: MAX_PAGES,
+} = await import("../services/issue-pull-requests.js");
 const { workProductService } = await import("../services/work-products.js");
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -159,6 +186,8 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     await db.delete(issues);
     await db.delete(companies);
     githubResponses.searchNodes = [];
+    githubResponses.pageInfo = { hasNextPage: false, endCursor: null };
+    githubResponses.pageCalls = 0;
   });
 
   afterAll(async () => {
@@ -328,12 +357,18 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     // The zero that used to be the whole report...
     expect(result.workProductsOffered).toBe(0);
     expect(result.enumerated).toBe(0);
-    // ...and the two fields that now say it is not a clean one. The Issue is
+    // ...and the field that now says it is not a clean one. The Issue is
     // excluded, so this counts 1 and not 2.
     expect(result.unreadableNodes).toBe(1);
-    // No readable item on the page, so the enumeration stopped early: the
-    // count above is a PREFIX of the window, not a measurement of it.
-    expect(result.enumerationTruncated).toBe(true);
+    // ...while truncation stays FALSE, and that is the point of this pair.
+    // The stub page is the LAST one (`hasNextPage: false`), so the walk
+    // reached the end of the window: rows were LOST, not left unread. The two
+    // fields answer different questions -- `unreadableNodes` reports a loss,
+    // `enumerationTruncated` reports a PREFIX -- and keeping them orthogonal
+    // is what lets a consumer add `enumerated + unreadableNodes` and account
+    // for the whole window. The truncation tests below drive the three paths
+    // that do set the flag.
+    expect(result.enumerationTruncated).toBe(false);
 
     // Nothing was repaired on work that was never read.
     const row = await readRow(company.id);
@@ -358,5 +393,97 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     // The repair still lands, so the two fields above are reporting on a sweep
     // that actually did its work.
     expect(result.workProductsOffered).toBe(1);
+  });
+
+  /**
+   * PEN-6733. THREE code paths end the page loop early and every one of them
+   * leaves `enumerated` a PREFIX of the window. Each gets its own test, and
+   * the fixtures are built so that reverting any single
+   * `enumerationTruncated = true` in `reconcileMergedPullRequests` fails
+   * EXACTLY ONE of them -- which is the only thing that makes these a control
+   * on the flag rather than three ways of observing one path.
+   *
+   * They are deliberately not table-driven: the three differ in what the
+   * server says, not in a parameter, and a shared fixture would hide that the
+   * paths are reached by different envelopes.
+   */
+  it("reports an all-unreadable page as truncated when more results remain (PEN-6733 path 1)", async () => {
+    const { company } = await seed("ready_for_review", {
+      lastEventAction: "opened",
+      sourceEventOrder: 10,
+      sourceEventActionOrder: 10,
+      sourceEventTimestamp: "2026-10-29T18:40:57Z",
+      sourceEventTimestampMs: Date.parse("2026-10-29T18:40:57Z"),
+    });
+
+    // Same unreadable page as the orthogonality test above -- the ONE thing
+    // changed is the server saying another page exists. That is what turns a
+    // short enumeration into a prefix, and it is the whole difference between
+    // this test's `true` and that test's `false`.
+    githubResponses.searchNodes = [
+      { __typename: "PullRequest", number: null, title: "unreadable" },
+      { __typename: "Issue", number: 12, title: "not a pull request" },
+    ];
+    githubResponses.pageInfo = { hasNextPage: true, endCursor: "cursor-page-2" };
+
+    const result = await runReconciler(db, company.id);
+
+    expect(result.enumerationTruncated).toBe(true);
+    expect(result.enumerated).toBe(0);
+    // The loss is still reported separately, and the loop still stopped: this
+    // path breaks rather than following the cursor.
+    expect(result.unreadableNodes).toBe(1);
+    expect(githubResponses.pageCalls).toBe(1);
+  });
+
+  it("reports another page with no cursor as truncated (PEN-6733 path 2)", async () => {
+    const { company } = await seed("ready_for_review", {
+      lastEventAction: "opened",
+      sourceEventOrder: 10,
+      sourceEventActionOrder: 10,
+      sourceEventTimestamp: "2026-10-29T18:40:57Z",
+      sourceEventTimestampMs: Date.parse("2026-10-29T18:40:57Z"),
+    });
+
+    // "There is more" with nothing to follow it with. The page itself reads
+    // fine, which is what separates this from path 1: a sweep can enumerate
+    // and repair real work and STILL be reporting a prefix.
+    githubResponses.pageInfo = { hasNextPage: true, endCursor: null };
+
+    const result = await runReconciler(db, company.id);
+
+    expect(result.enumerationTruncated).toBe(true);
+    // Nothing was unreadable -- the flag is not leaking in from path 1.
+    expect(result.unreadableNodes).toBe(0);
+    expect(result.enumerated).toBe(1);
+    // ...and the work on the page it DID read still landed.
+    expect(result.workProductsOffered).toBe(1);
+    expect(githubResponses.pageCalls).toBe(1);
+  });
+
+  it("reports hitting the page cap as truncated (PEN-6733 path 3)", async () => {
+    const { company } = await seed("ready_for_review", {
+      lastEventAction: "opened",
+      sourceEventOrder: 10,
+      sourceEventActionOrder: 10,
+      sourceEventTimestamp: "2026-10-29T18:40:57Z",
+      sourceEventTimestampMs: Date.parse("2026-10-29T18:40:57Z"),
+    });
+
+    // Every page says there is another one and hands back a usable cursor, so
+    // the loop is bounded only by the cap. A window wider than the cap returns
+    // a prefix that is arithmetically indistinguishable from a complete sweep.
+    githubResponses.pageInfo = { hasNextPage: true, endCursor: "cursor-next" };
+
+    const result = await runReconciler(db, company.id);
+
+    expect(result.enumerationTruncated).toBe(true);
+    // The loop STOPPED at the cap. Asserting against the exported constant
+    // rather than a literal is the point of exporting it: a third copy of the
+    // number could drift from the loop bound silently.
+    expect(githubResponses.pageCalls).toBe(MAX_PAGES);
+    expect(result.enumerated).toBe(MAX_PAGES);
+    // Readable pages throughout -- this path owes nothing to the other two.
+    expect(result.unreadableNodes).toBe(0);
   });
 });
