@@ -133,45 +133,8 @@ branch this record describes. `--fix` never relocates a range either — re-deri
 is a judgement about what the citation covers — so the unique construct is the only thing that
 will catch the next drift.
 
-When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix --base origin/master`
-— it rewrites any anchor whose construct it can place unambiguously, and reports the rest
-rather than guessing.
-
-**`--base` is required, and it is what keeps the remedy from widening your diff** (PEN-6680).
-`--fix` rewrites only the numbers your own change made stale: one citing a source file you
-moved, or one in a document you are already editing. **Moved and editing mean your WORKING
-TREE, not your commits** — the remedy is for the edit in front of you, so it counts unstaged,
-staged and untracked work as well as committed work. (Attribution for the PR gate is the
-committed diff, which is the right shape there and the wrong one here: narrowing the rewrite
-to it made this command a silent no-op before the first commit, which is most of the times
-anyone runs it. Passing `--head` pins the comparison back to a commit, which is what CI does
-and what you want under a merge-ref checkout; local runs should leave it off. The comparison
-is against the commit you branched FROM, not against `origin/master`'s tip, so a branch that
-is behind master — the normal state once you have fetched — does not inherit master's files
-as its own; without that anchor the remedy widened again through the same documents, which is
-how this was found.) Everything else is the base's drift, and
-rewriting it writes a shared line in a document you never opened — which manufactures exactly
-the pairwise conflict PEN-6674 removed the mandate for, arrived at voluntarily. Measured on
-#3774: a `--fix` run also renumbered a `Dockerfile` anchor, from line 674 to line 705, in an
-unrelated security document, over drift the same run's own report had scored as the base's.
-(Written out in prose on purpose — an anchor quoted as an EXAMPLE inside a code span is
-indistinguishable from one meant as a citation, and this check has no quotation register, so
-the illustration becomes a live claim that then has to be maintained.) A bare `--fix`
-with no base now refuses rather than guessing wide. `--fix-all` is the wide mode and is named
-so that taking it is a decision — it is safe for a single writer on `master` and not for a
-pull request.
-
-**A stale number does not fail your pull request either, and you are not expected to run `--fix`
-before landing** (PEN-6674). Where the construct is still in the file at exactly one place, the
-checker reports `STALE NUMBER` with the line it found and moves on: the citation is the construct,
-and the checker is holding the right number while it decides. Only rot is fatal — the construct
-gone from the file, sitting at several candidate sites, or pinned by a range, which `--fix` refuses
-to relocate. The reason is concurrency, not leniency. Requiring the number made `--fix` a WRITE to
-this shared document that every PR moving a cited file had to make, so two such PRs rewrote the
-same lines to different numbers and conflicted on merge-queue staging; and an entry whose numbers
-were right against its own base was wrong against the merge-group head, which carries the entries
-queued ahead of it. On 2026-11-14 that evicted `#3715` three times and `#3476` once, each eviction
-spending a human enqueue act, for a number no side could have held.
+When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix` — it rewrites any
+anchor whose construct it can place unambiguously, and reports the rest rather than guessing.
 
 **A drift already on `master` does not fail your pull request.** CI passes `--base $PR_BASE_SHA`,
 and an anchor that was already failing against the base is reported as `INHERITED` rather than
@@ -258,32 +221,32 @@ ancestor of `master` is reading the wrong field.
 not affect the fleet today, because the gate is off everywhere and the overlay can only set it to the
 value it already has. **It becomes live the moment stage 1 sets the gate `true` at agent scope.**
 
-The chain:
+The chain, read at `47d01a4bf`:
 
 <!-- anchor-file: server/src/services/heartbeat.ts -->
 
-1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8879`
+1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8818`
    (`function parseIssueAssigneeAdapterOverrides(`), parses
    `issue.assigneeAdapterOverrides.adapterConfig` with `parseObject` and **no key allowlist** —
    arbitrary keys pass.
-2. `mergeModelProfileAdapterConfig`, defined at `:7541`
+2. `mergeModelProfileAdapterConfig`, defined at `:7480`
    (`export function mergeModelProfileAdapterConfig(input: {`), is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` at `:38413`
+3. The merged object becomes `executionRunConfig` at `:39158`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
-4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3365`
+4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3304`
    (`function withAgentScopedEnvProvenance(`), re-asserts agent values for
    `AGENT_SCOPE_ONLY_ENV_KEYS` — three keys, **inside `env`**. It does nothing for top-level
    `adapterConfig` keys.
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:37814`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:38554`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
-The code already knows this class of problem. The comment at `:3348`
+The code already knows this class of problem. The comment at `:3287`
 (`is issue.assigneeAdapterOverrides.adapterConfig.`) says it in as many words:
 
 > `issueAdapterConfig` is `issue.assigneeAdapterOverrides.adapterConfig`.
@@ -1077,11 +1040,11 @@ precondition as outstanding, which is the *conservative* direction but still wro
 **Six of six discharged.** ⚠ The sixth was discharged by **closure**, not by merge, and the
 distinction matters: #3112's content reached `master` through #3123 and #3133 while #3112 itself was
 closed unmerged. A ledger that reads `merged` as the discharge condition would call this row
-outstanding forever. Re-verified at source — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
+outstanding forever. Re-verified at source on `47d01a4bf` — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
 (`server/src/services/agent-config-key-pins.ts:99`
 (`const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([`)), `withAgentScopedConfigProvenance`
-(defined `server/src/services/heartbeat.ts:3392`
-(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7551`
+(defined `server/src/services/heartbeat.ts:3331`
+(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7490`
 (`return withAgentScopedConfigProvenance(`)), `BROKERED_POD_COMPOSITION_CONFIG_KEYS`
 (`server/src/services/agent-config-key-pins.ts:272`
 (`const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([`), three keys),
