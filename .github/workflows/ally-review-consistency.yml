@@ -80,6 +80,14 @@ name: Ally Review Consistency Guard
 # four times running, and nothing acted on it: the strand was cleared by a seat
 # that found it by its own route while the finding sat in a green run's log
 # annotations. A notice inside a passing run is not a signal. Hence the promotion.
+#
+# One consequence of promoting, worth stating because it is easy to miss: once
+# the strand arm FAILS, `report` becomes the QUIET state relative to it, so an
+# unclocked head - the state a lost checks:read or a 403 on the rate-limit shard
+# produces - would have silenced the arm inside a green run. The no-alarm state
+# therefore requires a PRESENT push stamp: an unclocked head on a live PR fails,
+# aggregated into one line rather than one per head so a rate-limit window emits
+# a signal rather than N of them. See PEN-5445 on gate polarity.
 
 on:
   schedule:
@@ -96,7 +104,9 @@ permissions:
   pull-requests: read
   # The strand detector clocks an unattested head from its check-suite
   # created_at. Without checks:read that read 403s and EVERY unattested head
-  # reports `unclocked` — the detector stays loud but stops discriminating.
+  # reports `unclocked`. While the arm only reported, that left it loud but
+  # non-discriminating; now that it FAILS, an unclocked head on a live PR fails
+  # the run too, so losing this permission is loud rather than silently green.
   checks: read
 
 jobs:

@@ -3466,6 +3466,19 @@ describe("unattested-head strand detector (PEN-5793 done-when #4)", () => {
       assert.equal(dormant.length, 0);
     });
 
+    // Tier 2: the idle window applies ONLY where GitHub reported no usable merge
+    // state. A BEHIND/BLOCKED PR is one GitHub would still merge from on a click,
+    // with no transition and no run in between, so it stays fatal at any age.
+    it("keeps a strand live on a long-idle PR whose merge state GitHub DID compute", () => {
+      const ancient = new Date(NOW - (MAX_IDLE_DAYS + 30) * 24 * 60 * minutes(1)).toISOString();
+      for (const mergeStateStatus of ["BEHIND", "BLOCKED", "CLEAN", "UNSTABLE"]) {
+        const prs = [openPr({ mergeStateStatus, updatedAt: ancient })];
+        const { live, dormant } = partitionStrandsByDormancy([strand(3452)], prs, NOW);
+        assert.equal(live.length, 1, `${mergeStateStatus} must stay live at any age`);
+        assert.equal(dormant.length, 0, `${mergeStateStatus} must not defer`);
+      }
+    });
+
     it("handles empty input", () => {
       assert.deepEqual(partitionStrandsByDormancy([], []), { live: [], dormant: [] });
       assert.deepEqual(partitionStrandsByDormancy(undefined, undefined), { live: [], dormant: [] });
@@ -3614,6 +3627,42 @@ describe("unattested-head strand detector (PEN-5793 done-when #4)", () => {
       assert.match(errs, /#3452/);
       assert.doesNotMatch(errs.split("further strand")[0], /#3453/);
       assert.match(errs, /1 further strand\(s\) are reported above/);
+    });
+
+    // Suggestion 1 on PR #3816. Promoting the strand arm to failing makes
+    // `report` the quiet state, so an unclocked head — the state a lost
+    // `checks: read` or a 403 on the shard produces — would silence the arm
+    // inside a green run. PEN-5445 gate polarity: no-alarm requires a PRESENT
+    // push stamp.
+    describe("an unclocked head cannot silence the promoted arm", () => {
+      const unclockedRun = (prs, opts = {}) =>
+        run(prs, { fetchClock: () => ({ pushedAtMs: null, reason: "check-suite read failed: HTTP 403" }), ...opts });
+
+      it("fails when a LIVE head's age could not be decided", () => {
+        const { errs, exits } = unclockedRun([cleanLive, unreviewed], { strandFail: true });
+        assert.deepEqual(exits, [1], "an undecidable live head must not read as fine");
+        assert.match(errs, /age could not be decided/);
+        assert.match(errs, /UNDECIDED, not fine/);
+        assert.match(errs, /checks: read/);
+      });
+
+      it("reports it as ONE aggregated line, never one per head", () => {
+        const second = { ...unreviewed, number: 3455 };
+        const { errs } = unclockedRun([cleanLive, unreviewed, second], { strandFail: true });
+        assert.equal(errs.match(/unattested head\(s\) unclocked/g).length, 1);
+        assert.match(errs, /2 whose age could not be decided/);
+      });
+
+      it("does not fail on an unclocked head of a PR GitHub will not merge from", () => {
+        const dormantPr = { ...unreviewed, number: 3453, mergeStateStatus: "DIRTY" };
+        const { exits } = unclockedRun([cleanLive, dormantPr], { strandFail: true });
+        assert.deepEqual(exits, []);
+      });
+
+      it("still does not fail in report mode", () => {
+        const { exits } = unclockedRun([cleanLive, unreviewed]);
+        assert.deepEqual(exits, []);
+      });
     });
 
     it("tells the reader a strand is not baselineable and names the remedy", () => {

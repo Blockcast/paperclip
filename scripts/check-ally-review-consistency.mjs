@@ -2139,6 +2139,9 @@ export function formatUnclocked(unclocked) {
  * Mirrors `partitionByMergeEligibility`, including its polarity: a strand whose
  * PR is not in `prs` gets no dormancy reason and so stays LIVE and fails. A
  * lookup that silently failed must not read as "this one does not matter".
+ *
+ * Takes anything carrying a PR `number`, so the unclocked heads are partitioned
+ * through it too — see the `liveUnclocked` branch in `main`.
  */
 export function partitionStrandsByDormancy(strands, prs, now = Date.now()) {
   const byNumber = new Map((prs ?? []).map((pr) => [String(pr?.number), pr]));
@@ -2203,6 +2206,15 @@ export function main({
     prs,
     now,
   );
+  // An unclocked head is a head this arm COULD NOT DECIDE. While the detector
+  // only reported, warning on it satisfied "never silently skip". Promoting the
+  // strand arm to failing moves that goalpost: `report` is now the QUIET state
+  // relative to `fail`, so a lost `checks: read` — or a 403 on the rate-limit
+  // shard this endpoint sits on — would turn every would-be failure into a
+  // warning inside a GREEN run. That is the fail-open shape PEN-5445 is about,
+  // reintroduced by this very promotion. The no-alarm state must require a
+  // PRESENT push stamp, so an undecidable LIVE head fails.
+  const { live: liveUnclocked } = partitionStrandsByDormancy(unclocked, prs, now);
 
   log(
     `Unattested-head strand detector (threshold ${formatDuration(STRAND_THRESHOLD_MS)}): ` +
@@ -2274,12 +2286,24 @@ export function main({
     return;
   }
 
-  if (strandFail && liveStrands.length > 0) {
+  if (strandFail && (liveStrands.length > 0 || liveUnclocked.length > 0)) {
     err(
       `Ally review-consistency guard FAILED for ${repo}: ${liveStrands.length} non-draft open ` +
-        `head(s) unattested past ${formatDuration(STRAND_THRESHOLD_MS)}.\n`,
+        `head(s) unattested past ${formatDuration(STRAND_THRESHOLD_MS)}` +
+        `${liveUnclocked.length > 0 ? `, and ${liveUnclocked.length} whose age could not be decided` : ""}.\n`,
     );
     for (const strand of liveStrands) err(`  ${formatStrand(strand)}`);
+    if (liveUnclocked.length > 0) {
+      // One aggregated line, never one per head: during a rate-limit window
+      // every head reads unclocked at once, and N findings carry no more
+      // information than one.
+      err(`  ${formatUnclocked(liveUnclocked)}`);
+      err(
+        `\nAn unclocked head is UNDECIDED, not fine: this arm could not read its push stamp, ` +
+          `so it cannot say whether it is stranded. Check the \`checks: read\` permission and ` +
+          `the rate-limit shard behind commits/:sha/check-suites.`,
+      );
+    }
     if (dormantStrands.length > 0) {
       err(
         `\n${dormantStrands.length} further strand(s) are reported above on PR(s) GitHub will ` +
