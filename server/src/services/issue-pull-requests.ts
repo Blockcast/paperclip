@@ -5,7 +5,7 @@
  *   - Forward (webhook): recordMergedPullRequest() persists the link when a PR
  *     closes as merged, keyed on the BLO- ref the PR text carries.
  *   - Backfill (reconciler): reconcileMergedPullRequests() enumerates a repo's
- *     merged PRs over a window via the GitHub search API WITHOUT an `author:`
+ *     merged PRs over a window via the GitHub GraphQL search WITHOUT an `author:`
  *     qualifier, so PRs from kkroo, app/allyblockcast, and app/blockcast-ci-packages
  *     are all enumerated identically. The no-ref tail is stored with a null
  *     issueId (option (C): surfaced in the coverage %, never silently dropped).
@@ -13,11 +13,23 @@
  * authored-LOC needs the per-file diff, which neither the webhook payload nor
  * the search result carries — enrichAuthoredLocForRow() fetches pulls/{n}/files
  * and applies the shared exclusion set.
+ *
+ * ⛔ THAT FILE READ STAYS ON REST DELIBERATELY, and PEN-6341 item 2 measured
+ * why rather than leaving it as an omission: GraphQL's `PullRequestChangedFile`
+ * exposes exactly `additions`, `changeType`, `deletions`, `path` and
+ * `viewerViewedState` — there is NO `patch`. `computeAuthoredLoc`'s gitlink
+ * rule needs BOTH zero line churn AND the absence of a real hunk, because
+ * either signal alone also matches a pure rename or a mode-only change. Over
+ * GraphQL `patch` would be permanently undefined, so every 0/0 file would be
+ * classified gitlink-only and silently excluded from authored LOC. The loss
+ * would be a confident wrong answer, not an error. Do not "finish the
+ * migration" by moving this one.
  */
 import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issuePullRequests, issues } from "@paperclipai/db";
 import { ghFetch, ghReadBody, gitHubApiBase } from "./github-fetch.js";
+import { ghGraphQlQuery } from "./github-app-auth.js";
 import { unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { computeAuthoredLoc, type GithubPullFile } from "./authored-loc.js";
@@ -299,28 +311,90 @@ export async function reconcilePendingLocEnrichment(
   return { enriched, failed };
 }
 
-interface GithubSearchItem {
+/**
+ * One merged pull request, carrying EVERY field the reconciler decides on.
+ *
+ * PEN-6341 item 2: this is what kills the N+1. The REST path ran
+ * `GET /search/issues` and then one `GET /repos/{repo}/pulls/{n}` PER RESULT,
+ * because -- as the old comment at that call site said -- "search results lack
+ * branch + additions/deletions". The GraphQL search returns `PullRequest`
+ * NODES rather than issue stubs, so those fields come back on the enumeration
+ * itself and the detail reads are ELIMINATED rather than relocated.
+ *
+ * That matters for the budget specifically because the two legs sit on
+ * DIFFERENT GitHub resources: the REST search leg draws on `search`, which is
+ * not the exhausted shard, while the N detail reads draw on `core`. Migrating
+ * the search alone would have bought shard B nothing; removing the N is the
+ * entire win, so this site is priced by the N and never by the 1.
+ *
+ * `updated_at`/`updatedAt` is deliberately NOT selected. It is the PR's
+ * CURRENT timestamp at sweep time, and it feeds the work-product ordering
+ * guard -- see the `prUpdatedAt` argument below for why using it churns
+ * correctly delivered rows. Not selecting it at all is stronger than not
+ * reading it: the field cannot be picked up by accident.
+ */
+interface GithubMergedPullRequestNode {
   number: number;
-  title?: string | null;
-  body?: string | null;
-  pull_request?: unknown;
+  title: string | null;
+  body: string | null;
+  url: string | null;
+  mergedAt: string | null;
+  additions: number | null;
+  deletions: number | null;
+  headRefName: string | null;
+  headRefOid: string | null;
 }
 
-interface GithubPullDetail {
-  number: number;
-  title?: string | null;
-  body?: string | null;
-  merged_at?: string | null;
-  // PEN-6413: `html_url` is the work-product row's link, already present on
-  // the REST PR detail fetched below and not read before this change.
-  //
-  // `updated_at` is deliberately NOT read here. It is the PR's CURRENT
-  // timestamp at sweep time, and it feeds the work-product ordering guard --
-  // see the `prUpdatedAt` argument below for why using it churns correct rows.
-  html_url?: string | null;
-  additions?: number | null;
-  deletions?: number | null;
-  head?: { ref?: string | null; sha?: string | null } | null;
+const MERGED_PULL_REQUESTS_SEARCH_QUERY = `
+query($q: String!, $first: Int!, $cursor: String) {
+  search(query: $q, type: ISSUE, first: $first, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      __typename
+      ... on PullRequest {
+        number
+        title
+        body
+        url
+        mergedAt
+        additions
+        deletions
+        headRefName
+        headRefOid
+      }
+    }
+  }
+}`;
+
+type SearchPullRequestsResponse = {
+  search?: {
+    pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } | null;
+    nodes?: unknown;
+  } | null;
+};
+
+function readMergedPullRequestNode(node: unknown): GithubMergedPullRequestNode | null {
+  if (!node || typeof node !== "object") return null;
+  const row = node as Record<string, unknown>;
+  // `type: ISSUE` searches issues AND pull requests, so a plain Issue arrives
+  // with none of the inline-fragment fields. The REST path filtered the same
+  // population with `items.filter((it) => it.pull_request)`.
+  if (row.__typename !== "PullRequest") return null;
+  const number = row.number;
+  if (typeof number !== "number" || !Number.isInteger(number)) return null;
+  const str = (v: unknown) => (typeof v === "string" ? v : null);
+  const num = (v: unknown) => (typeof v === "number" ? v : null);
+  return {
+    number,
+    title: str(row.title),
+    body: str(row.body),
+    url: str(row.url),
+    mergedAt: str(row.mergedAt),
+    additions: num(row.additions),
+    deletions: num(row.deletions),
+    headRefName: str(row.headRefName),
+    headRefOid: str(row.headRefOid),
+  };
 }
 
 function toYmd(d: Date): string {
@@ -356,11 +430,17 @@ export async function reconcileMergedPullRequests(
   enriched: number;
   workProductsOffered: number;
 }> {
-  const apiBase = gitHubApiBase(GITHUB_HOST);
-  const headers = githubApiHeaders(input.token);
-
   // Author-agnostic enumeration. Intentionally NO `author:` qualifier.
   const q = `repo:${input.repoFullName} is:pr is:merged merged:${toYmd(input.since)}..${toYmd(input.until)}`;
+
+  // PEN-6341 item 2: GraphQL has no anonymous mode, where REST search had one.
+  // Refusing here is the honest form of that: an unauthenticated sweep would
+  // otherwise enumerate NOTHING and report `enumerated: 0`, which this
+  // function's own caller reads as "no merged PRs in the window" and folds
+  // into a coverage percentage. A thrown error stops the sweep for this repo
+  // and leaves the prior numbers standing.
+  const token = input.token ?? resolveGithubApiToken();
+  if (!token) throw unprocessable("reconciler: no GitHub token for the merged-PR search");
 
   // Resolve this company's issue identifiers once for attribution.
   const companyIssues = await db
@@ -379,32 +459,56 @@ export async function reconcileMergedPullRequests(
   let workProductsOffered = 0;
   const workProducts = workProductService(db);
 
+  let cursor: string | null = null;
   for (let page = 1; page <= 10; page += 1) {
-    const url = `${apiBase}/search/issues?q=${encodeURIComponent(q)}&per_page=100&page=${page}`;
-    const res = await ghFetch(url, { headers });
-    if (!res.ok) throw unprocessable(`search merged PRs page ${page} -> ${res.status}`);
-    const json = (await ghReadBody(url, () => res.json())) as {
-      items?: GithubSearchItem[];
-      total_count?: number;
-    };
-    const items = (json.items ?? []).filter((it) => it.pull_request);
+    const result = await ghGraphQlQuery<SearchPullRequestsResponse>({
+      token,
+      query: MERGED_PULL_REQUESTS_SEARCH_QUERY,
+      variables: { q, first: 100, cursor },
+    });
+    // Fail CLOSED, exactly as the REST pager's non-2xx did. An unreadable page
+    // is not an empty one, and this function's return value feeds a coverage
+    // percentage: a silent `enumerated: 0` would read as "the window really
+    // held no merged PRs".
+    if (!result.ok) throw unprocessable(`search merged PRs page ${page} -> ${result.reason}`);
+    const connection = result.data.search;
+    if (!connection || !Array.isArray(connection.nodes)) {
+      throw unprocessable(`search merged PRs page ${page} -> payload_malformed`);
+    }
+
+    const items: GithubMergedPullRequestNode[] = [];
+    let unreadableNodes = 0;
+    for (const node of connection.nodes) {
+      const row = readMergedPullRequestNode(node);
+      // A non-PullRequest node is an ORDINARY Issue and is not a loss -- the
+      // REST path dropped those too. A node that IS shaped like one and still
+      // will not read is a row this token could not resolve, which is a real
+      // gap in an enumeration whose whole job is completeness, so it is
+      // counted and reported rather than silently skipped.
+      if (row === null) {
+        if (node && typeof node === "object" && (node as Record<string, unknown>).__typename === "PullRequest") {
+          unreadableNodes += 1;
+        }
+        continue;
+      }
+      items.push(row);
+    }
+    if (unreadableNodes > 0) {
+      logger.warn(
+        { repoFullName: input.repoFullName, page, unreadableNodes },
+        "reconciler: merged-PR search returned pull-request nodes this token could not read",
+      );
+    }
     if (items.length === 0) break;
 
     for (const item of items) {
       enumerated += 1;
-      // Search results lack branch + additions/deletions; fetch the PR detail.
-      let detail: GithubPullDetail | null = null;
-      try {
-        const prUrl = `${apiBase}/repos/${input.repoFullName}/pulls/${item.number}`;
-        const prRes = await ghFetch(prUrl, { headers });
-        if (prRes.ok) detail = (await ghReadBody(prUrl, () => prRes.json())) as GithubPullDetail;
-      } catch (err) {
-        logger.warn({ err, prNumber: item.number }, "reconciler PR detail fetch failed");
-      }
-
-      const branch = detail?.head?.ref ?? null;
-      const title = detail?.title ?? item.title ?? null;
-      const body = detail?.body ?? item.body ?? null;
+      // PEN-6341 item 2: no per-result detail read. The search NODES carry
+      // branch, head sha, additions and deletions, which is what the REST
+      // path needed the N+1 for.
+      const branch = item.headRefName;
+      const title = item.title;
+      const body = item.body;
 
       // Attribute by ref (branch/title/body), never by author.
       const identifiers = extractPaperclipIdentifiers(branch, title, body);
@@ -426,10 +530,10 @@ export async function reconcileMergedPullRequests(
         issueId,
         repoFullName: input.repoFullName,
         prNumber: item.number,
-        headSha: detail?.head?.sha ?? null,
-        mergedAt: detail?.merged_at ? new Date(detail.merged_at) : null,
-        additions: detail?.additions ?? null,
-        deletions: detail?.deletions ?? null,
+        headSha: item.headRefOid,
+        mergedAt: item.mergedAt ? new Date(item.mergedAt) : null,
+        additions: item.additions,
+        deletions: item.deletions,
         linkSource,
         paperclipIdentifier: identifier,
       });
@@ -481,7 +585,7 @@ export async function reconcileMergedPullRequests(
       // because `metadata` is replaced wholesale on accept: passing `null` here
       // would erase a recorded owning set and silently downgrade every
       // consumer's `relation` from "owner" to "undetermined".
-      const mergedAtIso = detail?.merged_at ?? null;
+      const mergedAtIso = item.mergedAt;
       if (mergedAtIso) {
         const owning = resolveOwningPaperclipIdentifiers({ branch, title, body }).owning;
         const targets = new Set<string>([...identifiers, ...owning]);
@@ -489,8 +593,8 @@ export async function reconcileMergedPullRequests(
           repoFullName: input.repoFullName,
           prNumber: item.number,
           prTitle: title,
-          prUrl: detail?.html_url ?? null,
-          headSha: detail?.head?.sha ?? null,
+          prUrl: item.url,
+          headSha: item.headRefOid,
           previousHeadSha: null,
           prBranch: branch,
           prDraft: false,
@@ -562,7 +666,23 @@ export async function reconcileMergedPullRequests(
       }
     }
 
-    if (items.length < 100) break;
+    // `pageInfo.hasNextPage` is an explicit statement by the server where the
+    // REST loop had to infer the end from a short page -- and the inference
+    // was WRONG here in a way nothing reported: `items` is the PR-only subset,
+    // so a page of 100 carrying even one plain Issue read as short and ENDED
+    // the enumeration early. Reading the connection removes that entirely.
+    if (connection.pageInfo?.hasNextPage !== true) break;
+    const rawCursor: unknown = connection.pageInfo?.endCursor;
+    cursor = typeof rawCursor === "string" && rawCursor.length > 0 ? rawCursor : null;
+    // "There is more" with no cursor to follow cannot be paged, and silently
+    // stopping would report a PREFIX as the whole window.
+    if (cursor === null) {
+      logger.warn(
+        { repoFullName: input.repoFullName, page },
+        "reconciler: merged-PR search reported another page with no cursor; enumeration is a prefix",
+      );
+      break;
+    }
   }
 
   return { enumerated, linked, unlinked, enriched, workProductsOffered };

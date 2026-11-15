@@ -39,19 +39,43 @@ vi.hoisted(() => {
 });
 
 /**
- * The reconciler's only outbound calls are the search page and the PR detail.
+ * The reconciler's only outbound call is the merged-PR search page.
  * Everything else it does is database work, which is what these tests assert.
+ *
+ * PEN-6341 item 2: there used to be a SECOND outbound call -- one
+ * `GET /repos/{repo}/pulls/{n}` per search result, because the REST search
+ * returned issue stubs carrying no branch and no additions/deletions. The
+ * GraphQL search returns `PullRequest` nodes, so that N+1 is gone and this
+ * harness stubs one envelope instead of a URL map.
+ *
+ * The seam is `ghGraphQlQuery` -- the HTTP transport and nothing above it. The
+ * reconciler's own node reader, its `__typename` filter and its paging all run
+ * for real against the envelope, which is what the old `ghFetch` stub gave and
+ * what keeps these assertions a test of the reconciler rather than an echo of
+ * their own fixture. `ghFetch` stays mocked too, and now serves NOTHING: any
+ * REST read from this path is a regression, not a fixture.
  */
-const githubResponses = vi.hoisted(() => ({ byUrl: new Map<string, unknown>() }));
+const githubResponses = vi.hoisted(() => ({ searchNodes: [] as unknown[] }));
 
 vi.mock("../services/github-fetch.js", () => ({
   gitHubApiBase: () => "https://api.github.com",
-  ghFetch: async (url: string) => ({
-    ok: githubResponses.byUrl.has(url),
-    status: githubResponses.byUrl.has(url) ? 200 : 404,
-    json: async () => githubResponses.byUrl.get(url) ?? {},
-  }),
+  gitHubGraphQlUrl: () => "https://api.github.com/graphql",
+  ghFetch: async (url: string) => {
+    throw new Error(`REST read regressed in the merged-PR reconciler: ${url}`);
+  },
   ghReadBody: async <T,>(_url: string, read: () => Promise<T>) => read(),
+}));
+
+vi.mock("../services/github-app-auth.js", () => ({
+  ghGraphQlQuery: async () => ({
+    ok: true as const,
+    data: {
+      search: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: githubResponses.searchNodes,
+      },
+    },
+  }),
 }));
 
 const {
@@ -71,33 +95,40 @@ const REPO = "Blockcast/penstock-llm-proxy-core";
 const PR_NUMBER = 2991;
 const EXTERNAL_ID = `${REPO}#${PR_NUMBER}`;
 const MERGED_AT = "2026-11-07T02:49:13Z";
-/** Later than the merge: a comment, label or deploy-bot post after it landed. */
+/**
+ * Later than the merge: a comment, label or deploy-bot post after it landed.
+ *
+ * PEN-6341 item 2 made this stronger rather than redundant. The production
+ * query does not SELECT `updatedAt` at all, so the field cannot be picked up
+ * by accident -- but the stub payload still CARRIES it, and the assertions
+ * below check the stored source timestamp against BOTH values: it must equal
+ * the merge instant and must not equal this one.
+ */
 const UPDATED_AT_AFTER_MERGE = "2026-11-09T18:02:44Z";
 
 function stubGithub(identifier: string) {
-  githubResponses.byUrl.clear();
-  const searchUrl =
-    "https://api.github.com/search/issues?q="
-    + encodeURIComponent(
-      `repo:${REPO} is:pr is:merged merged:2026-11-01..2026-11-10`,
-    )
-    + "&per_page=100&page=1";
-  githubResponses.byUrl.set(searchUrl, {
-    items: [{ number: PR_NUMBER, title: `docs: lane contention (${identifier})`, pull_request: {} }],
-    total_count: 1,
-  });
-  githubResponses.byUrl.set(`https://api.github.com/repos/${REPO}/pulls/${PR_NUMBER}`, {
-    number: PR_NUMBER,
-    title: `docs: lane contention (${identifier})`,
-    body: `Owning row: ${identifier}`,
-    merged_at: MERGED_AT,
-    // Present on the real payload, and deliberately NOT read by the repair.
-    updated_at: UPDATED_AT_AFTER_MERGE,
-    html_url: `https://github.com/${REPO}/pull/${PR_NUMBER}`,
-    head: { ref: "cto/lane-contention", sha: "53ed5002".padEnd(40, "0") },
-    additions: 10,
-    deletions: 2,
-  });
+  githubResponses.searchNodes = [
+    {
+      __typename: "PullRequest",
+      number: PR_NUMBER,
+      title: `docs: lane contention (${identifier})`,
+      body: `Owning row: ${identifier}`,
+      mergedAt: MERGED_AT,
+      // The decoy, carried deliberately: a field the query does NOT select,
+      // placed in the payload anyway so "the reconciler must not read it"
+      // stays an assertion about the reconciler and not about the fixture.
+      updatedAt: UPDATED_AT_AFTER_MERGE,
+      url: `https://github.com/${REPO}/pull/${PR_NUMBER}`,
+      headRefName: "cto/lane-contention",
+      headRefOid: "53ed5002".padEnd(40, "0"),
+      additions: 10,
+      deletions: 2,
+    },
+    // A plain Issue in the same page. `search(type: ISSUE)` returns both, and
+    // the reconciler must drop this exactly as the REST path dropped a search
+    // item with no `pull_request` key -- without it ever reaching `enumerated`.
+    { __typename: "Issue", number: 12, title: "not a pull request" },
+  ];
 }
 
 async function runReconciler(db: Db, companyId: string) {
@@ -127,7 +158,7 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     await db.delete(issuePullRequests);
     await db.delete(issues);
     await db.delete(companies);
-    githubResponses.byUrl.clear();
+    githubResponses.searchNodes = [];
   });
 
   afterAll(async () => {
@@ -195,6 +226,10 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     });
 
     const result = await runReconciler(db, company.id);
+    // ONE, not two: the stub page also carries a plain Issue, which
+    // `search(type: ISSUE)` really does return and which must never be
+    // enumerated as a pull request.
+    expect(result.enumerated).toBe(1);
     expect(result.workProductsOffered).toBe(1);
 
     const row = await readRow(company.id);
@@ -208,6 +243,9 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     // ...and must still be distinguishable from a real delivery.
     expect(metadata.repairedBy).toBe(PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER);
     expect(typeof metadata.repairedAt).toBe("string");
+    // The repair offered the MERGE INSTANT, never the PR's current timestamp.
+    expect(metadata.sourceEventTimestampMs).toBe(Date.parse(MERGED_AT));
+    expect(metadata.sourceEventTimestampMs).not.toBe(Date.parse(UPDATED_AT_AFTER_MERGE));
 
     // Read it the way the fleet ownership directive tells callers to.
     const owners = await workProductService(db).listOwnersByExternalId(company.id, {
@@ -238,6 +276,10 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     const before = await readRow(company.id);
 
     const result = await runReconciler(db, company.id);
+    // ONE, not two: the stub page also carries a plain Issue, which
+    // `search(type: ISSUE)` really does return and which must never be
+    // enumerated as a pull request.
+    expect(result.enumerated).toBe(1);
     // Offered, as the counter's name says -- and rejected by the guard.
     expect(result.workProductsOffered).toBe(1);
 
@@ -248,6 +290,8 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     expect(metadata.repairedBy ?? null).toBeNull();
     expect(after.status).toBe("merged");
     expect(metadata.sourceEventTimestampMs).toBe(Date.parse(MERGED_AT));
+    // The decoy is in the payload and must not have been read.
+    expect(metadata.sourceEventTimestampMs).not.toBe(Date.parse(UPDATED_AT_AFTER_MERGE));
     // `updatedAt` is a liveness signal; a no-op sweep must not refresh it.
     expect(after.updatedAt.toISOString()).toBe(before.updatedAt.toISOString());
   });
