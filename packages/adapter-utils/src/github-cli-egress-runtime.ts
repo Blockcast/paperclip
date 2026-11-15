@@ -29,8 +29,12 @@ import {
   type ReviewAttestationGuardIo,
 } from "./github-review-attestation.js";
 
-/** Where a rewrite notice goes. Split out so tests can capture it, exactly as
- *  {@link GitHubMcpEgressRuntimeIo} does at the MCP door. */
+/** Where a notice goes. Split out so tests can capture it, exactly as
+ *  {@link GitHubMcpEgressRuntimeIo} does at the MCP door.
+ *
+ *  Two kinds travel this channel: the PEN-5734 rewrite notice, and the
+ *  PEN-6243 refusal notice. Both default to stderr, which on an `ac-*` seat is
+ *  the stream the log collector reads. */
 export interface GitHubCliEgressRuntimeIo {
   /** One already-formatted notice. Receives CLASSES and SCRUBBED excerpts
    *  only, never the material that fired. */
@@ -288,6 +292,82 @@ export function createReviewAttestationGuardIo(target: string): ReviewAttestatio
   };
 }
 
+/**
+ * PEN-6243 done-when #1: a seat-local counter for GitHub calls this container
+ * was refused for rate limiting.
+ *
+ * Installation 138085375 is shared by monitoring exporters, the Paperclip
+ * control plane and ~45 agent seats. The first two are instrumented
+ * (`arc_queued_job_age_exporter_api_errors_by_reason_total`,
+ * `paperclip_github_api_refusals_total`, `paperclip_github_api_held_total`);
+ * the seats are counted by nothing, so a seat refused mid-task is visible only
+ * to whichever agent happens to read its own tool output. Two such refusals 93
+ * minutes apart on 2026-11-08 were each found that way and by nothing else.
+ *
+ * Seats have no metrics endpoint, so the signal is a log line: `ac-*` pod
+ * STDERR is collected into Loki (measured 2026-11-15 — 2,117 `ac-*` pods over
+ * two hours, carrying this wrapper's own `[paperclip] …` lines; the same
+ * selector returns ZERO on `stream="stdout"` over six hours while stdout is
+ * collected elsewhere in the namespace, so the asymmetry is a property of the
+ * seats and not of the collector). A `loki.process` stage turns the line into
+ * the per-pod counter the row asks for; that kind of stage is already deployed
+ * in this cluster for the GitHub App token rotator.
+ */
+
+/** Why a GitHub CLI call was refused. A CLOSED set: it is a metric label, and
+ *  an open one would let `gh`'s prose drive cardinality. */
+export type GitHubCliRefusalReason = "rate_limit" | "secondary_rate_limit";
+
+// Deliberately narrow, on the same discipline as DEFINITE_ABSENCE_PATTERN
+// above: match only text that is DEFINITELY a rate-limit refusal. A bare
+// `HTTP 403` is an authorization failure far more often than a budget one, a
+// 5xx is neither, and a DNS error is neither — none of them match, so they
+// fall through UNCOUNTED. The series under-reports rather than inventing
+// refusals, which is the right direction for a signal whose whole purpose is
+// to establish that blocked work exists.
+const SECONDARY_RATE_LIMIT_PATTERN = /exceeded a secondary rate limit/i;
+const PRIMARY_RATE_LIMIT_PATTERN = /API rate limit exceeded/i;
+const INSTALLATION_ID_PATTERN = /installation ID (\d{1,20})/i;
+
+/** Stable leader, so a Loki stage can match this without parsing prose —
+ *  exactly as {@link REWRITE_NOTICE_PREFIX} does for the rewrite notice. The
+ *  `[paperclip]` prefix matches the wrapper lines already observed in Loki. */
+export const REFUSAL_NOTICE_PREFIX = "[paperclip] github-egress-refusal";
+
+/**
+ * Classify `gh`'s stderr. Returns null for anything that is not definitely a
+ * rate-limit refusal.
+ */
+export function classifyGitHubCliRefusal(stderrText: string): GitHubCliRefusalReason | null {
+  // Secondary first: it is the more specific message, and a build that ever
+  // reworded it to mention the primary phrase would otherwise be mislabelled.
+  if (SECONDARY_RATE_LIMIT_PATTERN.test(stderrText)) return "secondary_rate_limit";
+  if (PRIMARY_RATE_LIMIT_PATTERN.test(stderrText)) return "rate_limit";
+  return null;
+}
+
+/**
+ * Format the one line a refused invocation emits.
+ *
+ * Carries the reason and — when `gh` named it — the installation the budget
+ * belongs to. It carries NO argv, repository, path, SHA or payload: the pod
+ * label the collector already attaches is the seat identity, and everything
+ * else would be unbounded cardinality in a metric and a disclosure risk in a
+ * log.
+ */
+export function formatGitHubCliRefusalNotice(
+  reason: GitHubCliRefusalReason,
+  stderrText: string,
+): string {
+  const installation = INSTALLATION_ID_PATTERN.exec(stderrText)?.[1] ?? "unknown";
+  return `${REFUSAL_NOTICE_PREFIX} reason=${reason} installation=${installation}`;
+}
+
+/** Bound on the stderr kept for scanning across chunk boundaries. A refusal
+ *  message split across two reads would otherwise be missed, and an unbounded
+ *  buffer would hold all of a verbose call's stderr. */
+const REFUSAL_SCAN_TAIL_LIMIT = 4096;
+
 export async function runGitHubCliEgressRuntime(
   options: GitHubCliEgressRuntimeOptions,
 ): Promise<number> {
@@ -329,8 +409,50 @@ export async function runGitHubCliEgressRuntime(
   }
 
   const invocation = prepareGitHubCliInvocation(options);
+  const io = options.io ?? defaultIo;
+  // PEN-6243: tee STDERR so a rate-limit refusal can be counted, and ONLY
+  // stderr. stdout stays inherited because seats pipe `gh api` payloads into
+  // `jq`; moving it off `inherit` would change buffering, TTY detection and
+  // byte-exactness on the path every agent seat's `gh` takes, to instrument a
+  // stream the refusal is not written to.
+  //
+  // Inherit outright when our own stderr is a TTY. In a seat pod it never is,
+  // so the counter is unaffected there; what this preserves is the colour and
+  // interactivity `gh` chooses from `isatty(2)` for a human running the
+  // wrapper in a terminal. It also fails in the safe direction — when in
+  // doubt we inherit, so the series under-reports and no behaviour changes.
+  const teeStderr = !process.stderr.isTTY;
   return new Promise((resolve, reject) => {
-    const child = spawn(options.target, invocation.argv, { stdio: "inherit" });
+    const child = spawn(options.target, invocation.argv, {
+      stdio: teeStderr ? ["inherit", "inherit", "pipe"] : "inherit",
+    });
+    let refusalNotified = false;
+    let refusalScanTail = "";
+    if (teeStderr && child.stderr) {
+      child.stderr.on("data", (chunk: Buffer) => {
+        // Re-emit the RAW BYTES first and unconditionally, so `gh`'s stderr is
+        // byte-exact and arrives even if anything below throws. The decode is
+        // for scanning only: a chunk that splits a multi-byte character
+        // decodes to a replacement character here and cannot corrupt what was
+        // already written.
+        process.stderr.write(chunk);
+        if (refusalNotified) return;
+        const scanned = refusalScanTail + chunk.toString("utf8");
+        const reason = classifyGitHubCliRefusal(scanned);
+        if (reason) {
+          // Once per invocation: `gh` can print the same refusal on each of
+          // its internal retries, and this line is counted.
+          refusalNotified = true;
+          refusalScanTail = "";
+          io.notify(formatGitHubCliRefusalNotice(reason, scanned));
+          return;
+        }
+        refusalScanTail =
+          scanned.length > REFUSAL_SCAN_TAIL_LIMIT
+            ? scanned.slice(-REFUSAL_SCAN_TAIL_LIMIT)
+            : scanned;
+      });
+    }
     let forwardedSignal = false;
     let settled = false;
     const forwardSignal = (signal: NodeJS.Signals) => {
