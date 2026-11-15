@@ -84,6 +84,17 @@ test("API deployment hard-enforces node spread by default (BLO-20901)", () => {
   assert.match(rendered, /preferredDuringSchedulingIgnoredDuringExecution:/);
 });
 
+test("API deployment also hard-spreads across hypervisors (BLO-19366)", () => {
+  const rendered = renderTemplate();
+  // Two guests of one Proxmox host are two hostnames but one failure domain:
+  // 2026-11-15 pve2 took both replicas down at once (BLO-57408).
+  assert.match(
+    rendered,
+    /- maxSkew: 1\s+minDomains: 2\s+topologyKey: topology\.kubernetes\.io\/zone\s+whenUnsatisfiable: DoNotSchedule/,
+  );
+  assert.match(rendered, /topologyKey: kubernetes\.io\/hostname\s+whenUnsatisfiable: DoNotSchedule/);
+});
+
 test("API deployment drops the hard constraint when spreadAcrossNodes is disabled", () => {
   const rendered = renderTemplate(["--set", "api.spreadAcrossNodes=false"]);
 
