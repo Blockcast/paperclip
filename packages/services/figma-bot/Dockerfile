@@ -25,7 +25,7 @@ RUN apt-get update -qq \
  && rm -rf /var/lib/apt/lists/*
 
 # The upgrade above refreshes the nodesource `nodejs` deb, which re-ships its
-# own npm 10.9.x into /usr/lib/node_modules/npm over the npm@11.21.1 the base
+# own npm 10.9.x into /usr/lib/node_modules/npm over the npm@11.21.x the base
 # installed there. That npm bundles the pacote, sigstore, ip-address,
 # brace-expansion and picomatch versions Harbor flags High (BLO-55433), so
 # re-pin it. Also drop what figma-bot never runs: webflow-bot's npm
@@ -33,7 +33,14 @@ RUN apt-get update -qq \
 # package), and the gstreamer "bad" plugins, whose CVE-2025-3887 has no fix and
 # which only Playwright's WebKit loads. dpkg --purge (not apt) fails the build
 # if anything still depends on them instead of removing the dependents too.
-RUN npm install -g --no-audit --no-fund npm@11.21.1 \
+# npm 11.21.2, not 11.21.1: 11.21.1 bundles undici 6.29.0 (CVE-2026-87018,
+# -109383, -109869, all High; fixed in 6.29.1). The node check fails the build
+# if a later pin change brings a vulnerable bundled undici back (BLO-57448).
+RUN npm install -g --no-audit --no-fund npm@11.21.2 \
+ && node -e 'const v = require(process.argv[1]).version.split(".").map(Number); \
+if (!(v[0] > 6 || (v[0] === 6 && (v[1] > 29 || (v[1] === 29 && v[2] >= 1))))) { \
+console.error(`FATAL: npm-bundled undici ${v.join(".")} < 6.29.1 (BLO-57448)`); process.exit(1); }' \
+    "$(npm root -g)/npm/node_modules/undici/package.json" \
  && rm -rf /app/node_modules /app/package.json /app/package-lock.json \
  && dpkg --purge gstreamer1.0-plugins-bad libgstreamer-plugins-bad1.0-0
 
