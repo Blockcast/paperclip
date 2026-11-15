@@ -160,11 +160,13 @@ import { fileURLToPath } from "node:url";
  *
  * WHAT A `reason` MAY AND MAY NOT REST ON. Arm 3 enforces that a `reason` is
  * PRESENT; nothing enforces that it is TRUE, and the gap has now been paid for
- * twice in one entry. The soak-queries entry below went false twice and was
- * corrected on 2026-11-12 (PR #3685) and again on 2026-11-13, both times
- * through the same door: its attendance claim rested on the state of an object
- * no job in this repository can read -- first a code-owner review request,
- * then a Paperclip board card and its annotation.
+ * twice in one entry. The soak-queries entry -- deleted 2026-11-15 (PEN-6649)
+ * once its file became reachable from CI, and readable in this file's git
+ * history -- went false twice and was corrected on 2026-11-12 (PR #3685) and
+ * again on 2026-11-13, both times through the same door: its attendance claim
+ * rested on the state of an object no job in this repository can read --
+ * first a code-owner review request, then a Paperclip board card and its
+ * annotation.
  *
  * Both times it was false in the direction that DISCOURAGED the only act that
  * would release the blocked PR, which is the expensive direction, because a
@@ -192,16 +194,21 @@ import { fileURLToPath } from "node:url";
  * WHY THERE IS NO ARM FOR THIS, so nobody adds one thinking it was missed. A
  * lexical arm refusing a `reason` that cites an external identifier was ruled
  * against on PEN-5272 (2026-11-13), on three grounds, measured rather than
- * reasoned: the two entries in this allowlist are a discriminating pair and
- * such an arm scores them IDENTICALLY -- both cite external ids, so it refuses
- * the one entry that has never gone stale, i.e. the exemplar; the incentive
- * runs backwards, since both stale claims were CATCHABLE because they named
- * the objects they rested on, and penalising the citation selects for reasons
- * that assert without citing, which is strictly less falsifiable; and an arm
- * that instead RESOLVED the identifier against live state would reproduce,
- * inside this guard, the very failure the `security-audit-overrides` entry is
- * allowlisted for -- a terminal assertion that can turn red with no change to
- * this repository.
+ * reasoned: the two entries then in this allowlist were a discriminating pair
+ * and such an arm scored them IDENTICALLY -- both cited external ids, so it
+ * refused the one entry that had never gone stale, i.e. the exemplar; the
+ * incentive runs backwards, since both stale claims were CATCHABLE because
+ * they named the objects they rested on, and penalising the citation selects
+ * for reasons that assert without citing, which is strictly less falsifiable;
+ * and an arm that instead RESOLVED the identifier against live state would
+ * reproduce, inside this guard, the very failure the
+ * `security-audit-overrides` entry is allowlisted for -- a terminal assertion
+ * that can turn red with no change to this repository.
+ * Only the first ground was empirical, and the pair it rests on is now in git
+ * history rather than in the list, the soak-queries entry having been deleted
+ * on 2026-11-15. Grounds two and three never depended on what the list holds
+ * and are unchanged, so the ruling stands on them whatever this allowlist
+ * comes to contain.
  * That ruling is cited as history, not as live state: it does not matter to
  * any sentence here whether that row is still open.
  */
