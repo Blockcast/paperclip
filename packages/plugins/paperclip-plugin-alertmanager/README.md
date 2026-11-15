@@ -378,6 +378,27 @@ Two consequences when you read this table:
   the field that distinguished them was discarded before the row was written.
   So the historical undelivered count is an upper bound on drops for this
   reason as well as for the `refused`-without-cause reason in migration `014`.
+- **PEN-6719 — a `deferred` row is followed by `not_attempted` rows, and those
+  are the ladder working.** A deferral HOLDS the rung without re-waking: the
+  host has already committed a `scheduled_retry` run, so re-sending the wake on
+  the next sweep would stack a second one on top of it — the shape the core
+  server calls a *double-wake bug* and excludes from its own quota-recovery
+  retry for the same reason. Those held sweeps record
+  `wake_outcome = 'not_attempted'` with
+  `wake_cause = 'provider_capacity_deferred'` and a `wake_detail` that says so,
+  on an `unattended_rung` row. **Do not read them as the ladder having failed
+  to wake anyone** — it declined to, on purpose, and the rung is held rather
+  than spent. The hold is bounded by the same budget the delivery retries use
+  (`MAX_WAKE_DELIVERY_RETRIES` sweeps), after which the ladder posts one
+  hold-spent comment and climbs, so a `scheduled_retry` that never fires cannot
+  pin the ladder forever.
+
+  ⛔ The header comment of migration `015` says *"the rung is still HELD for a
+  delivery retry, unchanged"*. That was true when written and PEN-6719 made it
+  false — the rung is held, the delivery is not retried. Plugin migrations are
+  sha256-checksummed, so an applied one cannot be edited; migration `016`
+  carries the correction, and this is the second place it is recorded because a
+  reader of the table arrives here and not there.
 
 ```sql
 -- Escalation passes whose wake never reached a run: everything this platform

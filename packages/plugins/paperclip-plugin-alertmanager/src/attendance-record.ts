@@ -179,15 +179,25 @@ export const UNDELIVERED_WAKE_OUTCOMES: readonly WakeOutcome[] = ["refused", "de
  * dropped?* and is the measurement predicate: it decides what the undelivered
  * query counts and what the partial index covers. This one asks *can the
  * ladder show a run for this rung right now?* and is the BOOKKEEPING predicate:
- * it decides whether the rung is held for a delivery retry instead of climbing
- * past an owner.
+ * it decides whether the rung is HELD instead of climbing past an owner.
  *
  * A capacity deferral answers them oppositely — not dropped, and no run the
  * ladder can point to yet — which is exactly why PEN-6704 had to split them.
  * Folding `deferred` into the measurement constant would restore the
  * over-count; dropping it from this one would make the ladder climb past an
- * owner on the sweep after a deferral, which is a BEHAVIOUR change that
- * PEN-6704 deliberately did not take (see `escalation.ts`).
+ * owner on the sweep after a deferral, since that owner's `scheduled_retry`
+ * run is already committed and escalating past them would be premature.
+ *
+ * ⛔ THERE IS A THIRD QUESTION AND IT IS NOT ANSWERED HERE: *should the ladder
+ * RE-ATTEMPT the wake?* Until PEN-6719 it was fused to this one — holding the
+ * rung and re-sending the wake were one branch — and for `deferred` the two
+ * answers differ: hold, but do NOT re-send, because the host has committed a
+ * `scheduled_retry` run and a second wake on top of it is the shape the host's
+ * own quota-recovery path calls a double-wake bug. That predicate is
+ * `escalationWakeDeferred` on `AlertStateRecord`, read in `escalation.ts`.
+ * This list is deliberately NOT the place to express it: membership here is a
+ * property of an OUTCOME, while whether to re-attempt depends on the outcome
+ * of the PREVIOUS sweep, which is state and not a token.
  */
 export const WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG: readonly WakeOutcome[] = ["refused", "declined", "deferred"];
 

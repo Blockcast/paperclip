@@ -340,8 +340,43 @@ export interface AlertStateRecord {
    * unbounded retry would therefore pin the ladder on a dead seat forever. A
    * bounded one costs a terminated seat two extra rung intervals and then
    * climbs exactly as before.
+   *
+   * ⛔ PEN-6719 — this counts HELD sweeps as well as retried ones. When
+   * `escalationWakeDeferred` is set the ladder spends a sweep of this same
+   * budget WITHOUT re-attempting the wake, so the bound is unchanged (two
+   * extra rung intervals) and only the per-sweep action differs. The field
+   * name predates that split and is kept rather than renamed: it is persisted
+   * state, and a rename would make every row written before PEN-6719
+   * unreadable to gain one more accurate noun.
    */
   escalationWakeRetries?: number;
+  /**
+   * PEN-6719 — the prior attempt at `escalationWakePendingAgentId`'s rung was
+   * a provider-capacity DEFERRAL, not an undelivered wake. Set alongside the
+   * marker; cleared with it.
+   *
+   * ⛔ This is the THIRD predicate. `UNDELIVERED_WAKE_OUTCOMES` asks *was the
+   * wake dropped?*, `WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG` asks *can the
+   * ladder show a run for this rung?*, and this one asks *should the ladder
+   * RE-ATTEMPT the wake?*. For a deferral the answer to the second is no and
+   * to the third is ALSO no, and until PEN-6719 the two were fused: the rung
+   * was correctly held and the wake was incorrectly re-sent, on top of a
+   * `scheduled_retry` run the host had already committed. The host's own
+   * quota-recovery path calls that shape a "double-wake bug" and excludes the
+   * deferral from its unscoped retry for exactly this reason
+   * (`server/src/services/heartbeat.ts`, `QUOTA_RECOVERY_SCOPE_ATTRIBUTABLE_SKIP_REASONS`).
+   *
+   * ⚠️ The marker carried only the retry COUNT before this field existed, so
+   * the re-attempt site could not tell a deferral from a decline. That is the
+   * whole reason this field exists; it carries no other information and must
+   * not be read as a general "what happened last time" channel.
+   *
+   * Read `=== true`, never for truthiness: a record written before PEN-6719
+   * omits it and is making no claim, so it keeps the old re-attempt behaviour
+   * rather than having a hold read into its silence. Same discipline as
+   * `deferredForCapacity` on the host's own reply.
+   */
+  escalationWakeDeferred?: boolean;
 }
 
 /**

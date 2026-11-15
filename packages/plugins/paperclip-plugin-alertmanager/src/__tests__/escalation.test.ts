@@ -2022,11 +2022,46 @@ describe("PEN-2918 attendance observations", () => {
    * a run was pending.
    *
    * ⛔ MUTATION CONTROL. Delete the `deferredForCapacity === true` branch in
-   * `requestWakeupBestEffort` and these four tests fail — `wake_outcome` goes
-   * back to `declined`, the cause to null, `UNDELIVERED_WAKE_OUTCOMES` claims
-   * it, and the comment asserts the host enqueued nothing. Nothing else in the
-   * file moves: every existing wake test fixes `deferredForCapacity` absent,
-   * which the `=== true` test reads as no claim.
+   * `requestWakeupBestEffort` — four lines — and `wake_outcome` falls back to
+   * `declined`, the cause to null, `UNDELIVERED_WAKE_OUTCOMES` claims it, the
+   * comment asserts the host enqueued nothing, and the marker loses the
+   * deferral flag. Measured 2026-11-15, these FIVE tests fail and no others:
+   *
+   *   - records a capacity deferral as `deferred`, not as an undelivered `declined`
+   *   - mints `provider_capacity_deferred` as the cause, since the host leaves undeliveredReason null by design
+   *   - tells the thread the wake was POSTPONED, and never that no run was queued
+   *   - marks a deferral-held rung as deferred, not merely as undelivered
+   *   - promises a HOLD rather than a retry on the rung-opening comment for a deferral
+   *
+   * ⛔ NAMED, NOT COUNTED, AND THAT IS THE POINT OF THIS BLOCK. It used to
+   * read "these four tests fail" and the four were an ORDINAL run — "the FIRST
+   * THREE below", "the FOURTH". Both halves are traps, and PEN-6704 and
+   * PEN-6719 hit one each. The COUNT was wrong (three failed, not four), and a
+   * reader checking it saw a shortfall with no way to tell an over-count from a
+   * test that had quietly stopped covering anything. The ORDINAL then broke on
+   * its own terms the moment PEN-6719 added tests into this block: an ordinal
+   * into a list does not go missing when the list grows, it goes WRONG, and it
+   * keeps rendering. A name survives both — and a reader who finds one of these
+   * names absent knows to look for a rename rather than for a lost assertion.
+   *
+   * ⛔ Two tests in this block deliberately do NOT fail under that mutation, and
+   * neither is a gap in it:
+   *
+   *   - "holds the rung on a deferral rather than climbing past the owner" —
+   *     with the branch gone the outcome falls back to `declined`, which is
+   *     also in `WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG`, so the rung is held
+   *     by the same arm and its assertions still hold. It guards the PREDICATE
+   *     SWAP named in its own docblock instead.
+   *   - every PEN-6719 HOLD test — those set `escalationWakeDeferred` in the
+   *     state fixture directly, so they never reach this branch at all. Their
+   *     own controls are stated in their own docblocks: disabling
+   *     `holdingDeferredWake` fails three of them, dropping the explicit
+   *     `escalationWakeDeferred: false` from the marker's clear arm fails two,
+   *     and removing the hold-spent comment fails one (all measured
+   *     2026-11-15).
+   *
+   * Nothing else in the file moves: every existing wake test fixes
+   * `deferredForCapacity` absent, which the `=== true` test reads as no claim.
    */
   it("records a capacity deferral as `deferred`, not as an undelivered `declined`", async () => {
     const store = buildFakeAlertmanagerStore();
@@ -2076,9 +2111,8 @@ describe("PEN-2918 attendance observations", () => {
   });
 
   /**
-   * ⛔ The BEHAVIOUR this change deliberately does NOT alter. The ladder holds
-   * no run of its own at this rung, so the rung is still held for a delivery
-   * retry rather than climbing past an owner whose run is already committed.
+   * ⛔ The rung is HELD on a deferral — the ladder does not climb past an owner
+   * whose `scheduled_retry` run is already committed.
    *
    * Pinned because the two predicates are one character apart at the call site:
    * swapping `WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG` back to
@@ -2086,8 +2120,16 @@ describe("PEN-2918 attendance observations", () => {
    * file, and silently makes the ladder escalate a rung early on every capacity
    * deferral. That is the regression this test exists to catch, and it is
    * invisible in the attendance table.
+   *
+   * ⚠️ PEN-6719 RENAMED THIS TEST and the old name is the thing to understand.
+   * It read "still holds the rung for a DELIVERY RETRY on a deferral, exactly
+   * as before", which was accurate when written and names a behaviour that no
+   * longer exists: the rung is still held, and the sweep after it no longer
+   * re-sends the wake. What this test pins is unchanged — the HOLD — which is
+   * why its assertions did not move. The flag it now also pins is what tells
+   * the next sweep to hold WITHOUT re-waking.
    */
-  it("still holds the rung for a delivery retry on a deferral, exactly as before", async () => {
+  it("holds the rung on a deferral rather than climbing past the owner", async () => {
     const store = buildFakeAlertmanagerStore();
     const { ctx, mocks } = sweepContext(due(), "cto", store);
     mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true }));
@@ -2097,6 +2139,202 @@ describe("PEN-2918 attendance observations", () => {
     const final = writes[writes.length - 1][1];
     expect(final.escalationWakePendingAgentId).toBe("engineer");
     expect(final.escalationWakeRetries).toBe(0);
+  });
+
+  /**
+   * PEN-6719 — the marker carries the DEFERRAL, not just the retry count.
+   *
+   * This is the enabler for everything below it: before this field the
+   * re-attempt site could not tell a deferral from a decline, which is the only
+   * reason the two were ever fused.
+   */
+  it("marks a deferral-held rung as deferred, not merely as undelivered", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    const final = writes[writes.length - 1][1];
+    expect(final.escalationWakeDeferred).toBe(true);
+  });
+
+  /**
+   * PEN-6719 — the promise the rung-opening comment makes on a deferral.
+   *
+   * ⛔ Every other undelivered arm promises "the next sweep retries the
+   * delivery"; this one must NOT, because after PEN-6719 it does not. Pinned as
+   * a NEGATIVE as well as a positive: a future edit that collapses the two
+   * clauses back together compiles, passes every outcome assertion in this
+   * file, and leaves the thread making a forward-looking promise the ladder
+   * deliberately breaks — the PEN-6121 defect moved one tense over.
+   */
+  it("promises a HOLD rather than a retry on the rung-opening comment for a deferral", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
+    expect(body).toContain("HOLDS the rung without re-waking");
+    expect(body).not.toContain("the next sweep retries the delivery");
+  });
+
+  /**
+   * ⛔ PEN-6719 — THE DOUBLE WAKE. The behaviour PEN-6704 named and did not
+   * take, and the reason this file needed a third predicate.
+   *
+   * The host returns `queued: false` for a capacity deferral having ALREADY
+   * COMMITTED a `scheduled_retry` run, and says so on its own
+   * `deferredForCapacity` field. The sweep that follows used to re-send the
+   * wake, because holding the rung and re-attempting the wake were one branch —
+   * spending a second run of an owner who already had one queued, and most
+   * likely precisely when provider capacity is scarce. The host calls this
+   * exact shape a "double-wake bug" in its own quota-recovery path and excludes
+   * the same condition from its own unscoped retry.
+   *
+   * `requestWakeup` not being called is the whole assertion. The rest of the
+   * sweep is unchanged and is pinned alongside it so that a fix which stops the
+   * wake by ALSO stopping the hold — letting the ladder climb past the owner
+   * one sweep early, which is PEN-6704's regression — fails here rather than
+   * passing.
+   */
+  it("does NOT re-wake on the sweep after a deferral, and still holds the rung", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 0, escalationWakeDeferred: true }), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
+    // ...and the rung is held exactly as a retry sweep holds it: no climb, no
+    // second announcement, and the marker advanced by one spent sweep.
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    expect(writes[0][1].escalationAttempt).toBe(1);
+    const final = writes[writes.length - 1][1];
+    expect(final.escalationWakePendingAgentId).toBe("engineer");
+    expect(final.escalationWakeRetries).toBe(1);
+    expect(final.escalationWakeDeferred).toBe(true);
+  });
+
+  /**
+   * PEN-6719 — a held sweep is a DETERMINATION, and this table exists so that
+   * determinations stop being discarded.
+   *
+   * `not_attempted` is the literal truth and is outside
+   * `UNDELIVERED_WAKE_OUTCOMES`, so a hold cannot inflate the undelivered
+   * count. The cause is what makes the row triageable: without it a reader
+   * meeting `not_attempted` on an `unattended_rung` row reads the ladder as
+   * having failed to do its job, when it is the ladder doing its job.
+   */
+  it("records the held sweep as a deliberate non-attempt, with the deferral as its cause", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 0, escalationWakeDeferred: true }), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({
+      disposition: "unattended_rung",
+      wake_outcome: "not_attempted",
+      wake_cause: "provider_capacity_deferred",
+      escalation_attempt: 1,
+      subject_agent_id: "engineer",
+    });
+    expect(String(store.attendance[0].wake_detail)).toContain("BY DESIGN");
+  });
+
+  /**
+   * ⛔ A state record written before PEN-6719 omits the flag, and silence is
+   * not a claim — the same discipline the host's `deferredForCapacity` is read
+   * with one layer down.
+   *
+   * A truthiness test would be green here too, so this pins the direction that
+   * matters: a record that says nothing keeps the OLD re-attempt behaviour
+   * rather than having a hold read into its silence. Getting this backwards
+   * would strand every in-flight rung at the moment this change deploys — their
+   * markers predate the field, and reading absence as a hold would stop the
+   * retries those rungs are actually waiting on.
+   */
+  it("re-attempts the wake when the marker predates the deferral flag", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 0 }), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * ⛔ PEN-6719 — the HOLD IS BOUNDED, by the same counter and the same bound
+   * the retries used.
+   *
+   * If the `scheduled_retry` never fires — capacity never returns, the run is
+   * cancelled — an unbounded hold pins the ladder on one rung forever, which is
+   * the failure `escalationWakeRetries` was bounded to prevent in the first
+   * place. The blast radius is therefore unchanged at two extra rung intervals;
+   * only the per-sweep action changes from RE-WAKE to WAIT.
+   *
+   * The comment is the PEN-6229 retraction, one path over: the rung-opening
+   * comment promised a hold, that promise silently stops being true when the
+   * bound runs out, and nothing else in the thread ever says so. It must NOT
+   * read as the deferral having failed — this sweep cannot see whether the
+   * host's run has started, and the whole lineage exists because the ladder
+   * kept asserting things about runs it could not see.
+   */
+  it("says so once when the hold budget is spent, then clears the marker so the ladder can move on", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 1, escalationWakeDeferred: true }), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
+    expect(body).toContain("still POSTPONED, not dropped");
+    expect(body).toContain("held this rung for 2 sweeps without re-waking");
+    expect(body).toContain("The hold budget for this rung is spent; the ladder moves on at the next sweep.");
+    // Never a claim that the deferral failed or that no run exists.
+    expect(body).not.toContain("no run was queued");
+    expect(body).not.toContain("enqueued nothing");
+
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    const final = writes[writes.length - 1][1];
+    expect(final.escalationWakePendingAgentId).toBeNull();
+    expect(final.escalationWakeRetries).toBe(0);
+    expect(final.escalationWakeDeferred).toBe(false);
+  });
+
+  /** The sweep after that one climbs, exactly as a spent retry budget does. */
+  it("climbs once the hold budget for a rung is spent", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 2, escalationWakeDeferred: true }), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+    expect(store.attendance[0]).toMatchObject({ escalation_attempt: 2 });
+  });
+
+  /**
+   * ⛔ PEN-6719 — the flag is written in BOTH marker arms and never inherited
+   * through the spread.
+   *
+   * A stale `true` carried past a retired marker is silent and lasts: the next
+   * rung's first undelivered wake would be HELD instead of retried, so an agent
+   * the host genuinely failed to wake would never be re-woken, and nothing on
+   * any surface would say why. An operator reassignment is the cheapest way to
+   * reach the clear arm with the flag set, which is what this uses.
+   */
+  it("retires the deferral flag with the marker it belongs to", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "someone-else", escalationWakeRetries: 1, escalationWakeDeferred: true }), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    // Not a retry and not a hold: the marker names an agent who no longer owns
+    // the row, so the ladder climbs normally...
+    expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+    // ...and takes the flag with it.
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    const final = writes[writes.length - 1][1];
+    expect(final.escalationWakeDeferred).toBe(false);
   });
 
   /**
@@ -2210,7 +2448,8 @@ describe("PEN-2918 attendance observations", () => {
     expect(final.escalationWakePendingAgentId).toBeNull();
     expect(final.escalationWakeRetries).toBe(0);
     // A delivered retry DOES speak up — the thread said the earlier attempt
-    // was not delivered, so it has to say when that is no longer true.
+    // was not confirmed delivered, so it has to say when that is no longer
+    // true.
     const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
     expect(body).toContain("reached the queue on retry");
   });
