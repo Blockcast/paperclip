@@ -3659,6 +3659,13 @@ describe("unattested-head strand detector (PEN-5793 done-when #4)", () => {
         assert.deepEqual(exits, []);
       });
 
+      it("does not print the re-request remedy when nothing is stranded", () => {
+        const { errs } = unclockedRun([cleanLive, unreviewed], { strandFail: true });
+        assert.doesNotMatch(errs, /re-request a/, "an undecidable head is not a lost trigger");
+        assert.doesNotMatch(errs, /NOT baselineable/);
+        assert.match(errs, /checks: read/, "the correct remedy must still print");
+      });
+
       it("still does not fail in report mode", () => {
         const { exits } = unclockedRun([cleanLive, unreviewed]);
         assert.deepEqual(exits, []);

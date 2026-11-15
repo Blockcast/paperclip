@@ -2311,12 +2311,18 @@ export function main({
           `becomes mergeable.`,
       );
     }
-    err(
-      `\nA strand means the reviewer has produced no verdict at this head. It is a latency ` +
-        `condition with no stable fingerprint, so it is NOT baselineable: it clears when the ` +
-        `head is reviewed. If the reviewer is healthy, the trigger was lost — re-request a ` +
-        `review on the PR with a start-of-body \`paperclip:review-request\` marker. See PEN-5793.`,
-    );
+    // Gated on liveStrands: an unclocked-only failure means this arm could not
+    // DECIDE, so telling the reader to re-request reviews points at the wrong
+    // remedy entirely — and a rate-limit window is exactly when it would print.
+    // The unclocked branch above carries its own, correct remedy.
+    if (liveStrands.length > 0) {
+      err(
+        `\nA strand means the reviewer has produced no verdict at this head. It is a latency ` +
+          `condition with no stable fingerprint, so it is NOT baselineable: it clears when the ` +
+          `head is reviewed. If the reviewer is healthy, the trigger was lost — re-request a ` +
+          `review on the PR with a start-of-body \`paperclip:review-request\` marker. See PEN-5793.`,
+      );
+    }
     exit(1);
     return;
   }
