@@ -9,7 +9,7 @@ import {
   alertStateRef,
 } from "./constants.js";
 import { createSweepSourceStateReader, hasPrometheusEndpoint, type SourceStateReader } from "./prometheus-source-state.js";
-import { PROVIDER_CAPACITY_DEFERRAL_CAUSE, UNDELIVERED_WAKE_OUTCOMES, WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG, type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
+import { PROVIDER_CAPACITY_DEFERRAL_CAUSE, WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG, type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -1475,6 +1475,47 @@ async function advanceIssueLadder(
   const nextRetryCount = retryingWakeDelivery ? wakeRetries + 1 : 0;
   const retriesRemainAfterThisAttempt = nextRetryCount < MAX_WAKE_DELIVERY_RETRIES;
 
+  // PEN-6719 — the THIRD predicate: should the ladder RE-ATTEMPT the wake?
+  //
+  // `retryingWakeDelivery` above answers *is this rung still held?* — the
+  // bookkeeping question `WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG` decides.
+  // Until now the answer to that doubled as the answer to this one, which is
+  // right for `refused` and `declined` (nothing reached a run, so re-send) and
+  // WRONG for `deferred`: the host returned `queued: false` having already
+  // COMMITTED a `scheduled_retry` run that the scheduler re-drives when
+  // provider capacity returns. Re-sending there puts a second wake on top of a
+  // committed run — spending a run of an owner who already has one queued, and
+  // most likely precisely when capacity is scarce.
+  //
+  // This is not a judgement call this plugin is making on its own. The host
+  // excludes the same condition from its own unscoped retry and names the
+  // reason in its own words (`server/src/services/heartbeat.ts`):
+  // "the provider-capacity deferral is excluded separately via
+  // `providerCapacityDeferred` because it commits a scheduled_retry run before
+  // returning null — retrying there would double-wake", and "a blanket
+  // retry-on-falsy would be a double-wake bug". `providerCapacityDeferred`
+  // exists on the host's reply precisely so a caller can decline to re-wake;
+  // this ladder was the one caller that read it and re-woke anyway.
+  //
+  // ⛔ The rung is still HELD — only the re-attempt is withheld. The ladder
+  // still has no run of ITS OWN to point at (the committed run is the host's,
+  // and this sweep cannot see whether it has started), so climbing past the
+  // owner would be the premature escalation PEN-6704 refused.
+  //
+  // ⛔ And the hold is BOUNDED, by the same counter and the same bound the
+  // retries used. If the `scheduled_retry` never fires — capacity never
+  // returns, the run is cancelled — an unbounded hold would pin the ladder on
+  // a rung forever, which is the failure `escalationWakeRetries` was bounded to
+  // prevent in the first place. The blast radius is therefore unchanged at two
+  // extra rung intervals; only the per-sweep action changes from RE-WAKE to
+  // WAIT.
+  //
+  // Tested `=== true` for the same reason the host's `deferredForCapacity` is:
+  // a state record written before PEN-6719 omits the field and is making no
+  // claim, so it keeps the old re-attempt behaviour rather than having a hold
+  // read into its silence.
+  const holdingDeferredWake = retryingWakeDelivery && state.escalationWakeDeferred === true;
+
   // `retryingWakeDelivery` short-circuits the cover branch: the chain is not
   // exhausted while the rung it is standing on was never actually delivered.
   // Covering here would hand the board an escalation whose own last rung
@@ -1588,15 +1629,56 @@ async function advanceIssueLadder(
   let notified: string | null = null;
   let attemptedWake: WakeAttempt | null = null;
   if (retryingWakeDelivery) {
-    // The rung was already announced and the owner already set; only the
-    // DELIVERY failed. Re-attempt it without reassigning anyone and without a
-    // second escalation comment — a repeat announcement would be the comment
-    // storm the CAS ordering exists to prevent, and nothing has changed that a
-    // reader needs told until the outcome does.
+    // The rung was already announced and the owner already set, so neither arm
+    // below reassigns anyone or posts a second escalation comment — a repeat
+    // announcement would be the comment storm the CAS ordering exists to
+    // prevent, and nothing has changed that a reader needs told until the
+    // outcome does.
     notified = issue.assigneeAgentId ?? null;
+  }
+  if (holdingDeferredWake) {
+    // PEN-6719 — HOLD. No wake is attempted, deliberately: the host committed
+    // a `scheduled_retry` run for this owner and re-sending would add a second
+    // wake on top of it. `attemptedWake` stays null, so the determination below
+    // records `not_attempted` — which is the literal truth and is outside
+    // `UNDELIVERED_WAKE_OUTCOMES`, so the hold cannot land in the undelivered
+    // numerator either.
+    if (!retriesRemainAfterThisAttempt) {
+      // The LAST hold sweep for this rung. Say so, once — the same retraction
+      // PEN-6229 added for the retry path, and for the same reason: the
+      // rung-opening comment promised that the ladder would hold this rung
+      // without re-waking, that promise silently stops being true when the
+      // budget runs out, and a reader who is never told sees the next
+      // escalation contradict it rather than follow from it.
+      //
+      // Bounded exactly as the retry retraction is: one extra comment per
+      // fully-held rung, because the intermediate holds stay silent while the
+      // promise still holds.
+      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] ${deferralHoldSpentSentence(current?.name ?? "the current owner", wakeRetries + 1)}\n\n${livenessLine(liveness, state, now)}`, companyId);
+    }
+  } else if (retryingWakeDelivery) {
+    // Only the DELIVERY failed. Re-attempt it.
     attemptedWake = await requestWakeupBestEffort(ctx, issue, companyId, attempt);
     if (attemptedWake.outcome === "enqueued") {
-      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] The wake for ${current?.name ?? "the current owner"} reached the queue on retry ${wakeRetries + 1}; the earlier attempt at this rung was not delivered.\n\n${livenessLine(liveness, state, now)}`, companyId);
+      // PEN-6704 — "not CONFIRMED delivered", not "not delivered".
+      //
+      // ⛔ PEN-6719 CORRECTED THE REASON FOR THIS HEDGE, and left the hedge
+      // standing. It used to read: the ladder does not carry the earlier
+      // attempt's outcome here, so the sentence must be true for every outcome
+      // that can reach it — including `deferred`, where the host DID commit a
+      // run. `escalationWakeDeferred` now carries exactly that, and a deferral
+      // no longer reaches this site at all: it is held above and never
+      // re-attempted. So the deferral reason is spent.
+      //
+      // The hedge survives on a DIFFERENT and independent ground, which is why
+      // carrying the outcome did not retire it: `refused` with
+      // `hostAnswered: false` still reaches here. An uncoded rejection may come
+      // from either side of `heartbeat.wakeup()`, so the run MAY exist and the
+      // ladder cannot assert the negative — `wakeSentence`'s own `refused` arm
+      // is hedged in the same register #3756 established, for the same reason.
+      // Hardening this back to "was not delivered" would be a confident claim
+      // the ladder cannot support on that path, which is the PEN-6121 defect.
+      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] The wake for ${current?.name ?? "the current owner"} reached the queue on retry ${wakeRetries + 1}; the earlier attempt at this rung was not confirmed delivered.\n\n${livenessLine(liveness, state, now)}`, companyId);
     } else if (WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG.includes(attemptedWake.outcome) && !retriesRemainAfterThisAttempt) {
       // PEN-6229 — the LAST retry for this rung has just failed. Say so, once.
       //
@@ -1646,8 +1728,15 @@ async function advanceIssueLadder(
     disposition: "unattended_rung",
     alertLiveness: liveness.state,
     wakeOutcome: wake,
-    wakeDetail: wakeDetailFor(wake, attemptedWake?.hostAnswered ?? true),
-    wakeCause: attemptedWake?.cause ?? null,
+    // PEN-6719 — a HOLD sweep is a determination, not a gap, so it is recorded
+    // like every other one. `not_attempted` is the literal truth and the cause
+    // says WHY nothing was attempted, which is the one thing a reader triaging
+    // a run of `not_attempted` rows on an unattended rung needs and cannot get
+    // from the outcome alone. `wakeDetailFor` is not given a `not_attempted`
+    // arm for it, because that token is also written by the cover rung and by
+    // all three attended branches, where this detail would be false.
+    wakeDetail: holdingDeferredWake ? DEFERRAL_HOLD_DETAIL : wakeDetailFor(wake, attemptedWake?.hostAnswered ?? true),
+    wakeCause: holdingDeferredWake ? PROVIDER_CAPACITY_DEFERRAL_CAUSE : attemptedWake?.cause ?? null,
     escalationAttempt: claimedAttempt,
     subjectAgentId: notified,
   });
@@ -1664,23 +1753,37 @@ async function advanceIssueLadder(
   // in this file follows.
   // PEN-6704 — the RUNG predicate, not the measurement one. A capacity
   // deferral is not an undelivered wake, but the ladder still has no run it can
-  // point to at this rung, so the rung is held for a delivery retry exactly as
-  // before. Using `UNDELIVERED_WAKE_OUTCOMES` here would make the ladder climb
-  // past an owner on the sweep after a deferral — a behaviour change PEN-6704
-  // deliberately did not take, since the owner's `scheduled_retry` run is
-  // already committed and escalating past them would be premature. Whether the
-  // ladder should instead HOLD the rung without re-attempting (the host's own
-  // quota-recovery path excludes the deferral from its unscoped retry to avoid
-  // a double wake) is a separate decision with a separate blast radius.
-  const markerNext: AlertStateRecord = WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG.includes(wake) && retriesRemainAfterThisAttempt
-    ? { ...claimed, escalationWakePendingAgentId: notified, escalationWakeRetries: nextRetryCount }
-    : { ...claimed, escalationWakePendingAgentId: null, escalationWakeRetries: 0 };
+  // point to at this rung, so the rung is held exactly as before. Using
+  // `UNDELIVERED_WAKE_OUTCOMES` here would make the ladder climb past an owner
+  // on the sweep after a deferral, since the owner's `scheduled_retry` run is
+  // already committed and escalating past them would be premature.
+  //
+  // PEN-6719 — a HOLD sweep holds the rung too, and that needs saying
+  // separately: it attempts no wake, so `wake` is `not_attempted`, which is
+  // (correctly) in neither predicate. Reading only `wake` here would retire the
+  // marker on the first held sweep and hand the next one a clean slate to climb
+  // from — the ladder would escalate past the owner one sweep after a deferral,
+  // which is the exact behaviour the hold exists to prevent, arriving through
+  // the back door.
+  //
+  // `escalationWakeDeferred` is written in BOTH arms rather than inherited
+  // through the spread. A rung can go `declined` → `deferred` (flag rises on a
+  // retry sweep) and the clear arm must not leave a stale `true` behind for the
+  // next rung to read, so neither value may be reached by omission.
+  const rungHeldWithoutARun = holdingDeferredWake || WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG.includes(wake);
+  const markerNext: AlertStateRecord = rungHeldWithoutARun && retriesRemainAfterThisAttempt
+    ? { ...claimed, escalationWakePendingAgentId: notified, escalationWakeRetries: nextRetryCount, escalationWakeDeferred: holdingDeferredWake || wake === "deferred" }
+    : { ...claimed, escalationWakePendingAgentId: null, escalationWakeRetries: 0, escalationWakeDeferred: false };
   // Skipped when nothing moves, which is the common case: a delivered wake on a
-  // rung that carried no marker writes the same two fields it already had. That
-  // keeps a healthy rung at exactly one state write, as before this change.
+  // rung that carried no marker writes the same three fields it already had.
+  // That keeps a healthy rung at exactly one state write, as before this change
+  // — which is why the deferral flag is compared through `?? false` rather than
+  // by identity: a row predating PEN-6719 omits it, and `undefined !== false`
+  // would make every healthy rung pay a second state write forever.
   const markerMoved =
     (markerNext.escalationWakePendingAgentId ?? null) !== (claimed.escalationWakePendingAgentId ?? null) ||
-    (markerNext.escalationWakeRetries ?? 0) !== (claimed.escalationWakeRetries ?? 0);
+    (markerNext.escalationWakeRetries ?? 0) !== (claimed.escalationWakeRetries ?? 0) ||
+    (markerNext.escalationWakeDeferred ?? false) !== (claimed.escalationWakeDeferred ?? false);
   if (markerMoved && !await casAlertState(ctx, ref, claimed, markerNext)) {
     ctx.logger.info(`alert-escalation: wake-delivery marker for ${issue.identifier ?? issue.id} was not stored; alert state changed under the sweep`);
   }
@@ -1713,6 +1816,16 @@ async function advanceIssueLadder(
  * they are two reachable paths to one statement, and a reader (or a grep)
  * should match one string.
  *
+ * ⛔ PEN-6719 added a THIRD path and deliberately did NOT make it a fourth
+ * copy of that string. `deferralHoldSpentSentence` ends
+ * "...; the ladder moves on at the next sweep." identically, but opens "The
+ * HOLD budget" rather than "The retry budget", because on that path no retry
+ * was ever attempted — the ladder spent the same bounded budget WAITING on
+ * purpose. Saying "retry budget" there would contradict the same thread's own
+ * earlier sentence, which told the reader the rung would be held WITHOUT
+ * re-waking. Three sites, one trailing clause, two budget nouns; grep the
+ * trailing clause to find all three.
+ *
  * ⛔ The closing clause says the ladder MOVES ON, not that it will ESCALATE.
  * Escalating is only one of the things the next sweep can do, and which one is
  * a function of the CAUSE, which this sentence does not branch on: a
@@ -1727,6 +1840,15 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
   const retryClause = willRetry
     ? " This rung is NOT spent: the next sweep retries the delivery before the ladder escalates."
     : " The retry budget for this rung is spent; the ladder moves on at the next sweep.";
+  // PEN-6719 — the deferral arm promises something DIFFERENT from every other
+  // undelivered arm, and must not share `retryClause`. The others promise a
+  // re-send; after PEN-6719 a deferral is deliberately NOT re-sent, so the
+  // clause above would be a forward-looking assertion the ladder no longer
+  // keeps — the PEN-6121 defect in the future tense, which is exactly what
+  // `retryClause`'s own closing-clause note warns against.
+  const holdClause = willRetry
+    ? " This rung is NOT spent, and no second wake is added on top of that run: the ladder HOLDS the rung without re-waking while the host's retry stands."
+    : " The hold budget for this rung is spent; the ladder moves on at the next sweep.";
   const cause = wake.cause ? ` (${wake.cause})` : "";
   switch (wake.outcome) {
     case "enqueued":
@@ -1756,7 +1878,7 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
       // arm above: it states what the host committed to, and does not promise
       // when the run starts, which is a function of provider capacity and not
       // of anything this ladder can see.
-      return `**the wake for ${name} was POSTPONED, not dropped** — the host deferred it for provider capacity${cause} and committed a retry run the scheduler re-drives when capacity returns, so a run is pending rather than missing.${retryClause}`;
+      return `**the wake for ${name} was POSTPONED, not dropped** — the host deferred it for provider capacity${cause} and committed a retry run the scheduler re-drives when capacity returns, so a run is pending rather than missing.${holdClause}`;
     default:
       return `no wake was attempted for ${name}.`;
   }
@@ -1781,6 +1903,13 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
  * `willRetry === false` arm. One rung-is-spent wording, reachable two ways —
  * here on an exhausted budget, there on the `MAX_WAKE_DELIVERY_RETRIES = 0`
  * kill switch — so a reader (or a grep) matches one string, not two.
+ *
+ * ℹ️ PEN-6719 — this function is STILL REACHABLE on a deferral and the
+ * `deferred` arm below is not dead code, which is easy to get backwards now
+ * that a deferral normally holds instead of retrying. A rung can be `declined`
+ * first and `deferred` on its last RETRY sweep; the hold only begins on the
+ * sweep AFTER a deferral, so that final retry lands here. The held-out case
+ * has its own sentence in `deferralHoldSpentSentence`.
  */
 function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: number): string {
   const cause = wake.cause ? ` (${wake.cause})` : "";
@@ -1804,6 +1933,47 @@ function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: 
     : `the host accepted the request and enqueued nothing${cause}`;
   return `**No run was queued for ${name}** — ${how}. ${spent}`;
 }
+
+/**
+ * PEN-6719 — the sentence posted when the HOLD for a capacity deferral runs
+ * out, and the one place the thread admits the ladder is about to move past an
+ * owner whose run is still only pending.
+ *
+ * Same job as `retryBudgetSpentSentence`: retract a promise before it is
+ * silently broken. `wakeSentence`'s deferral arm told the reader "This rung is
+ * NOT spent, and no second wake is added on top of that run: the ladder HOLDS
+ * the rung without re-waking while the host's retry stands." That is true when
+ * written and stops being true when the bound runs out — and unlike the retry
+ * path, nothing has FAILED here, so a reader who is never told sees the ladder
+ * escalate past an owner whose run the thread said was coming.
+ *
+ * ⛔ It does NOT say the deferral failed, and must not be edited into saying
+ * so. The host's `scheduled_retry` run may still be pending, or may already
+ * have run — this sweep cannot see which, and the whole PEN-6704 lineage
+ * exists because the ladder kept asserting things about runs it could not see.
+ * What is certain, and all this says, is that the ladder waited `sweeps` rung
+ * intervals and is no longer waiting.
+ *
+ * The trailing clause is WORD-FOR-WORD the other two rung-is-spent sentences;
+ * the budget noun is not. See `wakeSentence`'s docblock for why.
+ */
+function deferralHoldSpentSentence(name: string, sweeps: number): string {
+  return `**The wake for ${name} is still POSTPONED, not dropped** — the host deferred it for provider capacity (${PROVIDER_CAPACITY_DEFERRAL_CAUSE}) and committed a retry run, and the ladder held this rung for ${sweeps} sweep${sweeps === 1 ? "" : "s"} without re-waking rather than stacking a second wake on it. Whether that run has since started is not readable from here. The hold budget for this rung is spent; the ladder moves on at the next sweep.`;
+}
+
+/**
+ * PEN-6719 — `wake_detail` for a sweep that deliberately attempted no wake.
+ *
+ * ⛔ A fixed string, like every other `wake_detail`, and it has to state the
+ * MECHANISM for the same reason the `deferred` arm of `wakeDetailFor` does: a
+ * reader triaging `wake_outcome = not_attempted` on an `unattended_rung` row
+ * will otherwise read it as the ladder having failed to do its job, when it is
+ * the ladder doing exactly its job. `not_attempted` is the only honest token —
+ * no wake was attempted — and it is outside `UNDELIVERED_WAKE_OUTCOMES`, so
+ * these rows cannot inflate the undelivered count either.
+ */
+const DEFERRAL_HOLD_DETAIL =
+  "No wake was attempted on this sweep BY DESIGN. The prior attempt at this rung was a provider-capacity deferral (escalationWakeDeferred), for which the host committed a scheduled_retry run that the scheduler re-drives when capacity returns. Re-sending the wake on top of that run would double-wake the owner -- the host's own quota-recovery path excludes the same condition from its unscoped retry for the same reason. The rung is HELD, not spent: the ladder does not climb past the owner while the hold stands, and the hold is bounded by MAX_WAKE_DELIVERY_RETRIES sweeps so a scheduled_retry that never fires cannot pin the ladder forever. Read the run itself on the issue, not this table.";
 
 /**
  * The operator-readable sentence for a wake outcome. Fixed strings only — never
@@ -1840,7 +2010,7 @@ function wakeDetailFor(wake: WakeOutcome, hostAnswered: boolean): string | null 
       // part for a reader triaging this table is that a `queued=false` row can
       // mean a run exists -- and because the null `undeliveredReason` that
       // sends them looking for a missing cause is by design, not a gap.
-      return "issues.requestWakeup resolved queued=false AND deferredForCapacity=true: the host DEFERRED this wake for provider capacity and committed a scheduled_retry run that the scheduler re-drives when capacity returns. This is NOT an undelivered wake and is deliberately excluded from UNDELIVERED_WAKE_OUTCOMES and from the undelivered partial index: the wake is late, not lost. The host leaves undeliveredReason NULL on this path by design -- the capacity gate is the one enqueueWakeup return-null that writes no skipped row, so no durableSkipReason is ever set -- and reports the condition on the separate deferredForCapacity boolean instead. wake_cause on this row is therefore MINTED BY THE LADDER (provider_capacity_deferred, the same token resolveHeartbeatTimerSchedulerExclusionReason uses for this condition) rather than forwarded from the host. The rung is still held for a delivery retry, because the ladder has no run of its own to point at; read the run itself on the issue, not this table.";
+      return "issues.requestWakeup resolved queued=false AND deferredForCapacity=true: the host DEFERRED this wake for provider capacity and committed a scheduled_retry run that the scheduler re-drives when capacity returns. This is NOT an undelivered wake and is deliberately excluded from UNDELIVERED_WAKE_OUTCOMES and from the undelivered partial index: the wake is late, not lost. The host leaves undeliveredReason NULL on this path by design -- the capacity gate is the one enqueueWakeup return-null that writes no skipped row, so no durableSkipReason is ever set -- and reports the condition on the separate deferredForCapacity boolean instead. wake_cause on this row is therefore MINTED BY THE LADDER (provider_capacity_deferred, the same token resolveHeartbeatTimerSchedulerExclusionReason uses for this condition) rather than forwarded from the host. PEN-6719: the rung is still HELD, because the ladder has no run of its own to point at, but the wake is NOT re-attempted on the sweeps that follow -- re-sending on top of the host's committed scheduled_retry run would double-wake. Those held sweeps record wake_outcome=not_attempted with this same cause; read the run itself on the issue, not this table.";
     case "declined":
       return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run. Read wake_cause for which gate (heartbeats disabled, cooldown, inactive company, scheduling suppressed, or worktree cutoff); a null cause means the host named none. PEN-6704: the provider-capacity deferral WAS in this list and is not any more -- it records wake_outcome=deferred, because the host commits a scheduled_retry run for it and the wake is postponed rather than dropped. The escalation comment for this rung reports this outcome and does not assert a wake.";
     default:
