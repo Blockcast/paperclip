@@ -91,7 +91,9 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * resolves `{ queued: false }`, perfectly normally, when `enqueueWakeup`
  * returns `null`: `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown,
  * `company.inactive`, `heartbeat.scheduling_suppressed`,
- * `worktree_execution_cutoff`, and the provider-capacity deferral. Treating
+ * `worktree_execution_cutoff`, and — until PEN-6704 split it out as `deferred`
+ * — the provider-capacity deferral, which is a postponement with a committed
+ * `scheduled_retry` run behind it rather than a drop. Treating
  * that resolution as success would file the larger and quieter population of
  * dropped wakes in the column that means "the host accepted it" — this row's
  * own defect, one layer down, in the direction that reads clean. So the result
@@ -147,10 +149,65 @@ export type AttendanceDisposition =
   | "held_alert_clear";
 
 /** See the `wake_outcome` column comment in the migration. */
-export type WakeOutcome = "enqueued" | "refused" | "declined" | "not_attempted";
+export type WakeOutcome = "enqueued" | "refused" | "declined" | "deferred" | "not_attempted";
 
-/** Every `wake_outcome` that means the wake did NOT reach the host's queue. */
+/**
+ * Every `wake_outcome` that means the wake did NOT reach the host's queue.
+ *
+ * ⛔ PEN-6704 — `deferred` is deliberately NOT a member, and that omission is
+ * the whole change. A provider-capacity deferral resolves `{ queued: false }`
+ * exactly like a decline, so it used to record `declined` and land in this set
+ * — but the host has already COMMITTED a `scheduled_retry` run which the
+ * scheduler re-drives when capacity returns. It is late, not lost. Counting it
+ * here put a postponement in the numerator of "wakes this platform believed it
+ * had delivered and had not", which is the very claim PEN-6121 built this
+ * table to make honest.
+ *
+ * Keep this list in step with the partial `..._undelivered_idx` predicate in
+ * migration `007`, which names the same two tokens. A new token is excluded
+ * from that index automatically, which is why `deferred` needed no index
+ * change — see migration `015`.
+ */
 export const UNDELIVERED_WAKE_OUTCOMES: readonly WakeOutcome[] = ["refused", "declined"];
+
+/**
+ * Every `wake_outcome` for which the ladder holds no run it can point to AT
+ * THIS RUNG — the superset of `UNDELIVERED_WAKE_OUTCOMES` plus `deferred`.
+ *
+ * ⛔ This answers a DIFFERENT question from the constant above, and the two
+ * must not be collapsed. `UNDELIVERED_WAKE_OUTCOMES` asks *was the wake
+ * dropped?* and is the measurement predicate: it decides what the undelivered
+ * query counts and what the partial index covers. This one asks *can the
+ * ladder show a run for this rung right now?* and is the BOOKKEEPING predicate:
+ * it decides whether the rung is held for a delivery retry instead of climbing
+ * past an owner.
+ *
+ * A capacity deferral answers them oppositely — not dropped, and no run the
+ * ladder can point to yet — which is exactly why PEN-6704 had to split them.
+ * Folding `deferred` into the measurement constant would restore the
+ * over-count; dropping it from this one would make the ladder climb past an
+ * owner on the sweep after a deferral, which is a BEHAVIOUR change that
+ * PEN-6704 deliberately did not take (see `escalation.ts`).
+ */
+export const WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG: readonly WakeOutcome[] = ["refused", "declined", "deferred"];
+
+/**
+ * PEN-6704 — the ladder's cause token for a provider-capacity deferral.
+ *
+ * ⛔ Unlike every other `wake_cause` value this one is MINTED HERE, not read
+ * off the host. The host leaves `undeliveredReason` null on this path BY
+ * DESIGN — `writeSkippedRequest` is never reached because no `skipped` row is
+ * written — and reports the condition through a separate boolean,
+ * `deferredForCapacity`. So there is no host string to forward, and a null
+ * cause on a row that IS diagnosed would be a worse record than a synthesised
+ * one.
+ *
+ * The spelling is not free: it is byte-identical to the token
+ * `resolveHeartbeatTimerSchedulerExclusionReason` already returns for the same
+ * condition in `server/src/services/heartbeat.ts`, so one grep across the
+ * fleet finds both surfaces rather than two names for one event.
+ */
+export const PROVIDER_CAPACITY_DEFERRAL_CAUSE = "provider_capacity_deferred";
 
 /** What Alertmanager said on this pass. `not_read` is a real answer, not a gap. */
 export type ObservedAlertLiveness = "firing" | "not_firing" | "unknown" | "not_read";
@@ -171,6 +228,13 @@ export interface AttendanceObservation {
    * This is the triage column; `wakeDetail` is the prose one. `null` means NOT
    * RECORDED — a branch that attempted no wake, or a host that dropped the wake
    * without naming a cause — and never "delivered". Read `wakeOutcome` for that.
+   *
+   * ⛔ PEN-6704 — on a `deferred` row this is NOT a host token. The host names
+   * the capacity deferral through a boolean and leaves its cause string null by
+   * design, so the ladder mints `PROVIDER_CAPACITY_DEFERRAL_CAUSE` instead of
+   * recording the NULL that would make a diagnosed row look untriaged. That is
+   * the one value in this column whose provenance is the ladder; every other is
+   * forwarded verbatim.
    */
   wakeCause?: string | null;
   escalationAttempt?: number | null;

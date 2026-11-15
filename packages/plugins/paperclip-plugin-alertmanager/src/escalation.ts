@@ -9,7 +9,7 @@ import {
   alertStateRef,
 } from "./constants.js";
 import { createSweepSourceStateReader, hasPrometheusEndpoint, type SourceStateReader } from "./prometheus-source-state.js";
-import { UNDELIVERED_WAKE_OUTCOMES, type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
+import { PROVIDER_CAPACITY_DEFERRAL_CAUSE, UNDELIVERED_WAKE_OUTCOMES, WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG, type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -1597,7 +1597,7 @@ async function advanceIssueLadder(
     attemptedWake = await requestWakeupBestEffort(ctx, issue, companyId, attempt);
     if (attemptedWake.outcome === "enqueued") {
       await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] The wake for ${current?.name ?? "the current owner"} reached the queue on retry ${wakeRetries + 1}; the earlier attempt at this rung was not delivered.\n\n${livenessLine(liveness, state, now)}`, companyId);
-    } else if (UNDELIVERED_WAKE_OUTCOMES.includes(attemptedWake.outcome) && !retriesRemainAfterThisAttempt) {
+    } else if (WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG.includes(attemptedWake.outcome) && !retriesRemainAfterThisAttempt) {
       // PEN-6229 — the LAST retry for this rung has just failed. Say so, once.
       //
       // Without this the thread read: "this rung is NOT spent: the next sweep
@@ -1662,7 +1662,17 @@ async function advanceIssueLadder(
   // retried here: an authoritative webhook rewrote the record, so the next
   // sweep re-decides against ITS state, which is the same rule every other CAS
   // in this file follows.
-  const markerNext: AlertStateRecord = UNDELIVERED_WAKE_OUTCOMES.includes(wake) && retriesRemainAfterThisAttempt
+  // PEN-6704 — the RUNG predicate, not the measurement one. A capacity
+  // deferral is not an undelivered wake, but the ladder still has no run it can
+  // point to at this rung, so the rung is held for a delivery retry exactly as
+  // before. Using `UNDELIVERED_WAKE_OUTCOMES` here would make the ladder climb
+  // past an owner on the sweep after a deferral — a behaviour change PEN-6704
+  // deliberately did not take, since the owner's `scheduled_retry` run is
+  // already committed and escalating past them would be premature. Whether the
+  // ladder should instead HOLD the rung without re-attempting (the host's own
+  // quota-recovery path excludes the deferral from its unscoped retry to avoid
+  // a double wake) is a separate decision with a separate blast radius.
+  const markerNext: AlertStateRecord = WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG.includes(wake) && retriesRemainAfterThisAttempt
     ? { ...claimed, escalationWakePendingAgentId: notified, escalationWakeRetries: nextRetryCount }
     : { ...claimed, escalationWakePendingAgentId: null, escalationWakeRetries: 0 };
   // Skipped when nothing moves, which is the common case: a delivered wake on a
@@ -1731,6 +1741,22 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
         : `**a run for ${name} could NOT be confirmed** — the wake call failed before the host's answer was read, so the wake may or may not have reached the queue.${retryClause}`;
     case "declined":
       return `**no run was queued for ${name}** — the host accepted the request and enqueued nothing${cause}.${retryClause}`;
+    case "deferred":
+      // PEN-6704 — the one arm that must NOT lead with "no run was queued".
+      //
+      // Every other undelivered arm leads with the absence because that is the
+      // fact a skimming reader must not miss. Here the absence is FALSE: the
+      // host committed a `scheduled_retry` run before returning `queued: false`
+      // and the scheduler re-drives it when provider capacity returns. Leading
+      // with "no run was queued" would be the PEN-6121 defect with its sign
+      // flipped — not a wake asserted that never happened, but a wake denied
+      // that did.
+      //
+      // Hedged in the same register #3756 established for the uncoded-rejection
+      // arm above: it states what the host committed to, and does not promise
+      // when the run starts, which is a function of provider capacity and not
+      // of anything this ladder can see.
+      return `**the wake for ${name} was POSTPONED, not dropped** — the host deferred it for provider capacity${cause} and committed a retry run the scheduler re-drives when capacity returns, so a run is pending rather than missing.${retryClause}`;
     default:
       return `no wake was attempted for ${name}.`;
   }
@@ -1765,6 +1791,14 @@ function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: 
   if (wake.outcome === "refused" && !wake.hostAnswered) {
     return `**A run for ${name} could NOT be confirmed** — the wake call failed before the host's answer was read, so the wake may or may not have reached the queue. ${spent}`;
   }
+  // PEN-6704 — same correction as `wakeSentence`, and it has to be repeated
+  // here because this is the sentence a reader lands on when the rung is about
+  // to be abandoned. The shared `No run was queued` opening below is FALSE for
+  // a deferral: the host committed a retry run. The ladder moving on is still
+  // true and still worth saying, so only the opening clause changes.
+  if (wake.outcome === "deferred") {
+    return `**The wake for ${name} was POSTPONED, not dropped** — the host deferred it for provider capacity${cause} and committed a retry run the scheduler re-drives when capacity returns, so a run is pending rather than missing. ${spent}`;
+  }
   const how = wake.outcome === "refused"
     ? `the host refused the wake${cause}`
     : `the host accepted the request and enqueued nothing${cause}`;
@@ -1778,8 +1812,13 @@ function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: 
  * `refused` and `declined` get DIFFERENT sentences because they are different
  * events with different remedies: a refusal is about this issue (terminal
  * status, blocker, budget), a decline is about the agent or the company
- * (heartbeats disabled, cooldown, suppression, capacity). One sentence saying
- * "threw" would have been false for every decline.
+ * (heartbeats disabled, cooldown, suppression, worktree cutoff). One sentence
+ * saying "threw" would have been false for every decline.
+ *
+ * PEN-6704 adds a third, `deferred`, for the same reason the first two are
+ * separate: it has its own remedy, which is to WAIT. A deferral is not about
+ * the issue and not about the agent — it is about provider capacity, and the
+ * run that serves it is already committed.
  *
  * ⛔ PEN-6121 — BOTH sentences used to end "The escalation comment posted
  * immediately before this asserts the wake regardless", which was true and is
@@ -1796,8 +1835,14 @@ function wakeDetailFor(wake: WakeOutcome, hostAnswered: boolean): string | null 
         return "issues.requestWakeup threw WITHOUT a cause: the host named no gate, so this is NOT established as a refusal. The seven coded gates (six distinct tokens: issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive, agent.not_invokable -- budgets.getInvocationBlock is one gate yielding two of them) all throw with details.code attached and all refuse BEFORE a run is created. An uncoded rejection may come from BEFORE heartbeat.wakeup() -- ensurePluginAvailableForCompany, requireInCompany, or a DB or transport error out of issues.getById or budgets.getInvocationBlock, none of which leaves a run -- or from AFTER it, which does. Only the second kind can leave a run behind, which is why such a row is UNSETTLED rather than refuted. Measured once (PEN-5911, 2026-11-13T05:36Z): the run existed and ran to success while this column read refused. To settle one of these, look for a run whose contextSnapshot.source is alertmanager-escalation created inside the sweep window; the issue.assignment_wakeup_requested activity row is written after the run, so its ABSENCE does not mean no run.";
       }
       return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate -- pre-wake in the plugin host (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive) or downstream in enqueueWakeup (budget.blocked, company.inactive, agent.not_invokable). That set GROWS; it is documentation, not a closed list. A null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
+    case "deferred":
+      // PEN-6704. Deliberately states the MECHANISM, because the surprising
+      // part for a reader triaging this table is that a `queued=false` row can
+      // mean a run exists -- and because the null `undeliveredReason` that
+      // sends them looking for a missing cause is by design, not a gap.
+      return "issues.requestWakeup resolved queued=false AND deferredForCapacity=true: the host DEFERRED this wake for provider capacity and committed a scheduled_retry run that the scheduler re-drives when capacity returns. This is NOT an undelivered wake and is deliberately excluded from UNDELIVERED_WAKE_OUTCOMES and from the undelivered partial index: the wake is late, not lost. The host leaves undeliveredReason NULL on this path by design -- the capacity gate is the one enqueueWakeup return-null that writes no skipped row, so no durableSkipReason is ever set -- and reports the condition on the separate deferredForCapacity boolean instead. wake_cause on this row is therefore MINTED BY THE LADDER (provider_capacity_deferred, the same token resolveHeartbeatTimerSchedulerExclusionReason uses for this condition) rather than forwarded from the host. The rung is still held for a delivery retry, because the ladder has no run of its own to point at; read the run itself on the issue, not this table.";
     case "declined":
-      return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run. Read wake_cause for which gate (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral); a null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
+      return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run. Read wake_cause for which gate (heartbeats disabled, cooldown, inactive company, scheduling suppressed, or worktree cutoff); a null cause means the host named none. PEN-6704: the provider-capacity deferral WAS in this list and is not any more -- it records wake_outcome=deferred, because the host commits a scheduled_retry run for it and the wake is postponed rather than dropped. The escalation comment for this rung reports this outcome and does not assert a wake.";
     default:
       return null;
   }
@@ -1821,9 +1866,18 @@ function wakeDetailFor(wake: WakeOutcome, hostAnswered: boolean): string | null 
  *    `agent.not_invokable`;
  *  - it **resolves `{ queued: false }`** when `enqueueWakeup` returns `null` —
  *    `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown,
- *    `company.inactive`, `heartbeat.scheduling_suppressed`,
- *    `worktree_execution_cutoff`, and the provider-capacity deferral ⇒
- *    `declined`.
+ *    `company.inactive`, `heartbeat.scheduling_suppressed` and
+ *    `worktree_execution_cutoff` ⇒ `declined`.
+ *
+ * ⛔ PEN-6704 — the SIXTH member of that second list, the provider-capacity
+ * deferral, is no longer one of them. It resolves `{ queued: false }` like the
+ * other five and is NOT a drop: the host has committed a `scheduled_retry` run
+ * and reports the fact on a separate `deferredForCapacity` field, having left
+ * `undeliveredReason` null on purpose. It records `deferred`, which is outside
+ * `UNDELIVERED_WAKE_OUTCOMES`. This file used to say the deferral was
+ * `declined` and the classification was called deliberate; it was deliberate
+ * and it was wrong, because `declined`'s own sentence asserts the host
+ * "enqueued nothing", which for this gate is false.
  *
  * Awaiting without reading files that second, larger and quieter population
  * under `enqueued`, i.e. under "the host accepted the wake" — which would put
@@ -1842,6 +1896,28 @@ async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, co
     // and must not be reported as a drop.
     if ((result as { queued?: boolean } | null | undefined)?.queued === false) {
       const cause = readWakeCause((result as { undeliveredReason?: unknown } | null | undefined)?.undeliveredReason);
+      // PEN-6704 — the host reports a provider-capacity deferral on a SECOND
+      // field, and reading only the first records a postponement as a drop.
+      //
+      // `undeliveredReason` is null here BY DESIGN and not by omission: the
+      // capacity gate is the one `return null` in `wakeupWithDispatchRetry`
+      // that writes no `skipped` row, because it has already committed a
+      // `scheduled_retry` run for the scheduler to re-drive. Its own source
+      // comment says so — "the wake is not declined, just postponed" — and
+      // `durableSkipReason` is set only where a skipped row IS written. So the
+      // cause this ladder would otherwise record is structurally unreachable,
+      // which is why PEN-6121's Done-when 3 could never be satisfied for this
+      // one of its six causes by waiting for a specimen.
+      //
+      // Tested `=== true` for the same reason `queued` is tested `=== false`
+      // just above: a host (or a fake) that omits the field is making no claim,
+      // and must not have a deferral read into its silence. A pre-PEN-6704 host
+      // therefore keeps recording `declined`, which is the behaviour this
+      // replaces rather than a new failure.
+      if ((result as { deferredForCapacity?: unknown } | null | undefined)?.deferredForCapacity === true) {
+        ctx.logger.info(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} was deferred by the host for provider capacity (queued=false, a scheduled_retry run is committed)`);
+        return { outcome: "deferred", cause: cause ?? PROVIDER_CAPACITY_DEFERRAL_CAUSE, hostAnswered: true };
+      }
       ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} was declined by the host (queued=false, cause=${cause ?? "unrecorded"})`);
       return { outcome: "declined", cause, hostAnswered: true };
     }

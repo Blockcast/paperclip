@@ -276,7 +276,9 @@ withholding and the PEN-4337 monitor deferral are all unchanged.
 | `unattended_cover` | none held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
 | `held_alert_clear` | Alertmanager says the alert is not firing (BLO-40739) | no |
 
-`wake_outcome` is `enqueued`, `refused`, `declined`, or `not_attempted`.
+`wake_outcome` is `enqueued`, `refused`, `declined`, `deferred`, or
+`not_attempted`. **Undelivered means `refused` or `declined` ONLY** — see
+`deferred` below, which is the one that looks undelivered and is not.
 
 **Read `enqueued` narrowly: the host accepted the wake.** It is not evidence
 that a run started, and it is not acknowledgement. Acknowledgement is recorded
@@ -345,10 +347,37 @@ or `agent.not_invokable` (`refused`) — but it *resolves* `{ queued: false }`
 when `enqueueWakeup` returns `null`, which it does without throwing on
 `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown, `company.inactive`,
 `heartbeat.scheduling_suppressed`, `worktree_execution_cutoff` and the
-provider-capacity deferral (`declined`). That second set is the commoner one,
-and a caller that merely awaits the promise files all of it under `enqueued` —
-"the host accepted the wake" — leaving the undelivered query reading clean while
-wakes are dropped. **Query both tokens; the partial index covers both.**
+and `worktree_execution_cutoff` (`declined`). That second set is the commoner
+one, and a caller that merely awaits the promise files all of it under
+`enqueued` — "the host accepted the wake" — leaving the undelivered query
+reading clean while wakes are dropped. **Query both tokens; the partial index
+covers both.**
+
+⛔ **PEN-6704 — `deferred` is the THIRD way, and it is not a drop. Do not add it
+to an undelivered query.** The sixth gate behind `queued: false` is the
+provider-capacity deferral, and this README used to list it under `declined`.
+It is a POSTPONEMENT: the host commits a `scheduled_retry` run which the
+scheduler re-drives when capacity returns, and reports the fact on a separate
+`deferredForCapacity` field. Counting it as undelivered put a postponement in
+the numerator of "wakes this platform believed it had delivered and had not" —
+PEN-6121's own defect with its sign flipped, a drop asserted that never
+happened. It now records `deferred`, which is outside
+`UNDELIVERED_WAKE_OUTCOMES` and outside the partial index.
+
+Two consequences when you read this table:
+
+- **`wake_cause` on a `deferred` row is minted by the ladder, not forwarded.**
+  The host leaves `undeliveredReason` null on that path by design — it is the
+  one `enqueueWakeup` return-null that writes no `skipped` row, so
+  `durableSkipReason` is never set. The ladder records
+  `provider_capacity_deferred`, matching the token
+  `resolveHeartbeatTimerSchedulerExclusionReason` uses for the same condition
+  in the core server. Every other value in that column is the host's own.
+- **Rows written before 2026-11-15 are not separable.** A `declined` row with a
+  null cause is consistent with a capacity deferral *and* with a plain decline;
+  the field that distinguished them was discarded before the row was written.
+  So the historical undelivered count is an upper bound on drops for this
+  reason as well as for the `refused`-without-cause reason in migration `014`.
 
 ```sql
 -- Escalation passes whose wake never reached a run: everything this platform
@@ -359,6 +388,13 @@ wakes are dropped. **Query both tokens; the partial index covers both.**
 -- with wake_cause IS NULL is not established as undelivered (migration 014),
 -- so add `wake_cause IS NOT NULL OR wake_outcome = 'declined'` when you need
 -- the established-undelivered set rather than the suspected one.
+--
+-- PEN-6704 2026-11-15: a SECOND reason it is an upper bound, and one no filter
+-- can remove. Before this date a provider-capacity deferral recorded
+-- 'declined' with a null cause, so some of those rows are postponements with a
+-- committed run behind them. They are not separable after the fact. From
+-- 2026-11-15 such a wake records 'deferred' and is correctly outside this
+-- predicate -- do NOT add it here.
 SELECT observed_at, alert_issue_id, alertname, escalation_attempt, wake_outcome
   FROM plugin_alertmanager_184163d1ba.alert_attendance_observations
  WHERE company_id = $1 AND wake_outcome IN ('refused', 'declined')
@@ -454,7 +490,7 @@ both are company-scoped by the host from the `companyId` query parameter.
 | route | answers |
 |---|---|
 | `GET /attendance-observations/summary` | how many observations exist, by `disposition` and `wake_outcome`, over a window — plus `byWakeCause`, the undelivered wakes grouped by the gate that dropped them (PEN-6121) |
-| `GET /attendance-observations/undelivered` | every pass whose wake never reached a run (`wake_outcome IN ('refused', 'declined')`) |
+| `GET /attendance-observations/undelivered` | every pass whose wake never reached a run (`wake_outcome IN ('refused', 'declined')` — `deferred` is deliberately excluded, PEN-6704: it is a postponement with a committed `scheduled_retry` run, not a drop) |
 
 Both accept `since` (ISO-8601) **or** `sinceHours`; the undelivered listing also
 accepts `limit` (default 100, max 500). An unparseable window is a `400`, never

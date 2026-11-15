@@ -13,6 +13,7 @@ import {
   resolveAlertmanagerApiUrl,
   runAlertEscalationSweep,
 } from "../escalation.js";
+import { UNDELIVERED_WAKE_OUTCOMES } from "../attendance-record.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
 import { BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
 import manifest from "../manifest.js";
@@ -1815,9 +1816,14 @@ describe("resolveAlertmanagerApiUrl", () => {
  *    TWO ways and only one of them throws, so there are two tokens and two
  *    tests: `refused` (it rejected) and `declined` (it resolved
  *    `{ queued: false }` — heartbeats disabled, cooldown, inactive company,
- *    suppression, worktree cutoff, capacity deferral). A caller that merely
- *    awaits the promise records the second, commoner case as `enqueued`,
- *    which is this row's own defect in the direction that reads clean.
+ *    suppression, worktree cutoff). A caller that merely awaits the promise
+ *    records the second, commoner case as `enqueued`, which is this row's own
+ *    defect in the direction that reads clean.
+ *
+ *    PEN-6704 added a THIRD token, `deferred`, for the sixth gate behind
+ *    `{ queued: false }` — the provider-capacity deferral, which this comment
+ *    used to list under `declined`. It is a postponement with a committed
+ *    `scheduled_retry` run, so it is NOT undelivered.
  */
 describe("PEN-2918 attendance observations", () => {
   const due = (overrides: Partial<AlertStateRecord> = {}): AlertStateRecord => ({
@@ -1996,6 +2002,111 @@ describe("PEN-2918 attendance observations", () => {
   });
 
   it("records the host's cause token for a declined wake, from undeliveredReason", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance[0]).toMatchObject({ wake_outcome: "declined", wake_cause: "heartbeat.cooldown" });
+  });
+
+  /**
+   * PEN-6704 — a provider-capacity deferral is a POSTPONEMENT, and recording it
+   * as an undelivered `declined` is the PEN-6121 defect with its sign flipped.
+   *
+   * The host commits a `scheduled_retry` run and returns `queued: false` with
+   * `deferredForCapacity: true`, leaving `undeliveredReason` NULL by design —
+   * that path writes no `skipped` row, so `durableSkipReason` is never set.
+   * The ladder used to read only `undeliveredReason`, so the row recorded
+   * `declined` with a null cause and landed in the undelivered numerator while
+   * a run was pending.
+   *
+   * ⛔ MUTATION CONTROL. Delete the `deferredForCapacity === true` branch in
+   * `requestWakeupBestEffort` and these four tests fail — `wake_outcome` goes
+   * back to `declined`, the cause to null, `UNDELIVERED_WAKE_OUTCOMES` claims
+   * it, and the comment asserts the host enqueued nothing. Nothing else in the
+   * file moves: every existing wake test fixes `deferredForCapacity` absent,
+   * which the `=== true` test reads as no claim.
+   */
+  it("records a capacity deferral as `deferred`, not as an undelivered `declined`", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance[0]).toMatchObject({ wake_outcome: "deferred" });
+    // ⛔ The point of the token: the undelivered query and the partial index
+    // both name these two literally, so a postponement must not be one of them.
+    expect(UNDELIVERED_WAKE_OUTCOMES).not.toContain("deferred");
+    expect(UNDELIVERED_WAKE_OUTCOMES).toEqual(["refused", "declined"]);
+  });
+
+  /**
+   * The cause is MINTED, not forwarded — the one value in that column that is.
+   * A null here would leave a fully diagnosed row looking untriaged, which is
+   * what made PEN-6121's Done-when 3 unsatisfiable for this gate: no specimen
+   * could ever have carried a host token, because the host never writes one.
+   */
+  it("mints `provider_capacity_deferred` as the cause, since the host leaves undeliveredReason null by design", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance[0].wake_cause).toBe("provider_capacity_deferred");
+  });
+
+  /**
+   * Done-when 2. The `declined` sentence asserts the host "enqueued nothing",
+   * which for this gate is FALSE — a `scheduled_retry` run exists. The reader
+   * a skimming thread must not mislead is the owner deciding whether anyone is
+   * coming.
+   */
+  it("tells the thread the wake was POSTPONED, and never that no run was queued", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
+    expect(body).toContain("POSTPONED, not dropped");
+    expect(body).toContain("provider capacity");
+    expect(body).not.toContain("enqueued nothing");
+    expect(body).not.toContain("no run was queued");
+  });
+
+  /**
+   * ⛔ The BEHAVIOUR this change deliberately does NOT alter. The ladder holds
+   * no run of its own at this rung, so the rung is still held for a delivery
+   * retry rather than climbing past an owner whose run is already committed.
+   *
+   * Pinned because the two predicates are one character apart at the call site:
+   * swapping `WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG` back to
+   * `UNDELIVERED_WAKE_OUTCOMES` there compiles, passes every other test in this
+   * file, and silently makes the ladder escalate a rung early on every capacity
+   * deferral. That is the regression this test exists to catch, and it is
+   * invisible in the attendance table.
+   */
+  it("still holds the rung for a delivery retry on a deferral, exactly as before", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    const final = writes[writes.length - 1][1];
+    expect(final.escalationWakePendingAgentId).toBe("engineer");
+    expect(final.escalationWakeRetries).toBe(0);
+  });
+
+  /**
+   * ⛔ The pre-PEN-6704 HOST, which omits the field entirely. Tested `=== true`
+   * for the same reason `queued` is tested `=== false`: silence is not a claim.
+   * A truthiness test would be green here too, so this pins the direction that
+   * matters — a host that says nothing keeps the OLD behaviour rather than
+   * having a deferral read into its silence.
+   */
+  it("keeps recording `declined` when the host omits deferredForCapacity", async () => {
     const store = buildFakeAlertmanagerStore();
     const { ctx, mocks } = sweepContext(due(), "cto", store);
     mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" }));
@@ -2279,7 +2390,9 @@ describe("PEN-2918 attendance observations", () => {
    * `issues.requestWakeup` resolves `{ queued: false }` without throwing
    * whenever the host declines to enqueue a run: `wakeOnDemand.disabled`, the
    * heartbeat cooldown, `company.inactive`, `scheduling_suppressed`,
-   * `worktree_execution_cutoff`, or a provider-capacity deferral. Recording
+   * or `worktree_execution_cutoff` (PEN-6704: the provider-capacity deferral
+   * was in this list and now records `deferred` instead, being a postponement
+   * rather than a drop). Recording
    * that as `enqueued` would file the larger and quieter half of the dropped
    * wakes under "the host accepted it", leaving the undelivered query reading
    * clean while wakes are dropped — the exact failure PEN-2918 measures.
