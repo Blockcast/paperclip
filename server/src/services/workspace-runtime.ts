@@ -6131,6 +6131,18 @@ export type WorktreeReclaimSafety = {
 const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
 
 /**
+ * BLO-49622: `git worktree remove` is a DESTRUCTIVE walk, so it must not share
+ * the 30s probe deadline. Killing it mid-walk leaves the worst possible state:
+ * git deletes the tree before its admin dir, so a kill can take the `.git`
+ * link and leave the registration, i.e. a husk the next wake refuses. Measured
+ * 2026-11-15: 478 of 3,602 collector removals in 7d (13%) ran into the 30s
+ * kill, and all five husks logged since b7d09fed had their dir modified 30-50s
+ * after the collector's own `git status`. A wedged mount costs this pass up to
+ * this bound on a child process; it holds no libuv thread.
+ */
+export const WORKTREE_REMOVE_GIT_TIMEOUT_MS = 10 * 60_000;
+
+/**
  * BLO-51647: `git worktree list --porcelain` grows ~520 bytes per registration.
  * At 525 registrations onprem-k8s printed 271,934 bytes, past the default
  * 256 KiB capture, which keeps only the TAIL -- so the first ~20 registrations
@@ -6504,7 +6516,7 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
               phase: "worktree_cleanup",
               args: ["worktree", "remove", ...removeForceArgs, workspacePath],
               cwd: repoRoot,
-              timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+              timeoutMs: WORKTREE_REMOVE_GIT_TIMEOUT_MS,
               metadata: {
                 workspaceId: input.workspace.id,
                 workspacePath,
