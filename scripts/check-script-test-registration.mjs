@@ -227,47 +227,6 @@ const ALLOWLIST = [
       "closing as a cue to delete this entry. It is permanent, not pending, " +
       "which is why it carries no pendingRegistrationPr.",
   },
-  {
-    file: "scripts/github-publish-broker-soak-queries.test.mjs",
-    reason:
-      "Registration for this file is the sole unique residue of PR #3205. " +
-      "That is measured, not inherited: the three files #3205 adds already " +
-      "exist on master in longer form, and master's pr.yml carries no " +
-      "reference to github-publish-broker-soak-queries at all, so the " +
-      "23-line registration step is the only content of that PR not already " +
-      "landed -- and is also why the PR is CONFLICTING. " +
-      "That PR's operative hold is the `do-not-merge` label, NOT the " +
-      "code-owner review request this entry named until 2026-11-11: " +
-      "`land-clean-prs.mjs` returns on its `SKIP_LABELS` opt-out before the " +
-      "sole `unsatisfiedOwners` call, so no CODEOWNERS ruling releases it " +
-      "and clearing the review request would achieve nothing. " +
-      "Measured live 2026-11-13: #3205 OPEN, CONFLICTING/DIRTY, " +
-      "labels ['do-not-merge'], head eb2dc737 unmoved since the " +
-      "2026-11-02T14:09:36Z force-push. The release condition on record " +
-      "is the CEO ruling in #3205's own thread at 2026-11-03T03:57Z -- " +
-      "the label comes off when @kkroo reviews -- and that review " +
-      "request, restored 2026-11-03T03:57:12Z, is still outstanding with " +
-      "zero @kkroo reviews of any state on the PR. " +
-      "DO NOT READ A DETERRENT OUT OF THIS ENTRY, AND DO NOT RE-PIN IT " +
-      "TO ONE. The revision that stood here from 2026-11-12 to " +
-      "2026-11-13 said removing the label was ALREADY asked on a board " +
-      "card and that a second ask would be a duplicate; it was withdrawn " +
-      "as false -- the card it named had already been withdrawn when that " +
-      "revision was written. A board card, a card annotation and a " +
-      "Paperclip row are objects this repository's CI cannot resolve, so " +
-      "a claim here about their state is checked by nothing and goes " +
-      "false silently, in the direction that discourages the only act " +
-      "that releases #3205. This file's git history carries both " +
-      "withdrawn texts and the measurements that killed them. Whether an " +
-      "ask is pending NOW is Paperclip state: read PEN-5272, and infer " +
-      "nothing either way from this entry. " +
-      "PEN-5272 forbids routing around the " +
-      "hold, so the step is NOT duplicated here and this entry stands in for " +
-      "it. DELETE THIS ENTRY when #3205 lands (arm 4 will print a notice " +
-      "telling you to); if #3205 is closed unmerged, re-land its 23-line " +
-      "pr.yml step and delete this entry then.",
-    pendingRegistrationPr: 3205,
-  },
 ];
 
 const TEST_FILE = /\.test\.(mjs|js)$/;
