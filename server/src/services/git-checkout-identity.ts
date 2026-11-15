@@ -46,6 +46,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { deriveAgentUrlKey } from "@paperclipai/shared";
+import { readLocalGitConfigValue } from "./git-local-config-file.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -260,9 +261,17 @@ async function readLocalConfigValue(
   cwd: string,
   key: string,
 ): Promise<string | null> {
+  // BLO-57549: read the config file instead of spawning git (each spawn forks the
+  // ~1.6 GB worker). Only for the real runner, so injected test seams still see
+  // every call; `undefined` means the reader declined and git decides.
+  const fromFile = runGit === defaultGitRunner
+    ? await readLocalGitConfigValue(cwd, key).catch(() => undefined)
+    : undefined;
   // Exit 1 with no output is git's "key is not set", which is a normal read
   // outcome rather than a failure -- hence catch-to-null instead of rethrow.
-  const value = await runGit(["config", "--local", "--get", key], cwd).catch(() => null);
+  const value = fromFile !== undefined
+    ? fromFile
+    : await runGit(["config", "--local", "--get", key], cwd).catch(() => null);
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;

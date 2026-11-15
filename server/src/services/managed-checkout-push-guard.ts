@@ -158,6 +158,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { readLocalGitConfigValue } from "./git-local-config-file.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -342,6 +343,14 @@ async function readConfigValue(
   scope: "effective" | "local" = "effective",
 ): Promise<{ value: string | null; unreadable: string | null }> {
   const scopeArgs = scope === "local" ? ["--local"] : [];
+  // BLO-57549: a local key is read from the config file rather than by spawning
+  // git (each spawn forks the ~1.6 GB worker). Only for the real runner -- a
+  // bare checkout and injected test seams use a different one -- and
+  // `undefined` (no `.git` here, or a shape the reader declines) asks git.
+  if (scope === "local" && runGit === defaultRunGit) {
+    const fromFile = await readLocalGitConfigValue(cwd, key).catch(() => undefined);
+    if (fromFile !== undefined) return { value: fromFile ? fromFile : null, unreadable: null };
+  }
   try {
     const raw = await runGit(["config", ...scopeArgs, "--get", key], cwd);
     const trimmed = typeof raw === "string" ? raw.trim() : "";
