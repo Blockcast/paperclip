@@ -10,6 +10,7 @@ import {
   TESTS_DIR,
   TSCONFIG_PATH,
   checkAllowlist,
+  insertionHint,
   isGatedTestFile,
   readDiffNameStatus,
   toIncludeEntry,
@@ -52,7 +53,8 @@ test("clean tree with no added test files passes", () => {
 
 test("an added test file that IS allowlisted passes", () => {
   const added = `${TESTS_DIR}/brand-new.test.ts`;
-  const include = [...BASELINE, toIncludeEntry(added)];
+  // `.sort()` is not decoration: arm 5 refuses an end-append (PEN-6734).
+  const include = [...BASELINE, toIncludeEntry(added)].sort();
   assert.deepEqual(
     check({ include, fileExists: existsOnly(...include.map(toRepoPath)), addedFiles: [added] }),
     [],
@@ -72,8 +74,11 @@ test("arm 3: an added test file absent from `include` is rejected, and naming it
   assert.match(red[0], /vacuously/);
   // The message must carry the exact line to paste, or the remedy is a guess.
   assert.match(red[0], /"src\/__tests__\/brand-new\.test\.ts",/);
+  // ...and WHERE to paste it, or the author appends, arm 5 reddens, and a
+  // one-line edit costs a second CI round trip (PEN-6734).
+  assert.match(red[0], /belongs at the TOP of `include`, before "src\/__tests__\/pr-comment-review-gate\.test\.ts"/);
 
-  const include = [...BASELINE, toIncludeEntry(added)];
+  const include = [...BASELINE, toIncludeEntry(added)].sort();
   assert.deepEqual(
     check({ include, baseInclude: BASELINE, addedFiles: [added], fileExists: existsOnly(...include.map(toRepoPath)) }),
     [],
@@ -276,10 +281,74 @@ test("readDiffNameStatus splits a rename into delete + add", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The live config must satisfy this guard's own whole-tree arms. If it ever
-// does not, the guard is red on master and the message says which arm.
+// Arm 5 -- sorted and unique, so two concurrent test-adding PRs edit different
+// lines. PEN-6734: in append order every such PR rewrote the same final line,
+// so any two conflicted by construction, and the natural resolution of that
+// conflict drops one side's entry.
 // ---------------------------------------------------------------------------
-test("the real server/tsconfig.tests.json passes arms 1 and 2", async () => {
+test("arm 5: an end-append is refused, and the sorted placement passes", () => {
+  // `brand-new` sorts BEFORE both baseline entries, so appending it is the
+  // exact shape #3818 and #3748 landed in: a new entry on the last line.
+  const added = `${TESTS_DIR}/brand-new.test.ts`;
+  const appended = [...BASELINE, toIncludeEntry(added)];
+
+  const red = check({
+    include: appended,
+    baseInclude: BASELINE,
+    addedFiles: [added],
+    fileExists: existsOnly(...appended.map(toRepoPath)),
+  });
+  assert.equal(red.length, 1);
+  assert.match(red[0], /is not sorted/);
+  assert.match(red[0], /"src\/__tests__\/brand-new\.test\.ts"/);
+  // The remedy must be mechanical: the message names the position.
+  assert.match(red[0], /belongs at the TOP of `include`, before "src\/__tests__\/pr-comment-review-gate\.test\.ts"/);
+  assert.match(red[0], /PEN-6734/);
+
+  // POSITIVE CONTROL: the same entry, sorted, is clean. Without this the arm
+  // could be refusing everything and the negative above would look identical.
+  const sorted = [...appended].sort();
+  assert.deepEqual(
+    check({ include: sorted, baseInclude: BASELINE, addedFiles: [added], fileExists: existsOnly(...sorted.map(toRepoPath)) }),
+    [],
+  );
+});
+
+test("arm 5: a duplicated entry is refused", () => {
+  // The other side of the same incident: a conflict in `include` resolved by
+  // keeping both sides of the one overlapping region duplicates the entry the
+  // two sides shared. tsc accepts that silently, so nothing else reports it.
+  const dupes = [GATED, GATED, ALSO_GATED];
+  const problems = check({ include: dupes, baseInclude: BASELINE, fileExists: allGatedExist(dupes) });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /more than once/);
+  assert.match(problems[0], /pr-comment-review-gate\.test\.ts/);
+});
+
+test("arm 5: the three insertion-hint shapes", () => {
+  const list = ["src/__tests__/b.test.ts", "src/__tests__/d.test.ts"];
+  assert.match(insertionHint(list, "src/__tests__/a.test.ts"), /^at the TOP of `include`, before "src\/__tests__\/b\.test\.ts"$/);
+  assert.match(insertionHint(list, "src/__tests__/c.test.ts"), /^between "src\/__tests__\/b\.test\.ts" and "src\/__tests__\/d\.test\.ts"$/);
+  assert.match(insertionHint(list, "src/__tests__/e.test.ts"), /^at the END of `include`, after "src\/__tests__\/d\.test\.ts"$/);
+  // An entry ALREADY in the list must not be told to move next to itself.
+  assert.match(insertionHint(["src/__tests__/z.test.ts", "src/__tests__/a.test.ts"], "src/__tests__/z.test.ts"), /after "src\/__tests__\/a\.test\.ts"$/);
+});
+
+test("arm 5 does not fire on an `include` the earlier arms already refused", () => {
+  // Arm 1 short-circuits on a non-string entry, and every later arm is keyed on
+  // string comparison. Pinned because arm 5 compares entries with `<`, which on
+  // a mixed array silently coerces instead of throwing.
+  const problems = checkAllowlist({ include: [ALSO_GATED, 42, GATED], fileExists: () => true });
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /is not a string/);
+});
+
+// ---------------------------------------------------------------------------
+// The live config must satisfy this guard's own whole-tree arms. If it ever
+// does not, the guard is red on master and the message says which arm. Arm 5
+// is in that set, so THIS is what pins the live `include` sorted.
+// ---------------------------------------------------------------------------
+test("the real server/tsconfig.tests.json passes arms 1, 2 and 5", async () => {
   const { existsSync, readFileSync } = await import("node:fs");
   const include = JSON.parse(readFileSync(join(REPO_ROOT, TSCONFIG_PATH), "utf8")).include;
   assert.ok(Array.isArray(include) && include.length > 0, `${TSCONFIG_PATH} has no readable include`);
