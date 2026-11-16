@@ -498,8 +498,12 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 # it in the image so claude can spawn it as a stdio MCP, which sidesteps
 # the per-request Authorization header dance the http transport requires
 # (the binary reads GITHUB_PERSONAL_ACCESS_TOKEN from env at startup).
-# Pin to a release tag — bump deliberately, not via :latest.
-FROM ghcr.io/github/github-mcp-server:v1.0.3 AS github-mcp
+# Pin to a release tag — bump deliberately, not via :latest. BLO-57664: v1.0.3
+# was go1.25.9 + x/net v0.38 (Harbor Highs). v2.x refuses plain-http GHES
+# hosts other than localhost/127.0.0.1/::1 and keeps the GITHUB_HOST port;
+# github-mcp-token-proxy.ts binds 127.0.0.1:80 with a port-less host, so both
+# changes are compatible. Its tools/list is a strict superset of v1.0.3's.
+FROM ghcr.io/github/github-mcp-server:v2.1.0@sha256:f6056fc10bfffcc8c81a6417a2e9ca12808647e8dd6049642a4feaadee0e0f8a AS github-mcp
 
 # BLO-32824: this stage previously reused `gh_token` (`PAPERCLIP_BOARD_TOKEN`,
 # then mounted for the `kkroo/*` vendor clone), which cannot read the Blockcast

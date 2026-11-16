@@ -214,9 +214,14 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # alone. Matching the PVC exactly is what makes removing the mount a no-op
 # rather than a fleet-wide downgrade.
 #
+# BLO-57664: moved to the latest v1.35 PATCH (v1.35.10, go1.26.10) because
+# v1.35.3 is built with go1.25.7 and old x/net/x/text/otel/spdystream, which
+# Harbor lists as High. A patch bump stays on the server's minor, so the skew
+# argument above is unchanged; only the patch is ahead of the control plane.
+#
 # Asserted rather than assumed: this pin exists to guarantee a specific version
 # match, so a served-but-wrong artifact must fail the build, not ship quietly.
-ARG KUBECTL_VERSION=v1.35.3
+ARG KUBECTL_VERSION=v1.35.10
 RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
        -o /usr/local/bin/kubectl \
   && chmod +x /usr/local/bin/kubectl \

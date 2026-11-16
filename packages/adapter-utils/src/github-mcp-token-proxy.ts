@@ -41,7 +41,9 @@
 //
 // `GITHUB_HOST` is parsed by the upstream server with the port DISCARDED:
 // `http://127.0.0.1:41487` produces requests to `http://127.0.0.1/api/v3/...`
-// (measured against v1.0.3). There is therefore no port to pick — the listener
+// (measured against v1.0.3; v2.1.0 keeps the port and only accepts plain http
+// for localhost/127.0.0.1/::1 — BLO-57664 — so a port-less 127.0.0.1 host
+// still works on both). There is therefore no port to pick — the listener
 // must answer on :80 of a loopback address or not at all. That works in the
 // agent pod because `net.ipv4.ip_unprivileged_port_start` is 0, and it is
 // checked rather than assumed: a bind failure disables the proxy and leaves the
