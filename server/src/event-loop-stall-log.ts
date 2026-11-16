@@ -10,7 +10,7 @@
 // Attribution is by timestamp: the sweeps already log continuously, so a stall
 // line lands next to whatever was running. See the ponytail note below.
 
-import { monitorEventLoopDelay } from "node:perf_hooks";
+import { monitorEventLoopDelay, performance } from "node:perf_hooks";
 import { logger } from "./middleware/logger.js";
 
 const DEFAULT_THRESHOLD_MS = 1_000;
@@ -39,14 +39,42 @@ export interface EventLoopStallLogOptions {
    * Keep this an order of magnitude above `HISTOGRAM_RESOLUTION_MS`. After a
    * stall both this timer and the histogram's own are overdue, and if libuv
    * runs ours first the histogram is re-armed before it can record — `max`
-   * reads 0 and the stall is lost, unrecoverably. The default 1000ms leaves the
-   * histogram overdue by nearly a second more, so it always wins (0 misses in
-   * 26 blocks). At 50ms the two are within the resolution and ours wins ~20% of
-   * the time on an idle host and ~70% under CPU contention (BLO-22985); only
-   * the tests go that low, and they retry the block a bounded number of times.
+   * reads 0 and that stall is lost from the histogram, unrecoverably. It is
+   * NOT deferred to the next window: `reset()` clears the histogram's own
+   * previous-tick timestamp, so the overdue tick records nothing when it
+   * finally runs (40 of 40 misses lost, never recovered — PEN-3381). The
+   * default 1000ms leaves the histogram overdue by nearly a second more, so it
+   * normally wins (0 misses in 26 blocks). At 50ms the two are within the
+   * resolution and ours wins ~27% of the time on an idle host and ~78% on a
+   * 4-core cgroup at load ~12 (BLO-22985, re-measured PEN-3381).
+   *
+   * That race no longer decides whether a stall is reported: `lagMs` below is
+   * a second detector the race cannot reach. Lowering this is still not free —
+   * `lagMs` under-reports by up to one sample interval, so a smaller value
+   * makes the floor tighter, not looser.
    */
   sampleMs?: number;
   log?: (fields: Record<string, number>, message: string) => void;
+  /**
+   * The delay histogram, for tests. Defaults to a real `monitorEventLoopDelay`
+   * and production never passes it. It exists because the histogram's reading
+   * is decided by the libuv race above, so a test that drives a REAL stall
+   * cannot deterministically exercise the histogram arm of `stallMs` — pinning
+   * `max` is the only way to cover that path without a coin flip.
+   */
+  histogram?: EventLoopDelayHistogram;
+}
+
+/**
+ * The slice of node's `IntervalHistogram` this sampler touches. Narrow on
+ * purpose: a stub needs four members, not the whole interface.
+ */
+export interface EventLoopDelayHistogram {
+  enable(): unknown;
+  disable(): unknown;
+  reset(): void;
+  /** Largest delay observed in the current window, in NANOseconds. */
+  readonly max: number;
 }
 
 /**
@@ -86,25 +114,49 @@ export function startEventLoopStallLogging(
   const sampleMs = options.sampleMs ?? DEFAULT_SAMPLE_MS;
   const log = options.log ?? ((fields, message) => logger.warn(fields, message));
 
-  const delay = monitorEventLoopDelay({ resolution: HISTOGRAM_RESOLUTION_MS });
+  const delay: EventLoopDelayHistogram =
+    options.histogram ?? monitorEventLoopDelay({ resolution: HISTOGRAM_RESOLUTION_MS });
   delay.enable();
   // Measured quirks, both harmless here but non-obvious if you read the output:
   // the histogram records nothing until the loop has iterated once after
   // enable(), and its `max` carries the resolution interval as a ~20ms floor.
   // At a 1s threshold that is 2% of noise on a signal we only read in seconds.
-  let windowStart = Date.now();
+  // Monotonic: `lagMs` below is derived from this, and a wall-clock step would
+  // manufacture or erase a stall that never happened.
+  let windowStart = performance.now();
 
   const timer = setInterval(() => {
-    const stallMs = delay.max / 1e6;
-    const now = Date.now();
+    const histogramMs = delay.max / 1e6;
+    const now = performance.now();
     // The stall delays this timer too, so the window is >= sampleMs; report the
     // measured one rather than the nominal.
     const windowMs = now - windowStart;
     windowStart = now;
     delay.reset();
+    // Second detector, and the only one the re-arm race cannot take away: this
+    // interval cannot run while the loop is blocked, so the interval's own
+    // lateness is a FLOOR on how long the loop was unresponsive. A block of D
+    // ms sits entirely inside one window, so windowMs >= D and lagMs >= D -
+    // sampleMs, whatever libuv does — and contention can only make the tick
+    // later, i.e. it moves this quantity AWAY from a missed detection.
+    //
+    // A floor, not a replacement. A stall shorter than one sample interval can
+    // miss its deadline by anything down to zero, so `lagMs` under-reports by
+    // up to `sampleMs`: at the production 1000ms sampling a 1.2s stall shows
+    // lagMs 200 and is caught by the histogram, not by this. The histogram
+    // stays the sensitive detector; this is the robust one. Report both so an
+    // operator can see which fired.
+    const lagMs = Math.max(0, windowMs - sampleMs);
+    const stallMs = Math.max(histogramMs, lagMs);
     if (stallMs >= thresholdMs) {
       log(
-        { stallMs: Math.round(stallMs), windowMs, thresholdMs },
+        {
+          stallMs: Math.round(stallMs),
+          histogramMs: Math.round(histogramMs),
+          lagMs: Math.round(lagMs),
+          windowMs: Math.round(windowMs),
+          thresholdMs,
+        },
         "event loop stalled",
       );
       stallListener?.(stallMs);

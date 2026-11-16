@@ -1967,7 +1967,8 @@ describe("startServer feedback export wiring", () => {
   // passes as part of a whole-file run. The spy returns a bare number, and
   // `startEventLoopStallLogging` calls `.unref()` on what `setInterval` returns
   // — survivable only because an earlier, unmocked `startServer()` has already
-  // latched that module's `activeStop` singleton (event-loop-stall-log.ts:70),
+  // latched that module's `activeStop` singleton (declared at the top of
+  // event-loop-stall-log.ts; no line number, it moves),
   // so this call returns early and never reaches `unref`. Running this test
   // alone with `-t` makes the mocked call the first one and fails on
   // `timer.unref is not a function`. That is the harness, not a regression.
