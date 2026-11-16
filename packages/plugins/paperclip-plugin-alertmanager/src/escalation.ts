@@ -667,6 +667,21 @@ const CARRY_OVER_MAX_CHARS = 1_800;
  * section with the machine's own sentences — which is precisely the content
  * that is NOT furnished.
  *
+ * ## The section names the ALERTNAME, and says so — PEN-6477
+ *
+ * The predicate below is keyed on `alertname`, which is also what the covers
+ * table and the liveness check are keyed on. Two distinct SOURCE issues can
+ * mint the same alertname — measured 2026-11-11, PEN-4148 and PEN-4363 both
+ * mint `HeartbeatRunQueueAgentOldestQueuedHigh` — so the predecessor selected
+ * here is not guaranteed to have been opened for the same source row.
+ *
+ * ⛔ The header and the sentence must therefore BOTH name the alertname, and
+ * the sentence must say that the selection is by alertname. It used to read
+ * "This is not the first cover opened for this source", which claims a
+ * per-source guarantee the query does not make. The behaviour is right —
+ * alertname is the correct key — so do not repair this by changing the
+ * predicate, and do not shorten the sentence back to "this source".
+ *
  * ## Fail-safe, in the direction that keeps the cover
  *
  * Every failure here is swallowed and degrades the section, never the cover.
@@ -694,9 +709,9 @@ async function previousCoverCarryOver(
     if (!previous) return "";
     const priorIssue = await ctx.issues.get(previous.cover_issue_id, companyId);
     const label = priorIssue?.identifier ?? previous.cover_issue_id;
-    const header = `\n\n---\n\n## Previous cover for \`${alertname}\`: ${label}\n\nThis is not the first cover opened for this source. ${label} covered it before and is now closed`
+    const header = `\n\n---\n\n## Previous cover for \`${alertname}\`: ${label}\n\nThis is not the first cover opened for \`${alertname}\`. ${label} covered that alert before and is now closed`
       + (previous.close_verdict ? ` (close verdict \`${previous.close_verdict}\`)` : "")
-      + `. Anything decided there still applies unless it is superseded here — the ladder restarted, the ask did not.`;
+      + `. This section is selected by alertname rather than by source issue, so ${label} may have been opened for a different source. Anything decided there still applies to this alert unless it is superseded here — the ladder restarted, the ask did not.`;
 
     const comments = await ctx.issues.listComments(previous.cover_issue_id, companyId);
     // ⚠ SORT, DO NOT TRUST THE HOST'S ORDER. `ctx.issues.listComments` reaches
@@ -1644,16 +1659,28 @@ async function advanceIssueLadder(
     // `UNDELIVERED_WAKE_OUTCOMES`, so the hold cannot land in the undelivered
     // numerator either.
     if (!retriesRemainAfterThisAttempt) {
-      // The LAST hold sweep for this rung. Say so, once — the same retraction
-      // PEN-6229 added for the retry path, and for the same reason: the
-      // rung-opening comment promised that the ladder would hold this rung
-      // without re-waking, that promise silently stops being true when the
-      // budget runs out, and a reader who is never told sees the next
-      // escalation contradict it rather than follow from it.
+      // The LAST HELD sweep for this rung. Say so, once — the same retraction
+      // PEN-6229 added for the retry path, and for the same reason: the thread
+      // is about to show the ladder escalate past an owner whose run is still
+      // only pending, and no other sweep on this path reports that the hold
+      // has ended. A reader who is never told sees the next escalation
+      // contradict the thread rather than follow from it.
       //
-      // Bounded exactly as the retry retraction is: one extra comment per
-      // fully-held rung, because the intermediate holds stay silent while the
-      // promise still holds.
+      // ⛔ PEN-6760 — this does NOT retract a hold promise, and must not be
+      // reworded as though it did. `wakeSentence` promises a hold on its
+      // `deferred` arm only. On the MIXED path the rung opened `declined`,
+      // whose clause promises a RE-SEND, and the deferral sweep itself posts
+      // nothing — so this comment can be the thread's FIRST mention of a hold.
+      // `deferralHoldSpentSentence` is written to stand alone for exactly that
+      // reason, and its docblock forbids the back-reference this comment used
+      // to make.
+      //
+      // Bounded as the retry retraction is: at most ONE extra comment per
+      // rung, because `!retriesRemainAfterThisAttempt` fires on the final
+      // sweep only and the earlier held sweeps stay silent. How many of those
+      // there were is not knowable here — two when the deferral landed on the
+      // rung's first attempt, one on the mixed path — which is the same reason
+      // `deferralHoldSpentSentence` carries no count.
       await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] ${deferralHoldSpentSentence(current?.name ?? "the current owner")}\n\n${livenessLine(liveness, state, now)}`, companyId);
     }
   } else if (retryingWakeDelivery) {

@@ -2371,10 +2371,25 @@ describe("PEN-2918 attendance observations", () => {
     // Sweep 2 — a RETRY, because the marker says `declined`. It re-wakes, and
     // this time the host DEFERS. Nothing is posted: the budget still remains.
     // This is the sweep the old count silently swept into the hold.
+    const commentsBeforeRetry = mocks.issues.createComment.mock.calls.length;
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:30:00Z"));
     expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(2);
     expect(live.escalationWakeRetries).toBe(1);
     expect(live.escalationWakeDeferred).toBe(true);
+    // ⛔ PEN-6760 — sweep 2 POSTS NOTHING, and that is the claim both
+    // `deferralHoldSpentSentence`'s docblock and the hold arm's comment rest
+    // on. It has to be pinned HERE: taking the baseline only after this sweep
+    // makes any comment it posted invisible, because the
+    // `commentsBeforeHold + 1` assertion below absorbs it and still passes.
+    //
+    // Mutation control, measured rather than assumed: dropping
+    // `!retriesRemainAfterThisAttempt` from the RETRY-path post arm in
+    // `escalation.ts` makes sweep 2 post its retry-budget sentence. This line
+    // then fails (2 against 1) and every other assertion in this test still
+    // passes — including `commentsBeforeHold + 1`, which is why it is not a
+    // substitute for this one. ⛔ Not the HOLD arm: sweep 2 never reaches it,
+    // because `escalationWakeDeferred` is still false when sweep 2 starts.
+    expect(mocks.issues.createComment.mock.calls.length).toBe(commentsBeforeRetry);
     const commentsBeforeHold = mocks.issues.createComment.mock.calls.length;
 
     // Sweep 3 — the hold, and its last one. No wake, and one retraction whose
