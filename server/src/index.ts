@@ -1457,8 +1457,10 @@ export async function startServer(): Promise<StartedServer> {
     }, 60_000).unref?.();
     // Flight recorder (BLO-51594): a profile started after a stall cannot
     // contain it, so keep one running and dump the segment the stall landed in.
-    // 2-min segments at 10 ms sampling cost well under 1% CPU.
-    startCpuFlightRecorder({ segmentMs: 120_000, samplingIntervalUs: 10_000 }).catch((err) =>
+    // Each rotation blocks the loop for seconds on a worker (Profiler.start
+    // re-logs every compiled function, whatever the sampling interval), so the
+    // segment is long: 2-min segments were a ~2 s stall every 2 min (BLO-57549).
+    startCpuFlightRecorder({ segmentMs: 900_000, samplingIntervalUs: 10_000 }).catch((err) =>
       logger.error({ err }, "CPU flight recorder failed to start"),
     );
     setEventLoopStallListener((stallMs) => {
