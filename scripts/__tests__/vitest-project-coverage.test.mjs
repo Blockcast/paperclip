@@ -835,32 +835,157 @@ function budgetLabel(budgetMs) {
   return `${budgetMs}ms`;
 }
 
+// Blank out `//` and `/* */` comments, leaving a string of the SAME LENGTH so
+// any index taken on the result still addresses the original. String and
+// template literals are respected, so a `//` inside a URL is not a comment --
+// and, the direction that matters here, an apostrophe inside a comment is not
+// a string.
+//
+// `clean` is false when the scan ends inside a string or an unterminated block
+// comment. Every caller must treat that as unreadable rather than as a clean
+// parse of what it managed to see: a half-parsed argument list is exactly the
+// input that produced the fail-open below.
+// Does a `/` at `index` open a REGEX literal rather than a division? The
+// standard lexer heuristic: look back at the last non-whitespace character. A
+// regex can only appear where a VALUE may start, so after an operator, an
+// opening bracket, a comma or a statement end -- never after an identifier,
+// a number, or a closing bracket, where `/` must be division.
+//
+// This matters because a regex can CONTAIN `//`. `pathname.replace(/^\\//, "")`
+// is live in `packages/db/src/client.test.ts`, and reading its `\\//` as the
+// start of a line comment blanks the rest of the line -- including the `)` --
+// which unbalances the call and reports a correctly-budgeted body as
+// unreadable. That is a FALSE ALARM, and this guard fails closed, so a false
+// alarm reds the build for everyone. Measured: 3 such sites before this.
+const VALUE_POSITION_PREFIX = /[(,=:[!&|?{};+\-*%<>~^]$|\b(?:return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await)$/;
+
+function opensRegexLiteral(source, index) {
+  const before = source.slice(0, index).replace(/\s+$/, "");
+  if (before === "") return true;
+  return VALUE_POSITION_PREFIX.test(before);
+}
+
+// Consume a regex literal starting at `index` (the opening `/`). Returns the
+// index of its closing `/`, or -1 if it does not terminate on this line -- in
+// which case the `/` was almost certainly division after all, and the caller
+// leaves it alone.
+function endOfRegexLiteral(source, index) {
+  let inClass = false;
+  for (let i = index + 1; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === "\\") {
+      i += 1;
+      continue;
+    }
+    if (char === "\n") return -1;
+    if (char === "[") inClass = true;
+    else if (char === "]") inClass = false;
+    else if (char === "/" && !inClass) return i;
+  }
+  return -1;
+}
+
+function stripJsComments(source) {
+  const out = source.split("");
+  let quote = null;
+  let index = 0;
+  let blockOpen = false;
+  for (; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (char === "\\") {
+        index += 1;
+        continue;
+      }
+      if (char === quote) quote = null;
+      continue;
+    }
+    // Regex literals are skipped WHOLE, and before the comment test, because a
+    // regex may contain `//` or `/*` that are not comments at all.
+    if (char === "/" && source[index + 1] !== "/" && source[index + 1] !== "*") {
+      if (opensRegexLiteral(source, index)) {
+        const end = endOfRegexLiteral(source, index);
+        if (end !== -1) {
+          index = end;
+          continue;
+        }
+      }
+    }
+    if (char === "/" && source[index + 1] === "/") {
+      let end = source.indexOf("\n", index + 2);
+      if (end === -1) end = source.length;
+      for (let i = index; i < end; i += 1) out[i] = " ";
+      index = end - 1;
+      continue;
+    }
+    if (char === "/" && source[index + 1] === "*") {
+      const end = source.indexOf("*/", index + 2);
+      if (end === -1) {
+        for (let i = index; i < source.length; i += 1) out[i] = " ";
+        blockOpen = true;
+        break;
+      }
+      for (let i = index; i < end + 2; i += 1) if (out[i] !== "\n") out[i] = " ";
+      index = end + 1;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") quote = char;
+  }
+  return { text: out.join(""), clean: quote === null && !blockOpen };
+}
+
 // Split a call's argument list -- the text BETWEEN its parens -- on top-level
-// commas. Brackets and string/template literals are tracked, so a comma inside
-// a test title or an options object does not split an argument. Comments are
-// not, which is the same bound `matchingParen` above carries.
+// commas. Brackets, string/template literals and COMMENTS are all tracked, so
+// a comma inside a test title, an options object or a comment does not split
+// an argument.
+//
+// Comments used to be excluded here, "the same bound `matchingParen` carries".
+// That was a fail-open, and a live one: an apostrophe in a comment inside the
+// callback (`// doesn't matter`) opened a pseudo-string that swallowed the
+// comma before the budget, merging the callback and the budget into ONE
+// argument. `isCallbackArgument` then matched it and the call read as "passes
+// no budget", i.e. inherits the config, i.e. a PASS -- the exact shape this
+// file exists to reject, reintroduced by the reader meant to close it
+// (PEN-6772, found by Ally reviewing `30fe3a0`).
+//
+// Returns `clean: false` when the scan ends inside a string or bracket, so the
+// caller can fail CLOSED instead of scoring a truncated parse.
 function splitTopLevelArgs(args) {
+  const stripped = stripJsComments(args);
   const parts = [];
   let depth = 0;
   let start = 0;
   let quote = null;
-  for (let index = 0; index < args.length; index += 1) {
-    const char = args[index];
+  for (let index = 0; index < stripped.text.length; index += 1) {
+    const char = stripped.text[index];
     if (quote) {
       if (char === "\\") index += 1;
       else if (char === quote) quote = null;
       continue;
     }
+    // Regex literals are skipped here too, with the same helpers the stripper
+    // uses. The two scanners MUST share one token model: comments are already
+    // blanked by now, but a regex can contain an apostrophe
+    // (`/...sql's definition/` is live in
+    // `packages/db/src/concurrent-index-guard.test.ts`) and a scanner that
+    // reads it as an opening quote swallows the rest of the argument list.
+    if (char === "/" && opensRegexLiteral(stripped.text, index)) {
+      const end = endOfRegexLiteral(stripped.text, index);
+      if (end !== -1) {
+        index = end;
+        continue;
+      }
+    }
     if (char === '"' || char === "'" || char === "`") quote = char;
     else if (char === "(" || char === "[" || char === "{") depth += 1;
     else if (char === ")" || char === "]" || char === "}") depth -= 1;
     else if (char === "," && depth === 0) {
-      parts.push(args.slice(start, index));
+      parts.push(stripped.text.slice(start, index));
       start = index + 1;
     }
   }
-  parts.push(args.slice(start));
-  return parts;
+  parts.push(stripped.text.slice(start));
+  return { parts, clean: stripped.clean && quote === null && depth === 0 };
 }
 
 // Is this argument the hook/test CALLBACK rather than a budget? Anchored on
@@ -908,18 +1033,22 @@ function resolveBudgetExpression(expression, constants) {
 // i.e. it would trade a fail-open for a false alarm. Two passes so a constant
 // defined in terms of an earlier one resolves.
 function numericConstantsInSource(source) {
-  // Strip `//` comments first, the same strip (and for the same reason) as
-  // `declaredTimeouts`, `configuredTestTimeout` and `configuredHookTimeout`
-  // above. Harvesting from raw source lets a COMMENTED declaration register as
-  // a constant, and the loop below keeps the FIRST binding for a name -- so a
-  // commented `// const BUDGET_MS = 600_000` sitting above the real
+  // Strip comments first, for the same reason as `declaredTimeouts`,
+  // `configuredTestTimeout` and `configuredHookTimeout` above. Harvesting from
+  // raw source lets a COMMENTED declaration register as a constant, and the
+  // loop below keeps the FIRST binding for a name -- so a commented
+  // `// const BUDGET_MS = 600_000` sitting above the real
   // `const BUDGET_MS = 30_000` masks the real one, and every body spelling its
   // budget as `BUDGET_MS` is then scored against a value that does not exist at
   // runtime. That is a fail-open in the resolver this guard added to CLOSE a
   // fail-open. Live trigger shape: `packages/db/src/client.test.ts` carries a
   // `const EMBEDDED_MIGRATION_TEST_TIMEOUT_MS = 60_000` inside the comment that
   // records why the argument was removed (PEN-6772).
-  const code = source.replace(/^\s*\/\/.*$/gm, "");
+  //
+  // `stripJsComments` rather than a line-anchored regex, so a TRAILING comment
+  // (`foo(); // const BUDGET_MS = 600_000`) is masked too, while a `//` inside
+  // a string literal is not mistaken for one.
+  const code = stripJsComments(source).text;
   const constants = new Map();
   for (let pass = 0; pass < 2; pass += 1) {
     const declarations = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*number\s*)?=\s*([^;\n]+)/g;
@@ -966,7 +1095,12 @@ function overrideUndercutsConfig(budgetMs, configuredMs) {
  * `code[closeIndex]`. See UNKNOWN_BUDGET above for the three outcomes.
  */
 function budgetArgument(code, openIndex, closeIndex, constants) {
-  const args = splitTopLevelArgs(code.slice(openIndex + 1, closeIndex)).map((arg) => arg.trim());
+  const split = splitTopLevelArgs(code.slice(openIndex + 1, closeIndex));
+  // An unreadable argument list is UNKNOWN, never `null`. `null` means "this
+  // call passes no budget and therefore inherits the config" -- a PASS -- and
+  // a parse that fell over has shown no such thing.
+  if (!split.clean) return UNKNOWN_BUDGET;
+  const args = split.parts.map((arg) => arg.trim());
   while (args.length > 0 && args[args.length - 1] === "") args.pop();
   if (args.length < 2) return null;
   const last = args[args.length - 1];
@@ -1948,6 +2082,103 @@ test("a non-literal budget is reported as UNKNOWN by all three detectors, not as
       `booting-body detector scored ${description} as something other than UNKNOWN`,
     );
   }
+});
+
+test("an apostrophe in a callback comment does not hide the budget from any detector", () => {
+  // Regression, found by Ally reviewing `30fe3a0`. The argument splitter used
+  // to treat every `'` as opening a string literal, comments included. A
+  // comment inside the callback saying `doesn't` therefore opened a pseudo-
+  // string that ran to the end of the call and SWALLOWED the comma before the
+  // budget, so the callback and the budget arrived as ONE argument.
+  // `isCallbackArgument` matched it and the call read as "passes no budget" --
+  // which is scored as inheriting the project config, i.e. a PASS.
+  //
+  // It is the fail-open this whole file is about, reintroduced by the reader
+  // written to close it, and it was a REGRESSION AGAINST BASE: the numeric
+  // regex it replaced never looked at apostrophes at all.
+  //
+  // Asserted as a MUST-REPORT against all three detectors: the budget has to
+  // read as the sub-floor 60_000 it literally is. `null` here is the bug.
+  const comment = "// the prefix doesn't matter here";
+
+  const hook = bootingHooksInSource(
+    `beforeAll(async () => {
+       ${comment}
+       tempDb = await startEmbeddedPostgresTestDatabase("probe-");
+     }, 60_000);`,
+    "<synthetic-apostrophe-hook>",
+  );
+  assert.deepEqual(
+    hook.map(({ hook: name, budgetMs }) => `${name}:${budgetMs}`),
+    ["beforeAll:60000"],
+    "booting-hook detector lost the budget to an apostrophe in a comment",
+  );
+
+  const realIo = realIoHooksInSource(
+    `beforeAll(async () => {
+       ${comment}
+       db = new PGlite();
+     }, 60_000);`,
+    "<synthetic-apostrophe-real-io>",
+  );
+  assert.deepEqual(
+    realIo.map(({ hook: name, budgetMs }) => `${name}:${budgetMs}`),
+    ["beforeAll:60000"],
+    "real-I/O hook detector lost the budget to an apostrophe in a comment",
+  );
+
+  const body = bootingTestBodiesInSource(
+    `it("boots", async () => {
+       ${comment}
+       const database = await startEmbeddedPostgresTestDatabase("probe-");
+       expect(database).toBeTruthy();
+     }, 60_000);`,
+    "<synthetic-apostrophe-body>",
+  );
+  assert.deepEqual(
+    body.map(({ budgetMs }) => String(budgetMs)),
+    ["60000"],
+    "booting-body detector lost the budget to an apostrophe in a comment",
+  );
+  assert.ok(
+    body[0].budgetMs < EMBEDDED_POSTGRES_BODY_FLOOR_MS,
+    "the recovered budget no longer offends the floor -- this control proves nothing",
+  );
+});
+
+test("an unreadable argument list fails CLOSED, not as inheriting", () => {
+  // The second half of the same fix. When the splitter cannot finish -- an
+  // unterminated string or an unbalanced bracket, whatever the cause -- the
+  // honest answer is UNKNOWN. Returning `null` would mean "this call passes no
+  // budget", a positive claim the parse never established, and UNKNOWN is a
+  // floor violation everywhere while `null` is a pass.
+  const truncated = bootingHooksInSource(
+    `beforeAll(async () => {
+       const prefix = "unterminated;
+       tempDb = await startEmbeddedPostgresTestDatabase(prefix);
+     }, 60_000);`,
+    "<synthetic-unterminated>",
+  );
+  assert.deepEqual(
+    truncated.map(({ budgetMs }) => String(budgetMs)),
+    [UNKNOWN_BUDGET],
+    "an unterminated string scored as inheriting the config instead of UNKNOWN",
+  );
+
+  // And a block comment that never closes, which the stripper reports the same
+  // way rather than silently blanking the rest of the call.
+  const openBlock = bootingHooksInSource(
+    `beforeAll(async () => {
+       /* never closed
+       tempDb = await startEmbeddedPostgresTestDatabase("probe-");
+     }, 60_000);`,
+    "<synthetic-open-block>",
+  );
+  assert.deepEqual(
+    openBlock.map(({ budgetMs }) => String(budgetMs)),
+    [UNKNOWN_BUDGET],
+    "an unterminated block comment scored as inheriting the config instead of UNKNOWN",
+  );
 });
 
 test("an UNKNOWN budget is a floor violation, and resolving a budget is not a way to launder it", () => {
