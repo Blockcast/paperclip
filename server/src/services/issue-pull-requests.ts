@@ -540,7 +540,7 @@ export async function reconcileMergedPullRequests(
     if (unreadableNodesThisPage > 0) {
       logger.warn(
         { repoFullName: input.repoFullName, page, unreadableNodes: unreadableNodesThisPage },
-        "reconciler: merged-PR search returned pull-request nodes this token could not read",
+        "reconciler: merged-PR search returned pull-request nodes with no readable number",
       );
     }
     if (items.length === 0) {
