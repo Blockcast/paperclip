@@ -1,3 +1,5 @@
+import { performance } from "node:perf_hooks";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -8,9 +10,21 @@ import {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Busy-waits on the SAME monotonic clock the sampler's window uses, which is
+ * what makes `GUARANTEED_LAG_MS` below a floor rather than an aspiration.
+ *
+ * A `Date.now()` busy-wait does not. That clock counts whole milliseconds, so
+ * `const end = Date.now() + ms` resolves against a truncated reading and the
+ * loop exits as soon as the counter has advanced `ms` — a real block of
+ * (ms - 1, ms], NOT >= ms. When the sampler's tick and this test's pre-block
+ * timer fire in the same timers pass the window is about the block, the raw lag
+ * lands in (399, 400], and the module's `Math.round` logs 399 against a floor
+ * of 400 (Ally on PEN-3381, reproduced first-party: see the PR body).
+ */
 function blockEventLoop(ms: number): void {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
     /* deliberate synchronous block */
   }
 }
@@ -25,11 +39,19 @@ const SAMPLE_MS = 50;
  * SAMPLE_MS. Sizing the block as `SAMPLE_MS + THRESHOLD_MS * HEADROOM` puts
  * that floor at `THRESHOLD_MS * HEADROOM` exactly.
  *
- * The headroom is margin against the arithmetic above being wrong, NOT against
- * load — load can only delay the tick further, i.e. it moves this quantity AWAY
- * from the threshold. That is the whole point of the rewrite: every previous
- * budget on this shard failed in the direction contention pushes it, and this
- * one cannot.
+ * The headroom puts that floor at twice the threshold, and that is margin on
+ * the `lines.length > 0` property — a line is emitted only when a detector
+ * crosses THRESHOLD_MS, and the floor clears it twice over. It is NOT margin on
+ * the floor assertion itself, which checks GUARANTEED_LAG_MS exactly and is
+ * meant to: that assertion IS the arithmetic above, so giving it slack would
+ * stop it testing the one claim this file exists to make. The exactness holds
+ * only because `blockEventLoop` busy-waits on the sampler's own clock — see its
+ * note.
+ *
+ * Neither quantity is margin against load. Load can only delay the tick
+ * further, i.e. it moves this quantity AWAY from the threshold. That is the
+ * whole point of the rewrite: every previous budget on this shard failed in the
+ * direction contention pushes it, and this one cannot.
  */
 const LAG_FLOOR_HEADROOM = 2;
 const STALL_BLOCK_MS = SAMPLE_MS + THRESHOLD_MS * LAG_FLOOR_HEADROOM;
