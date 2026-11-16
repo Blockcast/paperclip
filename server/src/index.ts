@@ -112,6 +112,7 @@ import {
   takeHeapSnapshot,
 } from "./services/heap-snapshot.js";
 import {
+  CPU_FLIGHT_RECORDER_PRODUCTION_OPTS,
   CPU_PROFILE_SENTINEL_BASENAME,
   maybeDumpStallFlightRecording,
   startCpuFlightRecorder,
@@ -1452,10 +1453,8 @@ export async function startServer(): Promise<StartedServer> {
     }, 60_000).unref?.();
     // Flight recorder (BLO-51594): a profile started after a stall cannot
     // contain it, so keep one running and dump the segment the stall landed in.
-    // Each rotation blocks the loop for seconds on a worker (Profiler.start
-    // re-logs every compiled function, whatever the sampling interval), so the
-    // segment is long: 2-min segments were a ~2 s stall every 2 min (BLO-57549).
-    startCpuFlightRecorder({ segmentMs: 900_000, samplingIntervalUs: 10_000 }).catch((err) =>
+    // Rotation cost is why the segment is long; see the constant (BLO-57549).
+    startCpuFlightRecorder(CPU_FLIGHT_RECORDER_PRODUCTION_OPTS).catch((err) =>
       logger.error({ err }, "CPU flight recorder failed to start"),
     );
     setEventLoopStallListener((stallMs) => {
