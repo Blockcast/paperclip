@@ -148,7 +148,17 @@ describe("plugin-worker-manager stderr failure context", () => {
         config: {},
         lease: { providerLeaseId: "lease-1" },
         command: "echo",
-        delayMs: 50,
+        // PEN-6776: this asserts the host's own 10ms budget rejects BEFORE the
+        // worker answers, so the margin is `delayMs` minus `rpcTimeoutMs`. At
+        // delayMs:50 that margin was ~40ms across two processes, and a
+        // contended CI shard lost it — failing a whole `General tests` shard
+        // and ejecting paperclip#3832 from the merge queue with 2219/2220
+        // green. 5s is far above any plausible scheduling hiccup and costs no
+        // wall-clock: the test settles as soon as the rejection lands, and
+        // `handle.stop()` tears the worker down with its timer still pending.
+        // Do NOT "harden" this by raising rpcTimeoutMs — that inverts the
+        // assertion, making the timeout fire later and lose more often.
+        delayMs: 5_000,
       } as HostToWorkerMethods["environmentExecute"][0])).rejects.toMatchObject({
         message: expect.stringContaining("timed out after 10ms"),
       });
@@ -181,8 +191,16 @@ describe("plugin-worker-manager stderr failure context", () => {
         config: {},
         lease: { providerLeaseId: "lease-1" },
         command: "echo",
+        // PEN-6776: this test's exposure is the INVERSE of the one above — it
+        // asserts the per-call override DISPLACED the 10ms handle default, so
+        // the worker's reply must arrive before the override expires and the
+        // margin is `override` minus `delayMs`. Raising `delayMs` here would
+        // break it outright (measured: delayMs:5_000 fails
+        // "timed out after 2000ms"). The knob that widens this margin without
+        // weakening the assertion is the OVERRIDE: any value far above the
+        // 10ms default still proves the default did not apply.
         delayMs: 50,
-      } as HostToWorkerMethods["environmentExecute"][0], 2_000)).resolves.toMatchObject({
+      } as HostToWorkerMethods["environmentExecute"][0], 30_000)).resolves.toMatchObject({
         exitCode: 0,
         stdout: "ok\n",
       });
