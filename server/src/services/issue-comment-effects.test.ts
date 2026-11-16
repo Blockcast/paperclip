@@ -44,7 +44,7 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-comment-effects-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(issueCommentEffects);

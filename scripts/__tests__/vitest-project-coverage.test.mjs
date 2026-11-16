@@ -917,6 +917,14 @@ function configuredTestTimeout(projectDir) {
 //     package's ejections as HOOK timeouts (`beforeEach`), already fixed by
 //     its 120s hookTimeout; its bodies construct PGlite (WASM), a different
 //     and cheaper startup than the embedded cluster BLO-17026 timed at ~40s.
+//     PEN-6759 2026-11-16: "already fixed by its 120s hookTimeout" was TRUE of
+//     the bodies this entry is about and FALSE of the package's heaviest
+//     hooks, because five `beforeAll`s passed an explicit `}, 30_000)` that
+//     vitest honours over the config. Three of them crossed it on
+//     `merge_group` run 43815231525 and ejected #3824. The overrides are gone
+//     and the override sweep at the foot of this file now fails on the shape;
+//     this entry stays scoped to the BODY arm, which is what it was written
+//     for.
 //
 // WHAT WOULD SETTLE EITHER: a `Test timed out` in one of these bodies in a
 // merge_group run, or a measurement of copyEmbeddedPostgresTemplate's per-suite
@@ -1112,19 +1120,42 @@ test("the booting-body floor actually discriminates", () => {
 const HOOK_IO =
   /\b(?:execFileSync|execSync|spawnSync|execFile|exec|spawn|mkdtempSync|mkdtemp|rmSync|rm|cpSync|cp|startEmbeddedPostgresTestDatabase)\s*\(|\bnew\s+PGlite\s*\(/;
 
-/** The names of every hook in `code` whose body reaches real I/O. */
-function hooksWithRealIo(code) {
+/**
+ * Every hook in `code` whose body reaches real I/O, with the per-hook timeout
+ * ARGUMENT attached to it (null when it inherits the project config).
+ *
+ * The budget is read here rather than in a second pass because the two
+ * questions share one scan and must not be able to disagree about which hooks
+ * exist: "does this package declare a hook budget at all?" (the sweep below
+ * this one) and "does a hook then undercut the number it declared?" (the
+ * override sweep further down).
+ */
+function realIoHooksInSource(code, label) {
   const hooks = [];
   const openers = /\b(?:beforeAll|afterAll|beforeEach|afterEach)\s*\(/g;
   let match;
   while ((match = openers.exec(code))) {
     const close = matchingParen(code, openers.lastIndex - 1);
     if (close === -1) continue;
-    if (HOOK_IO.test(code.slice(match.index, close + 1))) {
-      hooks.push(match[0].replace(/\s*\($/, ""));
+    const body = code.slice(match.index, close + 1);
+    if (HOOK_IO.test(body)) {
+      // Same shape the booting-body sweep reads: the trailing numeric
+      // argument of the hook call.
+      const budget = /,(\s*)([0-9_]+)(\s*,?\s*)\)$/.exec(body.slice(-40));
+      hooks.push({
+        file: label,
+        line: code.slice(0, match.index).split("\n").length,
+        hook: match[0].replace(/\s*\($/, ""),
+        budgetMs: budget ? Number(budget[2].replace(/_/g, "")) : null,
+      });
     }
   }
   return hooks;
+}
+
+/** The names of every hook in `code` whose body reaches real I/O. */
+function hooksWithRealIo(code) {
+  return realIoHooksInSource(code, "<inline>").map(({ hook }) => hook);
 }
 
 function projectsWithRealIoHooks() {
@@ -1203,5 +1234,153 @@ test("the real-I/O hook detector discriminates", () => {
     hooksWithRealIo(`it("removes the tree", () => { rmSync(dir, { recursive: true }); });`),
     [],
     "I/O in a test body was scored against the hook budget",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The two sweeps above both ask whether a budget was DECLARED. This one asks
+// whether anything then undercut it from one level down.
+//
+// PEN-6759. `paperclip-plugin-alertmanager` declares `hookTimeout: 120_000`,
+// chosen for this pool with a dated rationale in its own config (BLO-37114).
+// Five `beforeAll`s nonetheless passed an explicit `}, 30_000)`, and vitest
+// honours a per-hook argument over the config -- so the hooks that do the most
+// work in that package ran on a QUARTER of the number the package chose, and
+// no surface anywhere read the two together. On `merge_group` run 43815231525
+// (2026-11-16) three of them crossed it: `Hook timed out in 30000ms`, 633
+// tests passed, zero assertions failed, #3824 ejected from the master queue
+// and a human enqueue act discarded.
+//
+// The control is in the same job and costs nothing: the PGlite suites in that
+// package that INHERIT the 120s ran SLOWER and survived -- `attendance-read`
+// measured p50 17.7s / max 47.7s across 15 merge_group jobs. Same runner, same
+// fixture, same contention; the only difference was the override. So this is
+// not a sizing question about one number, it is the defeat-from-below shape
+// the booting-body sweep already names in its own comment ("a guard that reads
+// the config and stops is defeated by an override it never looks at") and that
+// PEN-6181 found in CI job budgets, where a step-level `timeout-minutes`
+// undercut a guard reading only job-level ones. That sweep closed it for test
+// BODIES. Hooks were the arm nobody had looked at.
+//
+// Deliberately NOT a floor. This demands no absolute number and takes no view
+// on what any budget should be; it only requires that a local override not be
+// TIGHTER than what the project declared for the environment it runs in.
+// Raising the config raises every hook with it, which is the behaviour the
+// config exists to have. An override at or above the config still passes --
+// a hook may legitimately say it needs MORE than its neighbours.
+// ---------------------------------------------------------------------------
+
+// Vitest's own default when a project declares none. The sibling sweep above
+// already demands a declared `hookTimeout` from every real-I/O project, so
+// this fallback should be unreachable there; it is here so that an override
+// cannot be scored against `undefined` and silently pass.
+const VITEST_DEFAULT_HOOK_TIMEOUT_MS = 10_000;
+
+function configuredHookTimeout(projectDir) {
+  let source;
+  try {
+    source = readFileSync(path.join(repoRoot, projectDir, "vitest.config.ts"), "utf8");
+  } catch {
+    return null;
+  }
+  // Same comment strip, same reason, as configuredTestTimeout above: these
+  // configs discuss their own budgets in prose at length, and this file's own
+  // config comment now quotes the `}, 30_000)` shape that caused PEN-6759.
+  const code = source.replace(/^\s*\/\/.*$/gm, "");
+  const declared = /\bhookTimeout\s*:\s*([0-9_]+)/.exec(code);
+  return declared ? Number(declared[1].replace(/_/g, "")) : null;
+}
+
+/** Every real-I/O hook whose explicit timeout argument is below its project's config. */
+function hookOverridesUnderConfig() {
+  const offenders = [];
+  for (const projectDir of readConfiguredProjectDirs()) {
+    const configured = configuredHookTimeout(projectDir) ?? VITEST_DEFAULT_HOOK_TIMEOUT_MS;
+    for (const file of testFilesUnder(path.join(repoRoot, projectDir))) {
+      const code = readFileSync(file, "utf8");
+      if (!HOOK_IO.test(code)) continue;
+      for (const found of realIoHooksInSource(code, path.relative(repoRoot, file))) {
+        if (found.budgetMs === null || found.budgetMs >= configured) continue;
+        offenders.push({ ...found, projectDir, configured });
+      }
+    }
+  }
+  return offenders;
+}
+
+test("no hook doing real I/O overrides its project's hookTimeout downward", () => {
+  const offenders = hookOverridesUnderConfig();
+
+  assert.deepEqual(
+    offenders.map(({ file, line, hook, budgetMs, configured }) => `${file}:${line} ${hook} ${budgetMs}ms < ${configured}ms`),
+    [],
+    `These hooks do real I/O and pass an explicit timeout argument SMALLER than the ` +
+      `hookTimeout their own project declared, which vitest honours over the config. The ` +
+      `package's budget was chosen for the contended ARC pool; an override below it puts the ` +
+      `hook back on a number nobody chose for that environment, and on merge_group a hook ` +
+      `timeout ejects the candidate and costs a full re-traverse of the queue (PEN-6759, ` +
+      `#3824). Drop the argument so the project's hookTimeout carries the hook, or raise the ` +
+      `project's config if the whole package needs more:\n` +
+      offenders
+        .map(({ file, line, hook, budgetMs, configured, projectDir }) => `  - ${file}:${line} ${hook}(..., ${budgetMs}) under ${projectDir}'s ${configured}ms`)
+        .join("\n"),
+  );
+});
+
+test("the hook-override sweep discriminates", () => {
+  // A sweep that cannot be shown to REJECT is not a sweep, and this one's
+  // offender list is empty by design once the fix lands -- which is exactly
+  // the state an inert detector also reports.
+  const tighter = realIoHooksInSource(
+    `beforeAll(async () => {
+       db = new PGlite();
+       await applyMigrations(db);
+     }, 30_000);`,
+    "<synthetic-tighter>",
+  );
+  assert.equal(tighter.length, 1, "the detector missed a booting beforeAll");
+  assert.equal(tighter[0].budgetMs, 30_000, "the explicit hook argument was not read");
+  assert.ok(tighter[0].budgetMs < 120_000, "the 30s override that ejected #3824 no longer reads as tighter");
+
+  // Must-accept the exact shape PEN-6759 removed, including its line.
+  assert.equal(tighter[0].hook, "beforeAll");
+
+  // Must-reject 1: no argument at all is the fixed state, not an offence.
+  const inherited = realIoHooksInSource(
+    `beforeAll(async () => { db = new PGlite(); });`,
+    "<synthetic-inherited>",
+  );
+  assert.equal(inherited.length, 1);
+  assert.equal(inherited[0].budgetMs, null, "an inheriting hook was read as carrying an override");
+
+  // Must-reject 2: an override ABOVE the config is a hook asking for more than
+  // its neighbours, which this guard deliberately permits.
+  const looser = realIoHooksInSource(
+    `afterAll(async () => { await rm(tmp, { recursive: true }); }, 240_000);`,
+    "<synthetic-looser>",
+  );
+  assert.equal(looser[0].budgetMs, 240_000);
+  assert.ok(looser[0].budgetMs > 120_000, "a deliberately-raised hook budget would be flagged");
+
+  // Must-reject 3: an in-memory hook carrying a tight argument is not this
+  // guard's business -- widening to it would put every package on the list.
+  const inMemory = realIoHooksInSource(
+    `beforeEach(() => { vi.restoreAllMocks(); }, 1_000);`,
+    "<synthetic-in-memory>",
+  );
+  assert.deepEqual(inMemory, [], "an in-memory hook was scored against the real-I/O override rule");
+});
+
+test("configuredHookTimeout reads the number, not the prose", () => {
+  // The alertmanager config is the worked example and the regression anchor:
+  // its comment block now QUOTES `}, 30_000)` and names 10s, 30s and 120s in
+  // prose, so a reader that does not strip comments can pick the wrong one --
+  // and picking a SMALLER one makes the sweep above pass on a real override.
+  const dir = "packages/plugins/paperclip-plugin-alertmanager";
+  assert.equal(
+    configuredHookTimeout(dir),
+    120_000,
+    `expected ${dir} to read 120000ms. If that package's config changed, re-point this control ` +
+      `at another config whose comments name several budgets -- do not simply delete it.`,
   );
 });
