@@ -118,6 +118,9 @@ function checkServerRuntimeAssets() {
   );
 }
 
+// PEN-6723: this is the ONLY path that runs the runtime-asset guard. The root
+// `build` script invokes it after `pnpm -r build`; see the note at the foot of
+// this file for why it no longer runs on the default path.
 if (args.has("--runtime-assets-only")) {
   checkServerRuntimeAssets();
   process.exit(0);
@@ -183,4 +186,21 @@ if (buildGapPackages.length > 0) {
   }
 }
 
-checkServerRuntimeAssets();
+// PEN-6723: the runtime-asset guard deliberately does NOT run here any more.
+// It is a presence check over server/dist, so it needs the server built -- and
+// the only reason `typecheck:build-gaps` built the server at all was to satisfy
+// it. That `pnpm --filter @paperclipai/server build` was a full tsc emit costing
+// 253s, 16.8% of the capped `Typecheck + Release Registry` job, to assert that
+// four `cp -R` commands in server's own build script had run. Nothing else in
+// that lane reads server/dist: the loop filters server out (its build contains
+// tsc), and every later step there is `tsc --noEmit` or `node --test` over
+// scripts/.
+//
+// The guard now runs from the root `build` script instead, via
+// `--runtime-assets-only`, which is where `pnpm -r build` has just produced the
+// dist it inspects. That is strictly STRONGER, not merely cheaper: here it
+// checked a dist built by an invocation that existed only to feed it, where in
+// `build` it checks the dist the real build emits. pr.yml's Build lane runs
+// `pnpm build` under the identical path selector as this lane
+// (`release_dry_run_needed`), so the two run and skip together and no diff that
+// can reach the server build escapes the check.
