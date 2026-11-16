@@ -18,7 +18,18 @@ import {
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-const EMBEDDED_TEST_TIMEOUT_MS = 60_000;
+// These bodies BOOT embedded Postgres, so the ~40 s ARC-contended startup
+// (BLO-17026) lands inside the per-test budget. They deliberately pass NO
+// timeout argument: this package raised `testTimeout` 60 s -> 120 s for
+// exactly this shape (PEN-6254, after a 60 s body evicted #3530), and an
+// explicit argument CAPS that config rather than raising it.
+//
+// `const EMBEDDED_TEST_TIMEOUT_MS = 60_000` used to sit here and was passed
+// as the trailing argument of each body below, putting them back on the very
+// budget that caused the eviction. No sweep could see it: every floor check in
+// scripts/__tests__/vitest-project-coverage.test.mjs read the budget with a
+// numeric-literal regex and scored a named constant as "inherits the config"
+// -- a pass (PEN-6772). Do not reintroduce an argument here.
 
 async function createTempDatabase(): Promise<string> {
   const db = await startEmbeddedPostgresTestDatabase("paperclip-pool-timeout-");
@@ -177,7 +188,6 @@ describeEmbeddedPostgres("createDb pool timeout bounds (PEN-3365)", () => {
         POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
       );
     },
-    EMBEDDED_TEST_TIMEOUT_MS,
   );
 
   it(
@@ -192,7 +202,6 @@ describeEmbeddedPostgres("createDb pool timeout bounds (PEN-3365)", () => {
       // and call it an improvement. If someone adds one, this fails.
       await expect(readPoolSettingMs(url, "statement_timeout")).resolves.toBe(30_000);
     },
-    EMBEDDED_TEST_TIMEOUT_MS,
   );
 
   it(
@@ -228,7 +237,6 @@ describeEmbeddedPostgres("createDb pool timeout bounds (PEN-3365)", () => {
         POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
       );
     },
-    EMBEDDED_TEST_TIMEOUT_MS,
   );
 
   it(
@@ -246,6 +254,5 @@ describeEmbeddedPostgres("createDb pool timeout bounds (PEN-3365)", () => {
       expect(inherited.statementTimeout.source).toBe("default");
       expect(formatInheritedTimeoutSettings(inherited)).toContain("statement_timeout=disabled");
     },
-    EMBEDDED_TEST_TIMEOUT_MS,
   );
 });

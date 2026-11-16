@@ -807,6 +807,162 @@ function matchingParen(code, openIndex) {
   return -1;
 }
 
+// ---------------------------------------------------------------------------
+// Reading a hook's / a test's timeout ARGUMENT.
+//
+// THREE outcomes, and the third one is the whole point. `budgetArgument`
+// returns a NUMBER for a budget it could evaluate, `null` when the call passes
+// no budget at all (so it genuinely inherits the project config), and
+// UNKNOWN_BUDGET when a budget IS passed in a spelling this scanner cannot
+// evaluate.
+//
+// Collapsing that third case into `null` is what made all three floor sweeps
+// below fail OPEN: `null` is scored as "inherits the project's 120s", i.e. a
+// PASS, so the exact cap these guards exist to catch -- spelled
+// `}, HOOK_TIMEOUT_MS)` or `}, { timeout: 30_000 })` rather than `}, 30_000)`
+// -- walked straight through every one of them. The first draft read the
+// budget with `/,(\s*)([0-9_]+)(\s*,?\s*)\)$/` over the last 40 characters of
+// the call, which matches a numeric literal and nothing else (PEN-6772).
+//
+// UNKNOWN_BUDGET is a floor violation everywhere below. A budget the guard
+// cannot read is not a budget the guard has cleared.
+const UNKNOWN_BUDGET = "unknown";
+
+/** How a budget reads in an offender message. */
+function budgetLabel(budgetMs) {
+  if (budgetMs === UNKNOWN_BUDGET) return "an unreadable budget";
+  if (budgetMs === null) return "no budget";
+  return `${budgetMs}ms`;
+}
+
+// Split a call's argument list -- the text BETWEEN its parens -- on top-level
+// commas. Brackets and string/template literals are tracked, so a comma inside
+// a test title or an options object does not split an argument. Comments are
+// not, which is the same bound `matchingParen` above carries.
+function splitTopLevelArgs(args) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  let quote = null;
+  for (let index = 0; index < args.length; index += 1) {
+    const char = args[index];
+    if (quote) {
+      if (char === "\\") index += 1;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") quote = char;
+    else if (char === "(" || char === "[" || char === "{") depth += 1;
+    else if (char === ")" || char === "]" || char === "}") depth -= 1;
+    else if (char === "," && depth === 0) {
+      parts.push(args.slice(start, index));
+      start = index + 1;
+    }
+  }
+  parts.push(args.slice(start));
+  return parts;
+}
+
+// Is this argument the hook/test CALLBACK rather than a budget? Anchored on
+// purpose: a nested arrow (`computeTimeout(() => 1)`) is not a callback, and
+// anything this cannot classify falls through to the unevaluable arm, which
+// fails closed.
+function isCallbackArgument(text) {
+  if (/^(?:async\s+)?function\b/.test(text)) return true;
+  if (!/=>/.test(text)) return false;
+  return /^(?:async\s*)?(?:\([^)]*\)|[A-Za-z0-9_$]+)\s*=>/.test(text);
+}
+
+// A budget expression this scanner is willing to evaluate: a sum of products of
+// numeric literals and file-local numeric constants. Deliberately narrow --
+// anything else returns null and is then reported as UNKNOWN_BUDGET rather than
+// guessed at. `+` and `*` are enough for every budget spelled in this repo
+// (`SERVER_STARTUP_TIMEOUT_MS + 60_000`, `TEMP_DIR_CLEANUP_BULK_CEILING_MS * 24`)
+// and both are associative, so no precedence handling is needed.
+function resolveBudgetExpression(expression, constants) {
+  let total = 0;
+  for (const term of expression.split("+")) {
+    let product = 1;
+    for (const factor of term.split("*")) {
+      const text = factor.trim();
+      if (/^[0-9][0-9_]*$/.test(text)) {
+        product *= Number(text.replace(/_/g, ""));
+        continue;
+      }
+      if (constants.has(text)) {
+        product *= constants.get(text);
+        continue;
+      }
+      return null;
+    }
+    total += product;
+  }
+  return total;
+}
+
+// File-local `const NAME = <number>` declarations, so a budget spelled as a
+// named constant is RESOLVED rather than merely rejected. Without this the
+// fail-closed arm would red the one legitimate non-literal budget in the repo
+// -- `cli/src/__tests__/company-import-export-e2e.test.ts`, which boots a
+// server on `SERVER_STARTUP_TIMEOUT_MS + 60_000` = 360s, far above the floor --
+// i.e. it would trade a fail-open for a false alarm. Two passes so a constant
+// defined in terms of an earlier one resolves.
+function numericConstantsInSource(code) {
+  const constants = new Map();
+  for (let pass = 0; pass < 2; pass += 1) {
+    const declarations = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*number\s*)?=\s*([^;\n]+)/g;
+    let match;
+    while ((match = declarations.exec(code))) {
+      if (constants.has(match[1])) continue;
+      const value = resolveBudgetExpression(match[2].replace(/;\s*$/, "").trim(), constants);
+      if (value !== null) constants.set(match[1], value);
+    }
+  }
+  return constants;
+}
+
+/**
+ * Does one budget clear an absolute floor? Shared by both floor sweeps so the
+ * two cannot drift apart on the UNKNOWN arm, and so that arm is reachable by a
+ * test without going through the filesystem.
+ */
+function floorVerdict(budgetMs, { configuredMs, floorMs, overrideSource }) {
+  if (budgetMs === UNKNOWN_BUDGET) {
+    return { offends: true, effectiveMs: UNKNOWN_BUDGET, source: "unreadable" };
+  }
+  const effectiveMs = budgetMs ?? configuredMs;
+  return {
+    offends: effectiveMs < floorMs,
+    effectiveMs,
+    source: budgetMs === null ? "config" : overrideSource,
+  };
+}
+
+/**
+ * Does an explicit argument undercut the project's own config? `null` is no
+ * argument at all, which inherits and is the fixed state. UNKNOWN cannot be
+ * SHOWN to clear the config, so it is reported -- the same fail-closed rule.
+ */
+function overrideUndercutsConfig(budgetMs, configuredMs) {
+  if (budgetMs === null) return false;
+  if (budgetMs === UNKNOWN_BUDGET) return true;
+  return budgetMs < configuredMs;
+}
+
+/**
+ * The timeout argument of the call whose parens are `code[openIndex]` and
+ * `code[closeIndex]`. See UNKNOWN_BUDGET above for the three outcomes.
+ */
+function budgetArgument(code, openIndex, closeIndex, constants) {
+  const args = splitTopLevelArgs(code.slice(openIndex + 1, closeIndex)).map((arg) => arg.trim());
+  while (args.length > 0 && args[args.length - 1] === "") args.pop();
+  if (args.length < 2) return null;
+  const last = args[args.length - 1];
+  if (isCallbackArgument(last)) return null;
+  const resolved = resolveBudgetExpression(last, constants);
+  return resolved === null ? UNKNOWN_BUDGET : resolved;
+}
+
 // File-local helpers whose own source reaches a boot. The suite that evicted
 // #3530 calls `startDatabase(...)` -- a four-line wrapper -- not the helper
 // directly, so a detector that only matches the direct call MISSES the exact
@@ -856,22 +1012,22 @@ function bootingTestBodiesInSource(code, label) {
   const reachesBoot = (body) =>
     BOOTS_EMBEDDED_POSTGRES.test(body) || [...helpers].some((name) => callsHelper(body, name));
 
+  const constants = numericConstantsInSource(code);
   const bodies = [];
   const openers =
     /\b(?:it|test)(?:\.each\([\s\S]*?\))?(?:\.(?:only|skip|concurrent|sequential))?\s*\(/g;
   let match;
   while ((match = openers.exec(code))) {
-    const close = matchingParen(code, openers.lastIndex - 1);
+    const open = openers.lastIndex - 1;
+    const close = matchingParen(code, open);
     if (close === -1) continue;
     const body = code.slice(match.index, close + 1);
     if (reachesBoot(body)) {
-      // The budget is the trailing numeric argument of the call.
-      const budget = /,(\s*)([0-9_]+)(\s*,?\s*)\)$/.exec(body.slice(-40));
       const title = /["'`](.+?)["'`]/.exec(body.slice(0, 300));
       bodies.push({
         file: label,
         line: code.slice(0, match.index).split("\n").length,
-        budgetMs: budget ? Number(budget[2].replace(/_/g, "")) : null,
+        budgetMs: budgetArgument(code, open, close, constants),
         title: title ? title[1] : "(untitled)",
       });
     }
@@ -960,10 +1116,16 @@ function underBudgetedBootingBodies({ includeExcepted = false } = {}) {
     const excepted = BOOTING_BODY_CONFIG_FLOOR_EXCEPTIONS.has(projectDir);
     for (const file of testFilesUnder(path.join(repoRoot, projectDir))) {
       for (const body of bootingTestBodies(file)) {
-        const effectiveMs = body.budgetMs ?? configured;
-        if (effectiveMs >= EMBEDDED_POSTGRES_BODY_FLOOR_MS) continue;
-        const source = body.budgetMs === null ? "config" : "per-test";
-        // The exception covers the inherited arm only.
+        // `unreadable` fails closed here: a budget this sweep cannot evaluate
+        // is not a budget it has cleared, and scoring it as "inherits the
+        // config" is the hole PEN-6772 found.
+        const { offends, effectiveMs, source } = floorVerdict(body.budgetMs, {
+          configuredMs: configured,
+          floorMs: EMBEDDED_POSTGRES_BODY_FLOOR_MS,
+          overrideSource: "per-test",
+        });
+        if (!offends) continue;
+        // The exception covers the inherited arm only -- never `unreadable`.
         if (!includeExcepted && excepted && source === "config") continue;
         offenders.push({ ...body, projectDir, effectiveMs, source });
       }
@@ -976,7 +1138,7 @@ test("every test body that boots embedded Postgres budgets above the ARC startup
   const offenders = underBudgetedBootingBodies();
 
   assert.deepEqual(
-    offenders.map(({ file, line, effectiveMs, source }) => `${file}:${line} ${effectiveMs}ms (${source})`),
+    offenders.map(({ file, line, effectiveMs, source }) => `${file}:${line} ${budgetLabel(effectiveMs)} (${source})`),
     [],
     `These test bodies START an embedded Postgres inside a budget smaller than ` +
       `${EMBEDDED_POSTGRES_BODY_FLOOR_MS}ms, and BLO-17026 measured that startup at ~40s on the ` +
@@ -984,9 +1146,13 @@ test("every test body that boots embedded Postgres budgets above the ARC startup
       `busy, and on merge_group that ejects the candidate and costs a full re-traverse of the ` +
       `queue (PEN-6254, #3530).\n` +
       `Raise the per-test budget, or move the boot into a hook so the project's hookTimeout ` +
-      `carries it (server/vitest.config.ts is the worked example of the second):\n` +
+      `carries it (server/vitest.config.ts is the worked example of the second).\n` +
+      `A body listed as "unreadable" passes a budget this sweep cannot evaluate -- a named ` +
+      `constant it cannot resolve, an expression other than a sum, or an options object. Spell ` +
+      `it as a numeric literal, or as a sum of file-local numeric constants, so the floor can ` +
+      `be checked at all (PEN-6772):\n` +
       offenders
-        .map(({ file, line, title, effectiveMs, source }) => `  - ${file}:${line} ${effectiveMs}ms from ${source} -- ${title}`)
+        .map(({ file, line, title, effectiveMs, source }) => `  - ${file}:${line} ${budgetLabel(effectiveMs)} from ${source} -- ${title}`)
         .join("\n"),
   );
 });
@@ -1032,7 +1198,11 @@ test("the booting-body detector sees through a file-local wrapper", () => {
       `body that reaches its boot through a helper -- do not simply delete it.`,
   );
   assert.ok(
-    bodies.every(({ budgetMs }) => budgetMs === null || budgetMs >= EMBEDDED_POSTGRES_BODY_FLOOR_MS),
+    bodies.every(
+      ({ budgetMs }) =>
+        budgetMs === null ||
+        (budgetMs !== UNKNOWN_BUDGET && budgetMs >= EMBEDDED_POSTGRES_BODY_FLOOR_MS),
+    ),
     `the control suite itself is under-budgeted: ${JSON.stringify(bodies)}`,
   );
 });
@@ -1143,22 +1313,23 @@ const HOOK_IO =
  * override sweep further down).
  */
 function realIoHooksInSource(code, label) {
+  const constants = numericConstantsInSource(code);
   const hooks = [];
   const openers = /\b(?:beforeAll|afterAll|beforeEach|afterEach)\s*\(/g;
   let match;
   while ((match = openers.exec(code))) {
-    const close = matchingParen(code, openers.lastIndex - 1);
+    const open = openers.lastIndex - 1;
+    const close = matchingParen(code, open);
     if (close === -1) continue;
     const body = code.slice(match.index, close + 1);
     if (HOOK_IO.test(body)) {
-      // Same shape the booting-body sweep reads: the trailing numeric
-      // argument of the hook call.
-      const budget = /,(\s*)([0-9_]+)(\s*,?\s*)\)$/.exec(body.slice(-40));
+      // Same reader the other two sweeps use, so the three cannot disagree
+      // about what a given spelling means.
       hooks.push({
         file: label,
         line: code.slice(0, match.index).split("\n").length,
         hook: match[0].replace(/\s*\($/, ""),
-        budgetMs: budget ? Number(budget[2].replace(/_/g, "")) : null,
+        budgetMs: budgetArgument(code, open, close, constants),
       });
     }
   }
@@ -1312,7 +1483,7 @@ function hookOverridesUnderConfig() {
       const code = readFileSync(file, "utf8");
       if (!HOOK_IO.test(code)) continue;
       for (const found of realIoHooksInSource(code, path.relative(repoRoot, file))) {
-        if (found.budgetMs === null || found.budgetMs >= configured) continue;
+        if (!overrideUndercutsConfig(found.budgetMs, configured)) continue;
         offenders.push({ ...found, projectDir, configured });
       }
     }
@@ -1324,7 +1495,10 @@ test("no hook doing real I/O overrides its project's hookTimeout downward", () =
   const offenders = hookOverridesUnderConfig();
 
   assert.deepEqual(
-    offenders.map(({ file, line, hook, budgetMs, configured }) => `${file}:${line} ${hook} ${budgetMs}ms < ${configured}ms`),
+    offenders.map(
+      ({ file, line, hook, budgetMs, configured }) =>
+        `${file}:${line} ${hook} ${budgetLabel(budgetMs)} < ${configured}ms`,
+    ),
     [],
     `These hooks do real I/O and pass an explicit timeout argument SMALLER than the ` +
       `hookTimeout their own project declared, which vitest honours over the config. The ` +
@@ -1332,9 +1506,12 @@ test("no hook doing real I/O overrides its project's hookTimeout downward", () =
       `hook back on a number nobody chose for that environment, and on merge_group a hook ` +
       `timeout ejects the candidate and costs a full re-traverse of the queue (PEN-6759, ` +
       `#3824). Drop the argument so the project's hookTimeout carries the hook, or raise the ` +
-      `project's config if the whole package needs more:\n` +
+      `project's config if the whole package needs more.\n` +
+      `A hook listed with "an unreadable budget" passes an argument this sweep cannot evaluate, ` +
+      `so it cannot be shown to sit above the config -- drop it, or spell it as a numeric ` +
+      `literal or a sum of file-local numeric constants (PEN-6772):\n` +
       offenders
-        .map(({ file, line, hook, budgetMs, configured, projectDir }) => `  - ${file}:${line} ${hook}(..., ${budgetMs}) under ${projectDir}'s ${configured}ms`)
+        .map(({ file, line, hook, budgetMs, configured, projectDir }) => `  - ${file}:${line} ${hook}(..., ${budgetLabel(budgetMs)}) under ${projectDir}'s ${configured}ms`)
         .join("\n"),
   );
 });
@@ -1502,21 +1679,22 @@ function bootingHooksInSource(code, label) {
   const reachesBoot = (body) =>
     BOOTS_EMBEDDED_POSTGRES.test(body) || [...helpers].some((name) => callsHelper(body, name));
 
+  const constants = numericConstantsInSource(code);
   const hooks = [];
   const openers = /\b(?:beforeAll|afterAll|beforeEach|afterEach)\s*\(/g;
   let match;
   while ((match = openers.exec(code))) {
-    const close = matchingParen(code, openers.lastIndex - 1);
+    const open = openers.lastIndex - 1;
+    const close = matchingParen(code, open);
     if (close === -1) continue;
     const body = code.slice(match.index, close + 1);
     openers.lastIndex = close + 1;
     if (!reachesBoot(body)) continue;
-    const budget = /,(\s*)([0-9_]+)(\s*,?\s*)\)$/.exec(body.slice(-40));
     hooks.push({
       file: label,
       line: code.slice(0, match.index).split("\n").length,
       hook: match[0].replace(/\s*\($/, ""),
-      budgetMs: budget ? Number(budget[2].replace(/_/g, "")) : null,
+      budgetMs: budgetArgument(code, open, close, constants),
     });
   }
   return hooks;
@@ -1543,14 +1721,15 @@ function underBudgetedBootingHooks() {
     const configured = configuredHookTimeout(projectDir) ?? 10_000;
     for (const file of testFilesUnder(path.join(repoRoot, projectDir))) {
       for (const hook of bootingHooks(file)) {
-        const effectiveMs = hook.budgetMs ?? configured;
-        if (effectiveMs >= EMBEDDED_POSTGRES_HOOK_FLOOR_MS) continue;
-        offenders.push({
-          ...hook,
-          projectDir,
-          effectiveMs,
-          source: hook.budgetMs === null ? "config" : "per-hook",
+        // Same shared verdict as the body sweep, so the two cannot drift apart
+        // on the `unreadable` arm (PEN-6772).
+        const { offends, effectiveMs, source } = floorVerdict(hook.budgetMs, {
+          configuredMs: configured,
+          floorMs: EMBEDDED_POSTGRES_HOOK_FLOOR_MS,
+          overrideSource: "per-hook",
         });
+        if (!offends) continue;
+        offenders.push({ ...hook, projectDir, effectiveMs, source });
       }
     }
   }
@@ -1561,7 +1740,7 @@ test("every hook that boots embedded Postgres budgets above the ARC startup cost
   const offenders = underBudgetedBootingHooks();
 
   assert.deepEqual(
-    offenders.map(({ file, line, hook, effectiveMs, source }) => `${file}:${line} ${hook} ${effectiveMs}ms (${source})`),
+    offenders.map(({ file, line, hook, effectiveMs, source }) => `${file}:${line} ${hook} ${budgetLabel(effectiveMs)} (${source})`),
     [],
     `These HOOKS start an embedded Postgres inside a budget smaller than ` +
       `${EMBEDDED_POSTGRES_HOOK_FLOOR_MS}ms, and BLO-17026 measured that startup at ~40s on the ` +
@@ -1571,9 +1750,13 @@ test("every hook that boots embedded Postgres budgets above the ARC startup cost
       `A per-hook timeout ARGUMENT CAPS the project's hookTimeout rather than raising it, so a ` +
       `package can declare 120s, pass every other sweep in this file, and still boot on 30s. ` +
       `DROP the inline argument so the project's hookTimeout carries the boot -- do not raise the ` +
-      `argument to match, which leaves the same cap one number later:\n` +
+      `argument to match, which leaves the same cap one number later.\n` +
+      `A hook listed as "unreadable" passes a budget this sweep cannot evaluate -- a named ` +
+      `constant it cannot resolve, an expression other than a sum, or an options object -- so ` +
+      `the floor cannot be checked at all. Drop it, or spell it as a numeric literal or a sum ` +
+      `of file-local numeric constants (PEN-6772):\n` +
       offenders
-        .map(({ file, line, hook, effectiveMs, source }) => `  - ${file}:${line} ${hook} ${effectiveMs}ms from ${source}`)
+        .map(({ file, line, hook, effectiveMs, source }) => `  - ${file}:${line} ${hook} ${budgetLabel(effectiveMs)} from ${source}`)
         .join("\n"),
   );
 });
@@ -1664,5 +1847,191 @@ test("the booting-hook detector discriminates", () => {
     ),
     [],
     "a boot in a test body was scored against the hook budget",
+  );
+});
+
+test("a non-literal budget is reported as UNKNOWN by all three detectors, not as inheriting", () => {
+  // THE load-bearing control for PEN-6772, and the reason it is written as a
+  // MUST-REPORT rather than a must-reject: a guard exercised only against
+  // inputs it has to reject can be vacuous and still green. The three sweeps
+  // in this file each resolved the project config and then read the per-call
+  // override with a numeric-literal regex, so every other spelling scored
+  // `null` = "inherits the project's 120s" = PASS. That is the exact cap these
+  // guards exist to catch, walking through all three of them.
+  //
+  // Each spelling is asserted against ALL THREE detectors, because the defect
+  // was copied into all three and fixing one carrier silently leaves the rest.
+  const spellings = [
+    ["a named constant", "HOOK_TIMEOUT_MS"],
+    ["an expression", "SOME_BASE_MS - 1_000"],
+    ["an options object", "{ timeout: 30_000 }"],
+  ];
+
+  for (const [description, budget] of spellings) {
+    const hook = bootingHooksInSource(
+      `beforeAll(async () => {
+         tempDb = await startEmbeddedPostgresTestDatabase("probe-");
+       }, ${budget});`,
+      "<synthetic-booting-hook>",
+    );
+    assert.deepEqual(
+      hook.map(({ hook: name, budgetMs }) => `${name}:${budgetMs}`),
+      [`beforeAll:${UNKNOWN_BUDGET}`],
+      `booting-hook detector scored ${description} as something other than UNKNOWN`,
+    );
+
+    const realIo = realIoHooksInSource(
+      `beforeAll(async () => { db = new PGlite(); }, ${budget});`,
+      "<synthetic-real-io-hook>",
+    );
+    assert.deepEqual(
+      realIo.map(({ hook: name, budgetMs }) => `${name}:${budgetMs}`),
+      [`beforeAll:${UNKNOWN_BUDGET}`],
+      `real-I/O hook detector scored ${description} as something other than UNKNOWN`,
+    );
+
+    const body = bootingTestBodiesInSource(
+      `it("boots", async () => {
+         const database = await startEmbeddedPostgresTestDatabase("probe-");
+         expect(database).toBeTruthy();
+       }, ${budget});`,
+      "<synthetic-booting-body>",
+    );
+    assert.deepEqual(
+      body.map(({ budgetMs }) => String(budgetMs)),
+      [UNKNOWN_BUDGET],
+      `booting-body detector scored ${description} as something other than UNKNOWN`,
+    );
+  }
+});
+
+test("an UNKNOWN budget is a floor violation, and resolving a budget is not a way to launder it", () => {
+  // The companion half: reporting UNKNOWN buys nothing unless the sweeps ACT
+  // on it. These are the predicates the three sweeps actually apply -- pulled
+  // out so the fail-closed arm is reachable without the filesystem -- so an
+  // edit that re-collapses UNKNOWN into the inherit arm fails right here.
+  const floorArgs = {
+    configuredMs: 120_000,
+    floorMs: EMBEDDED_POSTGRES_HOOK_FLOOR_MS,
+    overrideSource: "per-hook",
+  };
+
+  // MUST-REPORT: unreadable offends, and is labelled so the author is told why.
+  const unreadable = floorVerdict(UNKNOWN_BUDGET, floorArgs);
+  assert.equal(unreadable.offends, true, "an unreadable budget cleared the floor");
+  assert.equal(unreadable.source, "unreadable");
+  assert.equal(
+    overrideUndercutsConfig(UNKNOWN_BUDGET, 120_000),
+    true,
+    "an unreadable override was treated as clearing its project config",
+  );
+
+  // MUST-ACCEPT, and this is what stops the rule above from being vacuous: a
+  // sweep that reported everything would pass the assertions above and fail
+  // these. No argument inherits; a readable argument at or above the floor is
+  // fine; an argument above the config is a hook asking for MORE, which is
+  // deliberately permitted.
+  assert.equal(floorVerdict(null, floorArgs).offends, false, "an inheriting hook was reported");
+  assert.equal(floorVerdict(null, floorArgs).source, "config");
+  assert.equal(floorVerdict(240_000, floorArgs).offends, false, "a raised budget was reported");
+  assert.equal(
+    overrideUndercutsConfig(null, 120_000),
+    false,
+    "a hook with no argument was scored as an override",
+  );
+  assert.equal(
+    overrideUndercutsConfig(240_000, 120_000),
+    false,
+    "a deliberately-raised override was reported as undercutting the config",
+  );
+
+  // MUST-REPORT: a readable argument below the floor is still an offence, and
+  // is labelled as an override rather than as inherited.
+  const capped = floorVerdict(30_000, floorArgs);
+  assert.equal(capped.offends, true, "a 30s booting-hook budget cleared the floor");
+  assert.equal(capped.source, "per-hook");
+  assert.equal(overrideUndercutsConfig(30_000, 120_000), true);
+
+  // MUST-REPORT: an inherited config BELOW the floor is an offence too -- the
+  // arm the exception table covers, and the one `unreadable` must never reach.
+  assert.equal(floorVerdict(null, { ...floorArgs, configuredMs: 60_000 }).offends, true);
+
+  // Resolving a spelling must not become a way to LAUNDER it: a named constant
+  // hiding a sub-floor number reads as that number, not as "inherits".
+  const resolvedButTight = bootingHooksInSource(
+    `const TIGHT_MS = 30_000;
+     beforeAll(async () => {
+       tempDb = await startEmbeddedPostgresTestDatabase("probe-");
+     }, TIGHT_MS);`,
+    "<synthetic-resolved-tight>",
+  );
+  assert.equal(resolvedButTight[0].budgetMs, 30_000, "a named constant was not resolved to its value");
+  assert.equal(floorVerdict(resolvedButTight[0].budgetMs, floorArgs).offends, true);
+
+  // And the arm that keeps fail-closed from becoming a false-alarm generator:
+  // the two legitimate non-literal budgets in this repo both resolve.
+  const sum = realIoHooksInSource(
+    `const BASE_MS = 300_000;
+     beforeAll(async () => { db = new PGlite(); }, BASE_MS + 60_000);`,
+    "<synthetic-resolvable-sum>",
+  );
+  assert.equal(sum[0].budgetMs, 360_000, "a sum of file-local constants was not resolved");
+
+  const product = realIoHooksInSource(
+    `const STEP_MS = 10_000;
+     const BUDGET_MS = STEP_MS * 24;
+     beforeAll(async () => { db = new PGlite(); }, BUDGET_MS);`,
+    "<synthetic-resolvable-product>",
+  );
+  assert.equal(product[0].budgetMs, 240_000, "a product of file-local constants was not resolved");
+});
+
+test("the budget reader tells a callback apart from a budget", () => {
+  // The three outcomes have to be distinguishable on the shapes that actually
+  // occur, or the fail-closed arm above becomes a false alarm generator: a
+  // hook whose ONLY argument is its callback must read `null` (inherits), not
+  // UNKNOWN. A test title containing a comma or a bracket must not split the
+  // argument list and strand the budget either.
+  const inherits = realIoHooksInSource(
+    `beforeAll(async () => { db = new PGlite(); });`,
+    "<synthetic-inherits>",
+  );
+  assert.equal(inherits[0].budgetMs, null, "a hook passing only a callback was read as carrying a budget");
+
+  const namedCallback = realIoHooksInSource(
+    `beforeAll(setUpDatabase);
+     function setUpDatabase() { db = new PGlite(); }`,
+    "<synthetic-named-callback>",
+  );
+  assert.equal(namedCallback.length, 0, "a hook whose body is elsewhere was scored on its own text");
+
+  const awkwardTitle = bootingTestBodiesInSource(
+    `it("boots, then {opens} a (handle)", async () => {
+       const database = await startEmbeddedPostgresTestDatabase("probe-");
+       expect(database).toBeTruthy();
+     }, 60_000);`,
+    "<synthetic-awkward-title>",
+  );
+  assert.equal(
+    awkwardTitle[0].budgetMs,
+    60_000,
+    "a comma or bracket inside a test title stranded the budget argument",
+  );
+
+  const trailingComma = bootingTestBodiesInSource(
+    `it(
+       "boots",
+       async () => {
+         const database = await startEmbeddedPostgresTestDatabase("probe-");
+         expect(database).toBeTruthy();
+       },
+       60_000,
+     );`,
+    "<synthetic-trailing-comma>",
+  );
+  assert.equal(
+    trailingComma[0].budgetMs,
+    60_000,
+    "a multi-line call with a trailing comma stranded the budget argument",
   );
 });
