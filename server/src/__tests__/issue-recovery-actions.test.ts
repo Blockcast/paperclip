@@ -13038,8 +13038,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     // The must-pass arm of the same change, and the reason the PEN-6735 conjunct sits
-    // INSIDE the `completed` arm rather than beside it. `advanced` is reachable only from
-    // `if (concreteEvidence)`, so the state is already the evidence; and the recency
+    // INSIDE the `completed` arm rather than beside it. `advanced` is reachable from
+    // `if (concreteEvidence)` and from `if (planExempt && usefulOutput)`; neither is the
+    // no-op class, since the second still requires non-empty useful output. The case
+    // seeded below IS that second arm: `withRunEvidence: false` plus `advanced` is the
+    // plan-exempt shape, so this test was already exercising it. And the recency
     // `coalesce` is what keeps this arm honest for adapters (`opencode_k8s`) that never
     // stamp `lastUsefulActionAt` during the run. A regression that hoists the conjunct up
     // to the whole predicate would silently exclude every agent on those adapters, and
