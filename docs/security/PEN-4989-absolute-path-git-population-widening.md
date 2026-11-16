@@ -862,6 +862,8 @@ read `b46cfbd8…` — ≈6.9 days across nine distinct image tags, eight of whi
 otherwise name.
 
 ⚠ **The rows are not all the same observation, and the heading names only one of them.**
+Classify each row against **any earlier row carrying the same tag**, not against its immediate
+predecessor — otherwise a row’s type changes with whatever happens to sit above it.
 Eight carry a tag no earlier row does; those are the *image moved, surface did not* case the
 heading describes. Two hold the tag **fixed** and move the node (`k8s-paperclip-3` →
 `k8s-paperclip-7`) — 2026-11-13T04:4xZ and 2026-11-14T11:3xZ — which is node-invariance at one
