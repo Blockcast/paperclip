@@ -30,6 +30,7 @@
     "src/__tests__/cold-in-review-issue-metrics.test.ts",
     "src/__tests__/costs-by-project-statement-naming-postgres.test.ts",
     "src/__tests__/dep-blocked-retry-dispersion.test.ts",
+    "src/__tests__/event-loop-stall-log.test.ts",
     "src/__tests__/external-runtime-isolation-waiter-order.test.ts",
     "src/__tests__/fixtures/crash-guard-exit-fixture.ts",
     "src/__tests__/gc-flags-metrics.test.ts",
