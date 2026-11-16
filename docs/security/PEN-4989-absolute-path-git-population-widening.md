@@ -847,6 +847,9 @@ exactly that reason.
 | 2026-11-13T04:4xZ | `sha-195e005` | `k8s-paperclip-7` | `b46cfbd8…` | **same** |
 | 2026-11-13T06:3xZ | `sha-195e005` | `k8s-paperclip-7` | `b46cfbd8…` | **same** |
 | 2026-11-14T07:0xZ | `sha-70e6257` | `k8s-paperclip-3` | `b46cfbd8…` | **same** |
+| 2026-11-14T11:3xZ | `sha-70e6257` | `k8s-paperclip-7` | `b46cfbd8…` | **same** |
+| 2026-11-15T09:0xZ | `sha-70e6257` | `k8s-paperclip-3` | `b46cfbd8…` | **same** |
+| 2026-11-16T09:2xZ | `sha-b406d56` | `k8s-paperclip-7` | `b46cfbd8…` | **same** |
 
 All five per-file components — not merely the composite digest — were byte-identical at every row.
 Each was taken first-party from an agent pod and recorded on PEN-5663 at the time, and every image
@@ -855,15 +858,16 @@ config, which carries a `pendingImageBump` beside it and so can name an image th
 running.
 
 ⇒ **Sampled series, not continuous:** at every evaluation taken since 2026-11-09 the surface has
-read `b46cfbd8…` — ≈4.8 days across eight distinct image tags, seven of which this record does not
+read `b46cfbd8…` — ≈6.9 days across nine distinct image tags, eight of which this record does not
 otherwise name.
 
 ⚠ **The rows are not all the same observation, and the heading names only one of them.**
-Seven carry a tag no earlier row does; those are the *image moved, surface did not* case the
-heading describes. The 2026-11-13T04:4xZ row holds the tag **fixed** and moves the node
-(`k8s-paperclip-3` → `k8s-paperclip-7`) — that is node-invariance at one image, not an image
-move. The 2026-11-13T06:3xZ row repeats the preceding row’s tag **and** node, and adds only
-sampling density. Reading all nine non-baseline rows as instances of the heading over-counts it.
+Eight carry a tag no earlier row does; those are the *image moved, surface did not* case the
+heading describes. Two hold the tag **fixed** and move the node (`k8s-paperclip-3` →
+`k8s-paperclip-7`) — 2026-11-13T04:4xZ and 2026-11-14T11:3xZ — which is node-invariance at one
+image, not an image move. Two repeat an earlier row’s tag **and** node and add only sampling
+density: 2026-11-13T06:3xZ, and 2026-11-15T09:0xZ against the 2026-11-14T07:0xZ row. Reading all
+twelve non-baseline rows as instances of the heading over-counts it by four.
 
 §4 narrows the trigger from the image to the egress-relevant surface. These rows are the first
 direct observations supporting that narrowing; they are a sampled series and do **not** measure how
@@ -871,21 +875,24 @@ often an image change leaves the surface alone — only that it does.
 
 ⚠ **Three bounds, because this is the easiest table in the record to over-read.**
 **(a)** It is **sampled, not continuous** — the surface could have moved and returned between two
-rows, and nothing here excludes that. **(b)** ≈4.8 days sits **inside** the 2-to-5-day cadence above,
-so it **corroborates** that figure; it is **not** a counter-example and **not** evidence that the
-surface has slowed down. ⚠ It is now close to that range’s **upper** bound, and 5 days is the
-longest gap between any two firings ever observed here, so the next evaluation gets a threshold
-rather than a judgement: **the series passes 5 days at 2026-11-14T11:29:54Z.** A match after that
-instant no longer sits inside the published cadence and stops corroborating it — report that as a
-measurement about the **cadence**, which is what would have changed, and not as a §4 firing, which
-it is not: a match is still branch 1 and still owes no re-measurement. ⚠ **That instant is precise
-to about ±1 day, not to the second.** The 5-day maximum it is derived from comes from §4.1 rows
-carrying dates and no times, so the true observed maximum sits somewhere in ≈4-6 days. Read the
-instant as the point at which to START reporting the span, not as a bright line — a match landing a
-few hours either side of it neither crosses nor fails to cross the cadence. **(c)** ⛔ **No count was
-taken at any of these rows. Population: none. Window: none.** A non-firing licenses citing the
-window whose fingerprint it matches — it is not itself a measurement of the class, and must
-never be cited as one.
+rows, and nothing here excludes that. **(b)** ⛔ **The series has now outrun the published
+cadence, and that is the substantive change in this revision.** At ≈6.9 days it is past the
+2-to-5-day range’s 5-day maximum by ≈1.9 days, and past that maximum’s own ±1-day upper edge
+(≈6 days) by ≈0.9 days. Until 2026-11-16 this
+paragraph read that ≈4.8 days sat **inside** the range and **corroborated** it; that was true of
+≈4.8 days and is **superseded**. The 2026-11-15T09:0xZ row at ≈5.9 days was already past the
+5-day point estimate while still inside the ±1-day band; this is the first row past the band
+entirely. ⚠ **What that does and does not license.** §4.1's cadence is derived from *firings* and
+this series contains none, so the honest reading is that the surface has been **stable for longer
+than any gap previously observed here** — it is **not** a new cadence, **not** a prediction of when
+the next firing is due, and **not** a §4 firing, which it is not in any case: a match is still
+branch 1 and still owes no re-measurement. ⚠ **The ±1-day bound still applies and is now the
+load-bearing caveat**, because the band edge this series has passed is itself soft — §4.1's rows
+carry dates and no times. ⇒ **Report the span with its baseline and let a reader judge it**, and do
+not restate §4.1's cadence from a non-firing series, which measures a different thing.
+**(c)** ⛔ **No count was taken at any of these rows. Population: none. Window: none.** A
+non-firing licenses citing the window whose fingerprint it matches — it is not itself a
+measurement of the class, and must never be cited as one.
 
 ⛔ **A non-firing is not a weaker firing; it is a different observation, and it does not relax §4.**
 The three branches are unchanged: match ⇒ cite the matching window · differs with `wrapperAhead:
