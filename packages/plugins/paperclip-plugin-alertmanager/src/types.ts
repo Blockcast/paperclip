@@ -283,7 +283,9 @@ export interface AlertStateRecord {
    * When the plugin FIRST saw this fingerprint re-fire against an issue that
    * an operator (not the plugin) had closed — i.e. terminal status that
    * `closedByPlugin` does not attribute to the plugin (BLO-24234, BLO-31736).
-   * Anchors the `operatorSuppressionHours` window.
+   * Anchors the `operatorSuppressionHours` window. Stamped with the issue's own
+   * close time (`completedAt`/`cancelledAt`) when known, so the window counts
+   * from the close rather than from a recurrence days later (BLO-57636).
    *
    * Cleared whenever the issue is observed open again, so a close/re-open
    * cycle restarts the window rather than carrying a stale anchor forward.

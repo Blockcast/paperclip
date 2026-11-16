@@ -2242,7 +2242,14 @@ type RefireDecision =
   | { kind: "issue_missing" };
 
 export function decideRefire(
-  issue: { status: string } | null | undefined,
+  issue:
+    | {
+        status: string;
+        completedAt?: Date | string | null;
+        cancelledAt?: Date | string | null;
+      }
+    | null
+    | undefined,
   existing: Pick<
     AlertStateRecord,
     "resolvedAt" | "operatorSuppressedAt" | "pluginClosedAt"
@@ -2258,9 +2265,20 @@ export function decideRefire(
     return { kind: "reopen", reason: "plugin_resolved" };
   }
 
-  // Operator-closed. Anchor the window on the first re-fire we see against the
-  // closed issue — not on the close itself, which the plugin never observes.
-  const suppressedAt = existing.operatorSuppressedAt ?? new Date(nowMs).toISOString();
+  // Operator-closed. Anchor the window on the close itself when the row says
+  // when that was, else on the first re-fire we see against it.
+  //
+  // BLO-57636: anchoring on the first re-fire alone muted a whole fresh
+  // episode. A row closed `done` at 11-10 06:27 whose alert resolved at 06:45
+  // and next fired at 11-12 06:10 started its 24h window THEN, so the
+  // ~23.5h episode that followed was suppressed end to end and no row was open
+  // for it. The window is meant to buy quiet after a close, not after the
+  // next recurrence days later.
+  const closedAt = issue.status === "done" ? issue.completedAt : issue.cancelledAt;
+  const closedAtMs = closedAt ? new Date(closedAt).getTime() : NaN;
+  const suppressedAt =
+    existing.operatorSuppressedAt ??
+    new Date(Number.isFinite(closedAtMs) && closedAtMs <= nowMs ? closedAtMs : nowMs).toISOString();
   const firstObservation = !existing.operatorSuppressedAt;
   const windowMs = operatorSuppressionMs(config);
   if (windowMs === null) return { kind: "suppressed", suppressedAt, firstObservation };
