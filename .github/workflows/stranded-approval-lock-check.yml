@@ -96,7 +96,7 @@ jobs:
       # continuing past it buys nothing and only hides the real failure.
       - name: Install kubectl
         continue-on-error: true
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
 
       # `continue-on-error` here for the same reason as on the check below, and
       # the mechanism is easy to miss: an explicit `if:` without a status
