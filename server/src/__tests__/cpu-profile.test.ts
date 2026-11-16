@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  CPU_FLIGHT_RECORDER_PRODUCTION_OPTS,
   CPU_PROFILE_EXTENSION,
   CPU_PROFILE_SENTINEL_BASENAME,
   maybeDumpStallFlightRecording,
@@ -118,5 +119,12 @@ describe("summarizeCpuProfile (BLO-51594)", () => {
 
   it("is empty, not throwing, on a profile with no samples", () => {
     expect(summarizeCpuProfile({ nodes })).toEqual({ longestBusyMs: 0, topFrames: [] });
+  });
+});
+
+describe("CPU flight recorder production settings (BLO-57549)", () => {
+  it("rotates rarely: each rotation stalls the worker loop for seconds", () => {
+    // 120_000 put a ~2 s stall on the loop every 2 min in production.
+    expect(CPU_FLIGHT_RECORDER_PRODUCTION_OPTS.segmentMs).toBeGreaterThanOrEqual(600_000);
   });
 });

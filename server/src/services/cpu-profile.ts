@@ -65,6 +65,14 @@ let lastStallProfileAt = Number.NEGATIVE_INFINITY;
  * in the segment it just closed. Hence the last closed segment is kept and the
  * dump writes whichever of the two holds the longer busy run.
  */
+/**
+ * Production settings. Each rotation runs Profiler.stop + Profiler.start on the
+ * main isolate and blocks the loop for seconds on a worker (start re-logs every
+ * compiled function, whatever the sampling interval), so segments are long:
+ * 2-min segments were a ~2 s stall every 2 min (BLO-57549).
+ */
+export const CPU_FLIGHT_RECORDER_PRODUCTION_OPTS = { segmentMs: 900_000, samplingIntervalUs: 10_000 } as const;
+
 type Recorder = { session: Session; previous: CpuProfile | null; timer: ReturnType<typeof setInterval>; queue: Promise<unknown> };
 let recorder: Recorder | null = null;
 
