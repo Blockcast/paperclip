@@ -171,7 +171,7 @@ jobs:
         # the 29m cap is what will let its real tail appear for the first time.
         # Re-measure once it has; if a ratio is wanted against something that
         # does not move on one observation, p99 is 8.07m.
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
         timeout-minutes: 12
@@ -2110,7 +2110,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -2321,7 +2321,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.select.outputs.run == 'true'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
         if: steps.select.outputs.run == 'true'
@@ -2437,7 +2437,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.trim.outputs.run == 'true'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
         if: steps.trim.outputs.run == 'true'
@@ -2571,7 +2571,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.trim.outputs.run == 'true'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
         if: steps.trim.outputs.run == 'true'
@@ -2651,7 +2651,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.trim.outputs.run == 'true'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
         if: steps.trim.outputs.run == 'true'
@@ -2882,7 +2882,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.select.outputs.run == 'true'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
         if: steps.select.outputs.run == 'true'
@@ -3008,7 +3008,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -3111,7 +3111,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -3264,7 +3264,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # fetch-depth: 0 — the scan's range is `<base>..HEAD`, so both ends
           # and everything between them have to be in the object store. A
@@ -3787,7 +3787,7 @@ jobs:
       # is private and this one is public, so it cannot be pinned by `uses:`.
       - name: Check out the vendored predicate
         if: ${{ steps.mode.outputs.evaluate == 'true' }}
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: |
             .github/actions/verdict-dispatch
@@ -3954,7 +3954,7 @@ jobs:
       # setup on every push. Wording only: the gate below decides either way.
       - name: Checkout repository
         if: ${{ contains(needs.*.result, 'failure') && needs.ally_verdict.result != 'failure' }}
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # `arc-light` does not ship a usable Node by default — the `policy` job
       # on the same pool sets one up explicitly before its `node --test` steps.
@@ -4272,7 +4272,7 @@ jobs:
 
       - name: Checkout repository
         if: steps.select.outputs.run == 'true'
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
         if: steps.select.outputs.run == 'true'
@@ -4335,7 +4335,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
         uses: ./.github/actions/setup-pnpm
@@ -4533,7 +4533,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup pnpm
         uses: ./.github/actions/setup-pnpm
