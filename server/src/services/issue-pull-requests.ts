@@ -519,9 +519,15 @@ export async function reconcileMergedPullRequests(
       const row = readMergedPullRequestNode(node);
       // A non-PullRequest node is an ORDINARY Issue and is not a loss -- the
       // REST path dropped those too. A node that IS shaped like one and still
-      // will not read is a row this token could not resolve, which is a real
-      // gap in an enumeration whose whole job is completeness, so it is
-      // counted and reported rather than silently skipped.
+      // will not read is counted, because an enumeration whose whole job is
+      // completeness must not skip it silently.
+      //
+      // PEN-6742 item 2: that is NARROWER than "a row this token could not
+      // resolve", which this comment used to claim. A refusal arrives as a
+      // non-empty `errors` array, so `ghGraphQlQuery` returns `ok: false` and
+      // the `throw` above this loop fails the entire page -- it never reaches
+      // the counter. What lands here is a `PullRequest` node whose `number`
+      // is missing or non-integer, the single field the row reader requires.
       if (row === null) {
         if (node && typeof node === "object" && (node as Record<string, unknown>).__typename === "PullRequest") {
           unreadableNodesThisPage += 1;
@@ -734,10 +740,16 @@ export async function reconcileMergedPullRequests(
     }
 
     // `pageInfo.hasNextPage` is an explicit statement by the server where the
-    // REST loop had to infer the end from a short page -- and the inference
-    // was WRONG here in a way nothing reported: `items` is the PR-only subset,
-    // so a page of 100 carrying even one plain Issue read as short and ENDED
-    // the enumeration early. Reading the connection removes that entirely.
+    // REST loop had to infer the end from a short page (`items.length < 100`).
+    //
+    // PEN-6742 item 4: that inference was SOUND, and an earlier revision of
+    // this comment wrongly claimed it was broken by the PR-only `filter`.
+    // Measured at the pre-migration commit `9dcd29e3`: the search query
+    // already carried `is:pr`, so `items.filter((it) => it.pull_request)`
+    // dropped nothing and `items.length` was the true page size. The gain
+    // here is replacing a correct INFERENCE with an explicit server
+    // statement -- a smaller claim than the one this comment used to make,
+    // and the real one.
     if (connection.pageInfo?.hasNextPage !== true) break;
     const rawCursor: unknown = connection.pageInfo?.endCursor;
     cursor = typeof rawCursor === "string" && rawCursor.length > 0 ? rawCursor : null;

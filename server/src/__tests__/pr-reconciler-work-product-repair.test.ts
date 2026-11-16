@@ -76,6 +76,14 @@ const githubResponses = vi.hoisted(() => ({
    * well against a loop that ran forever and was killed by the test timeout.
    */
   pageCalls: 0,
+  /**
+   * PEN-6742 item 1: the `cursor` variable each page was asked for, in order.
+   *
+   * `pageCalls` counts ITERATIONS and cannot see whether the walk advanced:
+   * it passes identically against a loop that re-requests page 1 ten times.
+   * Only the cursor sequence distinguishes paging from spinning.
+   */
+  cursors: [] as (string | null)[],
 }));
 
 vi.mock("../services/github-fetch.js", () => ({
@@ -88,8 +96,11 @@ vi.mock("../services/github-fetch.js", () => ({
 }));
 
 vi.mock("../services/github-app-auth.js", () => ({
-  ghGraphQlQuery: async () => {
+  ghGraphQlQuery: async (input: { variables?: Record<string, unknown> }) => {
     githubResponses.pageCalls += 1;
+    githubResponses.cursors.push(
+      (input?.variables?.cursor as string | null | undefined) ?? null,
+    );
     return {
       ok: true as const,
       data: {
@@ -188,6 +199,7 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     githubResponses.searchNodes = [];
     githubResponses.pageInfo = { hasNextPage: false, endCursor: null };
     githubResponses.pageCalls = 0;
+    githubResponses.cursors = [];
   });
 
   afterAll(async () => {
@@ -485,5 +497,33 @@ describeEmbeddedPostgres("merged-PR reconciler repairs PR work products (PEN-641
     expect(result.enumerated).toBe(MAX_PAGES);
     // Readable pages throughout -- this path owes nothing to the other two.
     expect(result.unreadableNodes).toBe(0);
+  });
+
+  it("hands each page the previous page's endCursor (PEN-6742 item 1)", async () => {
+    const { company } = await seed("ready_for_review", {
+      lastEventAction: "opened",
+      sourceEventOrder: 10,
+      sourceEventActionOrder: 10,
+      sourceEventTimestamp: "2026-10-29T18:40:57Z",
+      sourceEventTimestampMs: Date.parse("2026-10-29T18:40:57Z"),
+    });
+
+    // Same multi-page shape as the page-cap test. What this one asserts is
+    // the thing that test CANNOT see: that the walk advanced.
+    githubResponses.pageInfo = { hasNextPage: true, endCursor: "cursor-next" };
+
+    await runReconciler(db, company.id);
+
+    // Page 1 opens the connection with no cursor; every later page must carry
+    // the previous page's `endCursor`. Replace the production `cursor`
+    // assignment with any non-empty constant and every other assertion in
+    // this file still passes -- including `pageCalls === MAX_PAGES`, because
+    // a loop re-reading page 1 forever iterates exactly as often as one that
+    // pages. This is the only arm that goes red.
+    expect(githubResponses.cursors).toHaveLength(MAX_PAGES);
+    expect(githubResponses.cursors[0]).toBe(null);
+    expect(githubResponses.cursors.slice(1)).toEqual(
+      Array(MAX_PAGES - 1).fill("cursor-next"),
+    );
   });
 });
