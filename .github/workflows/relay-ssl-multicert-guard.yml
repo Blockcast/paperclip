@@ -83,7 +83,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+        uses: azure/setup-kubectl@v5
 
       - name: Configure kubeconfig
         env:
