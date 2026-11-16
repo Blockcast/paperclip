@@ -44,7 +44,16 @@ export interface ReconcileResult {
    */
   workProductsOffered: number;
   /**
-   * PEN-6733: merged pull-request nodes the enumeration could not read.
+   * PEN-6733: merged pull-request nodes the enumeration had to skip.
+   *
+   * NOT "nodes this token could not resolve" (PEN-6742 item 2). A node the
+   * API refuses comes back as a non-empty `errors` array, which
+   * `ghGraphQlQuery` reports as `ok: false` and the page loop turns into a
+   * throw ABOVE this counter -- so a permission or `NOT_FOUND` failure fails
+   * the whole page and is never counted here. What this counts is the
+   * narrower thing that survives to the node loop: a node typed
+   * `PullRequest` whose `number` is missing or not an integer, the one field
+   * the row reader requires.
    *
    * Read this WITH `workProductsOffered`, never instead of it. Alone,
    * `workProductsOffered: 0` spans two opposite states and nothing on this
@@ -61,10 +70,20 @@ export interface ReconcileResult {
    * PEN-6733: this repo's enumeration stopped before the window was exhausted,
    * so `enumerated` is a PREFIX rather than a count.
    *
-   * Three paths reach it -- a page whose pull-request nodes all failed to
-   * read, a `hasNextPage` with no cursor, and the page cap -- and all three
-   * previously logged and returned nothing, so a coverage percentage computed
-   * from `enumerated` was an OVERSTATEMENT presented as a measurement.
+   * Three paths reach it: a page that yielded no usable pull-request row
+   * while the server said another page exists, a `hasNextPage` with no
+   * cursor, and the page cap. Before this field each of them simply returned,
+   * so a coverage percentage computed from `enumerated` was an OVERSTATEMENT
+   * presented as a measurement.
+   *
+   * Do not read the LOG as the signal -- this flag is the signal. The
+   * no-cursor and page-cap paths each warn, but the first path warns only
+   * through the per-page unreadable-node WARN, which does not fire when the
+   * page simply carried no pull-request nodes at all. That case needs
+   * `is:pr` to be absent from the query to be reachable, so it is a hole in
+   * the logging rather than a live gap -- but it is why the three paths are
+   * not interchangeable in the log, and why the caller is told in the RETURN
+   * VALUE instead.
    */
   enumerationTruncated: boolean;
 }
