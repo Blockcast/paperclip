@@ -20,9 +20,14 @@ export default defineConfig({
     // `pipelines-schema.test.ts:50`, whose boot is in the `beforeAll`).
     // So `testTimeout` reaches no Postgres-booting body at all, and
     // `hookTimeout` reaches exactly one block: the bare `afterEach` at
-    // `pool-timeout-bounds.test.ts:49`.
+    // `pool-timeout-bounds.test.ts:49`. In particular it does NOT cover
+    // `pipelines-schema.test.ts:41`, the one `beforeAll` boot — that hook
+    // closes `}, 60_000)` itself, as does its `afterAll` at :46.
+    // Contrast the alertmanager package, where a per-test `beforeEach` closes
+    // with no argument and `hookTimeout` is therefore the whole fix.
     //
-    // 2026-11-16 (PEN-6772): THE SENTENCE ABOVE WAS TRUE WHEN WRITTEN AND IS
+    // 2026-11-16 (PEN-6772): THE PARAGRAPH ABOVE -- specifically "`testTimeout`
+    // reaches no Postgres-booting body at all" -- WAS TRUE WHEN WRITTEN AND IS
     // NOW FALSE, and the way it went false is the point. 12 booting bodies in
     // this package -- 8 in `client.test.ts`, 4 in `pool-timeout-bounds.test.ts`
     // -- were passing a file-local `= 60_000` constant as their trailing
@@ -34,11 +39,7 @@ export default defineConfig({
     // as "inherits the config" -- a pass. Those arguments are now gone and the
     // sweeps read non-literal spellings, so those 12 bodies DO fall through to
     // `testTimeout` and it is load-bearing for them. Do not reintroduce a
-    // per-test argument in this package: raise the value below instead. In particular it does NOT cover
-    // `pipelines-schema.test.ts:41`, the one `beforeAll` boot — that hook
-    // closes `}, 60_000)` itself, as does its `afterAll` at :46.
-    // Contrast the alertmanager package, where a per-test `beforeEach` closes
-    // with no argument and `hookTimeout` is therefore the whole fix.
+    // per-test argument in this package: raise the value below instead.
     //
     // 2026-09-27 (BLO-37114): PRECAUTIONARY, not measured. No `packages/db`
     // timeout appears in the merge-queue failure sample; the package is

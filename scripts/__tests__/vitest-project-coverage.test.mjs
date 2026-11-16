@@ -907,7 +907,19 @@ function resolveBudgetExpression(expression, constants) {
 // server on `SERVER_STARTUP_TIMEOUT_MS + 60_000` = 360s, far above the floor --
 // i.e. it would trade a fail-open for a false alarm. Two passes so a constant
 // defined in terms of an earlier one resolves.
-function numericConstantsInSource(code) {
+function numericConstantsInSource(source) {
+  // Strip `//` comments first, the same strip (and for the same reason) as
+  // `declaredTimeouts`, `configuredTestTimeout` and `configuredHookTimeout`
+  // above. Harvesting from raw source lets a COMMENTED declaration register as
+  // a constant, and the loop below keeps the FIRST binding for a name -- so a
+  // commented `// const BUDGET_MS = 600_000` sitting above the real
+  // `const BUDGET_MS = 30_000` masks the real one, and every body spelling its
+  // budget as `BUDGET_MS` is then scored against a value that does not exist at
+  // runtime. That is a fail-open in the resolver this guard added to CLOSE a
+  // fail-open. Live trigger shape: `packages/db/src/client.test.ts` carries a
+  // `const EMBEDDED_MIGRATION_TEST_TIMEOUT_MS = 60_000` inside the comment that
+  // records why the argument was removed (PEN-6772).
+  const code = source.replace(/^\s*\/\/.*$/gm, "");
   const constants = new Map();
   for (let pass = 0; pass < 2; pass += 1) {
     const declarations = /\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::\s*number\s*)?=\s*([^;\n]+)/g;
@@ -1572,6 +1584,39 @@ test("configuredHookTimeout reads the number, not the prose", () => {
     `expected ${dir} to read 120000ms. If that package's config changed, re-point this control ` +
       `at another config whose comments name several budgets -- do not simply delete it.`,
   );
+});
+
+test("the constant resolver reads the declaration, not the prose", () => {
+  // Same failure as the test above, one layer in: `numericConstantsInSource`
+  // harvests `const NAME = <number>` so a budget spelled as a named constant
+  // RESOLVES instead of being rejected. Harvested from raw source, a COMMENTED
+  // declaration registers too -- and because the loop keeps the FIRST binding
+  // for a name, a commented one sitting ABOVE the real one wins. That launders
+  // a sub-floor budget into a passing number, which is the exact fail-open
+  // this resolver was added to close.
+  const masked = numericConstantsInSource(
+    `// const BUDGET_MS = 600_000 was the old budget, removed because it was too high.
+     const BUDGET_MS = 30_000;`,
+  );
+  assert.equal(
+    masked.get("BUDGET_MS"),
+    30_000,
+    "a commented-out declaration masked the real one -- the comment strip is gone",
+  );
+
+  // Must-pass arm: stripping comments must not stop a real declaration, or a
+  // legitimate non-literal budget silently becomes UNKNOWN and the floor sweep
+  // reds the repo instead of passing it.
+  const live = numericConstantsInSource(
+    `const STARTUP_MS = 300_000;
+     const TOTAL_MS = STARTUP_MS + 60_000;`,
+  );
+  assert.equal(live.get("STARTUP_MS"), 300_000, "a real declaration stopped resolving");
+  assert.equal(live.get("TOTAL_MS"), 360_000, "a constant defined from an earlier one stopped resolving");
+
+  // And a declaration that exists ONLY in prose must not register at all.
+  const proseOnly = numericConstantsInSource(`// const GHOST_MS = 600_000;`);
+  assert.equal(proseOnly.has("GHOST_MS"), false, "a commented declaration registered as a constant");
 });
 
 // ---------------------------------------------------------------------------
