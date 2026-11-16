@@ -6,10 +6,14 @@
 
 import { spawn } from "node:child_process";
 import {
+  closeSync,
   mkdtempSync,
+  openSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -33,17 +37,34 @@ import {
  *  {@link GitHubMcpEgressRuntimeIo} does at the MCP door.
  *
  *  Two kinds travel this channel: the PEN-5734 rewrite notice, and the
- *  PEN-6243 refusal notice. Both default to stderr, which on an `ac-*` seat is
- *  the stream the log collector reads. */
+ *  PEN-6243 refusal notice. Both default to THIS PROCESS's stderr.
+ *
+ *  An earlier generation of this comment went on to say that stderr "on an
+ *  `ac-*` seat is the stream the log collector reads". That is measured FALSE
+ *  and it is why the PEN-6243 counter read zero: under the agent harness's
+ *  Bash tool the wrapper is a grandchild whose fd 2 is a FILE on the run's
+ *  scratch volume, so a notice written there is read by the caller and by
+ *  nothing else. {@link GitHubCliEgressRuntimeIo.publishToCollectedStream} is
+ *  the half that reaches the collector. */
 export interface GitHubCliEgressRuntimeIo {
-  /** One already-formatted notice. Receives CLASSES and SCRUBBED excerpts
-   *  only, never the material that fired. */
+  /** One already-formatted notice, for the CALLER. Receives CLASSES and
+   *  SCRUBBED excerpts only, never the material that fired. */
   notify(message: string): void;
+  /** PEN-6243: the same already-formatted notice, for the LOG COLLECTOR.
+   *
+   *  Optional so that an injected io keeps compiling, and so that a test
+   *  capturing `notify` alone publishes nothing. Only the refusal notice
+   *  travels this way: the rewrite notice must not start appearing in the
+   *  container log as a side effect of instrumenting a different line. */
+  publishToCollectedStream?(message: string): void;
 }
 
 const defaultIo: GitHubCliEgressRuntimeIo = {
   notify: (message) => {
     console.error(message);
+  },
+  publishToCollectedStream: (message) => {
+    publishNoticeToContainerStderr(message);
   },
 };
 
@@ -304,14 +325,22 @@ export function createReviewAttestationGuardIo(target: string): ReviewAttestatio
  * to whichever agent happens to read its own tool output. Two such refusals 93
  * minutes apart on 2026-11-08 were each found that way and by nothing else.
  *
- * Seats have no metrics endpoint, so the signal is a log line: `ac-*` pod
- * STDERR is collected into Loki (measured 2026-11-15 — 2,117 `ac-*` pods over
- * two hours, carrying this wrapper's own `[paperclip] …` lines; the same
- * selector returns ZERO on `stream="stdout"` over six hours while stdout is
- * collected elsewhere in the namespace, so the asymmetry is a property of the
- * seats and not of the collector). A `loki.process` stage turns the line into
- * the per-pod counter the row asks for; that kind of stage is already deployed
- * in this cluster for the GitHub App token rotator.
+ * Seats have no metrics endpoint, so the signal is a log line. The CONTAINER's
+ * stderr is collected into Loki (measured 2026-11-15 — 2,117 `ac-*` pods over
+ * two hours carrying `[paperclip] …` lines; the same selector returns ZERO on
+ * `stream="stdout"` over six hours while stdout is collected elsewhere in the
+ * namespace, so the asymmetry is a property of the seats and not of the
+ * collector). A `loki.process` stage turns the line into the per-pod counter
+ * the row asks for; that kind of stage is already deployed in this cluster for
+ * the GitHub App token rotator.
+ *
+ * ⚠ An earlier generation of this comment read those lines as "this wrapper's
+ * own". They are the ENTRYPOINT's: one `[paperclip]` prefix, two processes,
+ * two stderr destinations. The entrypoint is PID 1 and reaches the log; this
+ * wrapper, run as a grandchild of the agent harness's Bash tool, does not. A
+ * shared log PREFIX is not evidence of a shared EMITTER, and taking it for one
+ * is why this counter was built against a stream the line never reached. That
+ * is what {@link GitHubCliEgressRuntimeIo.publishToCollectedStream} repairs.
  */
 
 /** Why a GitHub CLI call was refused. A CLOSED set: it is a metric label, and
@@ -361,6 +390,70 @@ export function formatGitHubCliRefusalNotice(
 ): string {
   const installation = INSTALLATION_ID_PATTERN.exec(stderrText)?.[1] ?? "unknown";
   return `${REFUSAL_NOTICE_PREFIX} reason=${reason} installation=${installation}`;
+}
+
+/** PID 1's fd 2 IS the container's stderr: the stream the container runtime
+ *  captures into the container log, which is what the collector reads. */
+const CONTAINER_STDERR_PATH = "/proc/1/fd/2";
+const OWN_STDERR_PATH = "/proc/self/fd/2";
+
+/**
+ * Whether this process's stderr already IS the container's stderr.
+ *
+ * Three-valued on purpose, and the third value is the point. `null` means the
+ * question could not be answered — no `/proc`, an unreadable link — and the
+ * caller must then publish NOTHING rather than guess. Publishing on an unknown
+ * risks a SECOND copy of a line that is COUNTED, which would inflate the
+ * series; declining costs an under-report, which is the direction this path
+ * already chose at {@link classifyGitHubCliRefusal}.
+ *
+ * Both arms measured on a live `ac-*` seat, 2026-11-16: a process whose stderr
+ * is inherited from PID 1 reads the same link for both paths, and a Bash-tool
+ * grandchild reads a `…/tasks/<id>.output` file against PID 1's log pipe. So
+ * this discriminates rather than being a constant.
+ */
+export function ownStderrIsContainerStderr(
+  readLink: (filePath: string) => string = readlinkSync,
+): boolean | null {
+  try {
+    return readLink(OWN_STDERR_PATH) === readLink(CONTAINER_STDERR_PATH);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Publish one already-formatted notice to the CONTAINER's own stderr, so that
+ * the log collector sees it.
+ *
+ * PEN-6243: `console.error` reaches the caller and not the collector — see
+ * {@link GitHubCliEgressRuntimeIo}. This is the other half, and it is best
+ * effort in every direction: a seat whose PID 1 is unreachable, or whose uid
+ * cannot open it, publishes nothing at all. An observability side-channel must
+ * never be able to break a wrapped `gh`, so every failure here is swallowed.
+ */
+function publishNoticeToContainerStderr(message: string): void {
+  // Anything but a definite "our stderr is somewhere else" publishes nothing.
+  if (ownStderrIsContainerStderr() !== false) return;
+  let fd: number | null = null;
+  try {
+    // Append, never truncate. PID 1's stderr is a pipe under the container
+    // runtime but may be a regular file elsewhere, and "w" would empty it.
+    fd = openSync(CONTAINER_STDERR_PATH, "a");
+    // One short line in a single write: below PIPE_BUF it cannot interleave
+    // with PID 1's own output.
+    writeSync(fd, `${message}\n`);
+  } catch {
+    // Unwritable, absent, or full. The caller already has the notice.
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Nothing to do; the descriptor dies with the process regardless.
+      }
+    }
+  }
 }
 
 /** Bound on the stderr kept for scanning across chunk boundaries. A refusal
@@ -444,7 +537,12 @@ export async function runGitHubCliEgressRuntime(
           // its internal retries, and this line is counted.
           refusalNotified = true;
           refusalScanTail = "";
-          io.notify(formatGitHubCliRefusalNotice(reason, scanned));
+          const notice = formatGitHubCliRefusalNotice(reason, scanned);
+          io.notify(notice);
+          // PEN-6243: and the collected copy, which is the one that is
+          // counted. Guarded by `?.` so an injected io without it is a no-op
+          // rather than a crash on the path every seat's `gh` takes.
+          io.publishToCollectedStream?.(notice);
           return;
         }
         refusalScanTail =

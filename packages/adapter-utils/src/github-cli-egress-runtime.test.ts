@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   classifyGitHubCliRefusal,
   formatGitHubCliRefusalNotice,
+  ownStderrIsContainerStderr,
   prepareGitHubCliInvocation,
   runGitHubCliEgressRuntime,
 } from "./github-cli-egress-runtime.js";
@@ -575,5 +576,102 @@ describe("PEN-6243: a seat's rate-limit refusal is counted, and nothing else is"
     const notice = formatGitHubCliRefusalNotice("rate_limit", stderr);
     expect(notice).not.toMatch(/Blockcast|repos|pulls|ghp_|Bearer/);
     expect(notice.split(/\s+/)).toHaveLength(4);
+  });
+});
+describe("PEN-6243: the counted notice reaches the LOG COLLECTOR, not just the caller", () => {
+  // `console.error` goes to THIS process's stderr, and under the agent
+  // harness's Bash tool that is a file on the run's scratch volume — so the
+  // counter built on this line read zero while the line was being emitted
+  // correctly. These pin the second, collected copy.
+
+  const REFUSAL = "gh: API rate limit exceeded for installation ID 138085375.\n";
+  const NOTICE = "[paperclip] github-egress-refusal reason=rate_limit installation=138085375";
+
+  describe("ownStderrIsContainerStderr", () => {
+    // Three-valued, and the `null` arm is the one that matters: an unknown
+    // must publish NOTHING, because a second copy of a counted line inflates
+    // the series where a missing one merely under-reports.
+    it("is true when our stderr already IS the container's", () => {
+      expect(ownStderrIsContainerStderr(() => "pipe:[851466819]")).toBe(true);
+    });
+
+    it("is false when our stderr is somewhere else", () => {
+      const links: Record<string, string> = {
+        "/proc/self/fd/2": "/runtime-cache/t/abc/tasks/xyz.output",
+        "/proc/1/fd/2": "pipe:[851466819]",
+      };
+      expect(ownStderrIsContainerStderr((filePath) => links[filePath] ?? "")).toBe(false);
+    });
+
+    it("is null when the question cannot be answered, rather than guessing", () => {
+      expect(
+        ownStderrIsContainerStderr(() => {
+          throw new Error("ENOENT: no /proc on this platform");
+        }),
+      ).toBeNull();
+    });
+  });
+
+  it("publishes the SAME line to the collector that the caller was notified of", async () => {
+    const fixture = makeSplittingFixture([REFUSAL]);
+    const notices: string[] = [];
+    const published: string[] = [];
+    await runGitHubCliEgressRuntime({
+      target: fixture.target,
+      argv: ["api", "/rate_limit"],
+      io: {
+        notify: (message) => notices.push(message),
+        publishToCollectedStream: (message) => published.push(message),
+      },
+    });
+    expect(notices).toEqual([NOTICE]);
+    // Same bytes: a collector-side counter and a caller-side reader must not
+    // be able to disagree about what was refused.
+    expect(published).toEqual(notices);
+  });
+
+  it("publishes ONCE even when gh prints the refusal on every retry", async () => {
+    const fixture = makeSplittingFixture([REFUSAL, REFUSAL, REFUSAL]);
+    const published: string[] = [];
+    await runGitHubCliEgressRuntime({
+      target: fixture.target,
+      argv: ["api", "/rate_limit"],
+      io: {
+        notify: () => {},
+        publishToCollectedStream: (message) => published.push(message),
+      },
+    });
+    // The series counts this line, so a second copy would be a second
+    // refusal that never happened.
+    expect(published).toHaveLength(1);
+  });
+
+  it("publishes nothing when the stderr was not a refusal", async () => {
+    const fixture = makeSplittingFixture(["gh: HTTP 403: Resource not accessible by integration\n"]);
+    const published: string[] = [];
+    await runGitHubCliEgressRuntime({
+      target: fixture.target,
+      argv: ["api", "/rate_limit"],
+      io: {
+        notify: () => {},
+        publishToCollectedStream: (message) => published.push(message),
+      },
+    });
+    expect(published).toEqual([]);
+  });
+
+  it("does not throw when an injected io omits the collector half", async () => {
+    // The optional method is on the path EVERY seat's `gh` takes, so a caller
+    // that predates it must keep working rather than crashing the wrapper.
+    const fixture = makeSplittingFixture([REFUSAL]);
+    const notices: string[] = [];
+    await expect(
+      runGitHubCliEgressRuntime({
+        target: fixture.target,
+        argv: ["api", "/rate_limit"],
+        io: { notify: (message) => notices.push(message) },
+      }),
+    ).resolves.toBeTypeOf("number");
+    expect(notices).toEqual([NOTICE]);
   });
 });
