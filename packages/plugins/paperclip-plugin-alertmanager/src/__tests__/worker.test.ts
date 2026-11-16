@@ -3159,10 +3159,10 @@ describe("handleWebhook — closure authorship across cycles (BLO-31736)", () =>
    */
   const mkCycleWorld = (
     mocks: MockClients,
-    opts: { issueStatus: string; state: AlertStateRecord },
+    opts: { issueStatus: string; state: AlertStateRecord; completedAt?: string },
   ) => {
     const world = {
-      issue: { id: "issue-existing", status: opts.issueStatus },
+      issue: { id: "issue-existing", status: opts.issueStatus, completedAt: opts.completedAt ?? null },
       state: { ...opts.state } as AlertStateRecord,
     };
     mocks.state.get.mockImplementation(async () => world.state);
@@ -3246,6 +3246,49 @@ describe("handleWebhook — closure authorship across cycles (BLO-31736)", () =>
     await handleWebhook(ctx, config, true, firingDelivery());
     expect(statusPatches(mocks)).toEqual([]);
     expect(world.issue.status).toBe("done");
+  });
+
+  it("re-opens a `done` row when its alert resolves and fires again after the window (BLO-57636)", async () => {
+    // Live shape: closed `done` 11-10 06:27, alert resolved 06:45, next fired
+    // 11-12 06:10 for ~23.5h. The window used to be anchored on that re-fire,
+    // so the whole second episode was suppressed and no row was open for it.
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "done",
+      state: freshlyFiredState(),
+      completedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+    });
+
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    expect(world.issue.status).toBe("done");
+
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("todo");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppression_expired",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
+  });
+
+  it("CONTROL — still suppresses a re-fire inside the window after a `done` close", async () => {
+    const { ctx, mocks } = mkCtx();
+    const config = baseConfig({ autoCloseOnResolve: true });
+    const world = mkCycleWorld(mocks, {
+      issueStatus: "done",
+      state: freshlyFiredState(),
+      completedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    });
+
+    await handleWebhook(ctx, config, true, resolvedDelivery("2026-04-29T10:00:00Z"));
+    await handleWebhook(ctx, config, true, firingDelivery());
+    expect(world.issue.status).toBe("done");
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.firing.suppressed",
+      1,
+      expect.objectContaining({ alertname: "CiliumPolicyDropsHigh" }),
+    );
   });
 
   it("reaches operator suppression for a hand-cancelled row whose alert resolved before", async () => {
