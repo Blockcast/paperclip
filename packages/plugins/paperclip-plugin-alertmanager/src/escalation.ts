@@ -1654,7 +1654,7 @@ async function advanceIssueLadder(
       // Bounded exactly as the retry retraction is: one extra comment per
       // fully-held rung, because the intermediate holds stay silent while the
       // promise still holds.
-      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] ${deferralHoldSpentSentence(current?.name ?? "the current owner", wakeRetries + 1)}\n\n${livenessLine(liveness, state, now)}`, companyId);
+      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] ${deferralHoldSpentSentence(current?.name ?? "the current owner")}\n\n${livenessLine(liveness, state, now)}`, companyId);
     }
   } else if (retryingWakeDelivery) {
     // Only the DELIVERY failed. Re-attempt it.
@@ -1819,12 +1819,20 @@ async function advanceIssueLadder(
  * ⛔ PEN-6719 added a THIRD path and deliberately did NOT make it a fourth
  * copy of that string. `deferralHoldSpentSentence` ends
  * "...; the ladder moves on at the next sweep." identically, but opens "The
- * HOLD budget" rather than "The retry budget", because on that path no retry
- * was ever attempted — the ladder spent the same bounded budget WAITING on
- * purpose. Saying "retry budget" there would contradict the same thread's own
- * earlier sentence, which told the reader the rung would be held WITHOUT
- * re-waking. Three sites, one trailing clause, two budget nouns; grep the
- * trailing clause to find all three.
+ * HOLD budget" rather than "The retry budget", because the sweeps that SPENT
+ * that budget attempted no wake — the ladder spent it WAITING, on purpose.
+ *
+ * ⚠️ PEN-6719's follow-up CORRECTED this paragraph. It used to read "on that
+ * path no retry was ever attempted", which is false on the MIXED path: a rung
+ * can go `declined` → `deferred`, and the sweep that carried the deferral DID
+ * re-wake, before any hold began. The budget NOUN survives that correction,
+ * because it names what the HELD sweeps did rather than the rung's whole
+ * history — which is the same distinction that cost `deferralHoldSpentSentence`
+ * its sweep count, one function down, in the same change.
+ *
+ * Saying "retry budget" there would contradict the rung-opening sentence
+ * wherever that sentence promised a hold. Three sites, one trailing clause,
+ * two budget nouns; grep the trailing clause to find all three.
  *
  * ⛔ The closing clause says the ladder MOVES ON, not that it will ESCALATE.
  * Escalating is only one of the things the next sweep can do, and which one is
@@ -1940,25 +1948,43 @@ function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: 
  * owner whose run is still only pending.
  *
  * Same job as `retryBudgetSpentSentence`: retract a promise before it is
- * silently broken. `wakeSentence`'s deferral arm told the reader "This rung is
- * NOT spent, and no second wake is added on top of that run: the ladder HOLDS
- * the rung without re-waking while the host's retry stands." That is true when
- * written and stops being true when the bound runs out — and unlike the retry
- * path, nothing has FAILED here, so a reader who is never told sees the ladder
- * escalate past an owner whose run the thread said was coming.
+ * silently broken. Unlike the retry path, nothing has FAILED here, so a reader
+ * who is never told sees the ladder escalate past an owner whose run the thread
+ * said was coming.
  *
  * ⛔ It does NOT say the deferral failed, and must not be edited into saying
  * so. The host's `scheduled_retry` run may still be pending, or may already
  * have run — this sweep cannot see which, and the whole PEN-6704 lineage
  * exists because the ladder kept asserting things about runs it could not see.
- * What is certain, and all this says, is that the ladder waited `sweeps` rung
- * intervals and is no longer waiting.
+ *
+ * ⛔ IT CARRIES NO SWEEP COUNT, AND MUST NOT BE GIVEN ONE BACK. It used to
+ * say the ladder "held this rung for N sweeps without re-waking rather than
+ * stacking a second wake on it", with `N = wakeRetries + 1`. That is exact on
+ * the path every test took — a deferral on the rung's FIRST attempt, where
+ * every sweep after it is held — and overstates by the number of non-held
+ * retry sweeps on the MIXED path, where the rung goes `declined` first and only
+ * `deferred` on a retry sweep. There the ladder re-woke on that retry sweep and
+ * held exactly ONE, while the sentence claimed two and denied the re-wake.
+ *
+ * ⛔ And it cannot be repaired from state. This sweep sees
+ * `escalationWakeRetries` and `escalationWakeDeferred`, and both paths arrive
+ * carrying `1` and `true` — so no expression over state can be right on both,
+ * and an exact count would mean persisting a hold-start field on
+ * `AlertStateRecord` for one numeral. The sentence does its job without one:
+ * retract the promise, say the budget is spent, say the ladder moves on.
+ *
+ * ⚠️ `wakeSentence`'s hold promise did NOT necessarily come first. On the
+ * mixed path the rung opened on the `declined` arm — which promises a RE-SEND,
+ * not a hold — and the deferral sweep posts nothing, so this can be the
+ * thread's FIRST mention of a hold. It is written to stand alone for that
+ * reason, and must not be shortened into a back-reference to a promise that may
+ * never have been made.
  *
  * The trailing clause is WORD-FOR-WORD the other two rung-is-spent sentences;
  * the budget noun is not. See `wakeSentence`'s docblock for why.
  */
-function deferralHoldSpentSentence(name: string, sweeps: number): string {
-  return `**The wake for ${name} is still POSTPONED, not dropped** — the host deferred it for provider capacity (${PROVIDER_CAPACITY_DEFERRAL_CAUSE}) and committed a retry run, and the ladder held this rung for ${sweeps} sweep${sweeps === 1 ? "" : "s"} without re-waking rather than stacking a second wake on it. Whether that run has since started is not readable from here. The hold budget for this rung is spent; the ladder moves on at the next sweep.`;
+function deferralHoldSpentSentence(name: string): string {
+  return `**The wake for ${name} is still POSTPONED, not dropped** — the host deferred it for provider capacity (${PROVIDER_CAPACITY_DEFERRAL_CAUSE}) and committed a retry run, and the ladder held this rung without re-waking while that retry stood. Whether that run has since started is not readable from here. The hold budget for this rung is spent; the ladder moves on at the next sweep.`;
 }
 
 /**

@@ -2025,13 +2025,14 @@ describe("PEN-2918 attendance observations", () => {
    * `requestWakeupBestEffort` — four lines — and `wake_outcome` falls back to
    * `declined`, the cause to null, `UNDELIVERED_WAKE_OUTCOMES` claims it, the
    * comment asserts the host enqueued nothing, and the marker loses the
-   * deferral flag. Measured 2026-11-15, these FIVE tests fail and no others:
+   * deferral flag. Re-measured 2026-11-16, these SIX tests fail and no others:
    *
    *   - records a capacity deferral as `deferred`, not as an undelivered `declined`
    *   - mints `provider_capacity_deferred` as the cause, since the host leaves undeliveredReason null by design
    *   - tells the thread the wake was POSTPONED, and never that no run was queued
    *   - marks a deferral-held rung as deferred, not merely as undelivered
    *   - promises a HOLD rather than a retry on the rung-opening comment for a deferral
+   *   - holds for one sweep, and claims no count, when the rung went `declined` before it went `deferred`
    *
    * ⛔ NAMED, NOT COUNTED, AND THAT IS THE POINT OF THIS BLOCK. It used to
    * read "these four tests fail" and the four were an ORDINAL run — "the FIRST
@@ -2052,13 +2053,27 @@ describe("PEN-2918 attendance observations", () => {
    *     also in `WAKE_OUTCOMES_WITHOUT_A_RUN_AT_THIS_RUNG`, so the rung is held
    *     by the same arm and its assertions still hold. It guards the PREDICATE
    *     SWAP named in its own docblock instead.
-   *   - every PEN-6719 HOLD test — those set `escalationWakeDeferred` in the
-   *     state fixture directly, so they never reach this branch at all. Their
-   *     own controls are stated in their own docblocks: disabling
-   *     `holdingDeferredWake` fails three of them, dropping the explicit
-   *     `escalationWakeDeferred: false` from the marker's clear arm fails two,
-   *     and removing the hold-spent comment fails one (all measured
-   *     2026-11-15).
+   *   - every PEN-6719 HOLD test THAT SETS `escalationWakeDeferred` IN THE
+   *     STATE FIXTURE — those never reach this branch at all. Their own
+   *     controls are stated in their own docblocks. Re-measured 2026-11-16,
+   *     after the mixed-path test joined the block: disabling
+   *     `holdingDeferredWake` fails FOUR (was three), dropping the explicit
+   *     `escalationWakeDeferred: false` from the marker's clear arm fails TWO
+   *     (unchanged — the mixed path exits through the SET arm until its last
+   *     sweep), and removing the hold-spent comment fails TWO (was one).
+   *
+   *     ⛔ Those three counts moved because a test was ADDED, not because
+   *     anything regressed, which is the whole hazard of a counted control:
+   *     it is read as a property of the MUTATION when it is a property of the
+   *     POPULATION. Re-measure all four counts in this block whenever a test
+   *     is added to it, or replace them with names as the list above was.
+   *
+   *     ⛔ The mixed-path test is the EXCEPTION and is why this carve-out is
+   *     no longer "every PEN-6719 HOLD test". It drives a real deferral through
+   *     `requestWakeupBestEffort` rather than asserting the flag into state, so
+   *     it DOES reach this branch and is named in the failing list above. Any
+   *     further hold test that stubs a `deferredForCapacity: true` host belongs
+   *     in that list too, not in this carve-out.
    *
    * Nothing else in the file moves: every existing wake test fixes
    * `deferredForCapacity` absent, which the `=== true` test reads as no claim.
@@ -2290,17 +2305,93 @@ describe("PEN-2918 attendance observations", () => {
     expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
     const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
     expect(body).toContain("still POSTPONED, not dropped");
-    expect(body).toContain("held this rung for 2 sweeps without re-waking");
+    expect(body).toContain("held this rung without re-waking while that retry stood");
     expect(body).toContain("The hold budget for this rung is spent; the ladder moves on at the next sweep.");
     // Never a claim that the deferral failed or that no run exists.
     expect(body).not.toContain("no run was queued");
     expect(body).not.toContain("enqueued nothing");
+    // ⛔ PEN-6719 follow-up — AND NO SWEEP COUNT. This sweep reaches the same
+    // state on the first-attempt path (where a count is exact) and on the mixed
+    // path below (where it overstates), so no count can be right on both. A
+    // pattern rather than a literal, so that reintroducing one in ANY wording
+    // fails here rather than only the wording that was removed.
+    expect(body).not.toMatch(/held this rung for \d+ sweep/);
+    expect(body).not.toContain("rather than stacking");
 
     const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
     const final = writes[writes.length - 1][1];
     expect(final.escalationWakePendingAgentId).toBeNull();
     expect(final.escalationWakeRetries).toBe(0);
     expect(final.escalationWakeDeferred).toBe(false);
+  });
+
+  /**
+   * ⛔ PEN-6719 follow-up — THE MIXED PATH: `declined` → `deferred` →
+   * hold-spent. No test covered it, and it is where the sweep count the
+   * hold-spent sentence used to carry was wrong.
+   *
+   * Every other hold test starts from a hand-written marker with
+   * `escalationWakeDeferred` already set — a deferral on the rung's FIRST
+   * attempt, where every sweep after it is held and `wakeRetries + 1` is exact.
+   * This drives the real state machine across three sweeps instead, so the
+   * deferral lands on a RETRY sweep. That sweep re-wakes, correctly: the marker
+   * it read said `declined`, for which the host committed nothing. So exactly
+   * ONE sweep is held, while `wakeRetries + 1` reads 2.
+   *
+   * ⛔ The state this arrives in is INDISTINGUISHABLE from the first-attempt
+   * path's — `escalationWakeRetries: 1`, `escalationWakeDeferred: true`,
+   * asserted below — which is why the count was DROPPED rather than corrected.
+   * Nothing at that call site can tell the two apart.
+   *
+   * The multi-sweep drive is the point and not incidental convenience: a
+   * hand-written fixture for this path would be byte-identical to the one the
+   * test above already uses, so only running the transitions can exercise it.
+   */
+  it("holds for one sweep, and claims no count, when the rung went `declined` before it went `deferred`", async () => {
+    const store = buildFakeAlertmanagerStore();
+    let live: AlertStateRecord = due({ escalationAttempt: 0 });
+    const { ctx, mocks } = sweepContext(live, "cto", store);
+    // The shared fixture serves one FIXED record; this rung has to carry its
+    // own marker forward, because the defect is in how the marker was reached.
+    mocks.state.get = vi.fn(async () => live);
+    mocks.state.set = vi.fn(async (_ref: unknown, next: AlertStateRecord) => { live = next; });
+    const outcomes: Array<Record<string, unknown>> = [
+      { queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" },
+      { queued: false, runId: null, undeliveredReason: null, deferredForCapacity: true },
+    ];
+    mocks.issues.requestWakeup = vi.fn(async () => outcomes.shift() ?? { queued: true, runId: "run-x" });
+
+    // Sweep 1 — the rung opens and the wake is DECLINED. No run was committed,
+    // so the marker records a plain delivery failure and no deferral.
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    expect(live.escalationWakeRetries).toBe(0);
+    expect(live.escalationWakeDeferred).toBe(false);
+
+    // Sweep 2 — a RETRY, because the marker says `declined`. It re-wakes, and
+    // this time the host DEFERS. Nothing is posted: the budget still remains.
+    // This is the sweep the old count silently swept into the hold.
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:30:00Z"));
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(live.escalationWakeRetries).toBe(1);
+    expect(live.escalationWakeDeferred).toBe(true);
+    const commentsBeforeHold = mocks.issues.createComment.mock.calls.length;
+
+    // Sweep 3 — the hold, and its last one. No wake, and one retraction whose
+    // only quantified claim would have been false.
+    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T02:00:00Z"));
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(2);
+    expect(mocks.issues.createComment.mock.calls.length).toBe(commentsBeforeHold + 1);
+    const [, body] = mocks.issues.createComment.mock.calls[commentsBeforeHold] as unknown as [string, string, string];
+    expect(body).toContain("still POSTPONED, not dropped");
+    expect(body).toContain("The hold budget for this rung is spent; the ladder moves on at the next sweep.");
+    // ⛔ The two claims that were false on THIS path: one sweep was held, not
+    // two, and sweep 2 did send a second wake.
+    expect(body).not.toMatch(/held this rung for \d+ sweep/);
+    expect(body).not.toContain("rather than stacking");
+    // ...and the retraction still never reads as the deferral having failed.
+    expect(body).not.toContain("no run was queued");
+    expect(body).not.toContain("enqueued nothing");
   });
 
   /** The sweep after that one climbs, exactly as a spent retry budget does. */
