@@ -159,7 +159,7 @@ jobs:
           exit 1
 
       - name: Download measured durations
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: shard-durations-*
           path: /tmp/shard-durations
