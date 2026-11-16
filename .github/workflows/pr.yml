@@ -2329,7 +2329,7 @@ jobs:
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: steps.select.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: pr-lockfile
@@ -2445,7 +2445,7 @@ jobs:
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: steps.trim.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: pr-lockfile
@@ -2659,7 +2659,7 @@ jobs:
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: steps.trim.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: pr-lockfile
@@ -2890,7 +2890,7 @@ jobs:
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: steps.select.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: pr-lockfile
@@ -4280,7 +4280,7 @@ jobs:
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: steps.select.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: pr-lockfile
@@ -4342,7 +4342,7 @@ jobs:
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: pr-lockfile
@@ -4540,7 +4540,7 @@ jobs:
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
         if: needs.policy.outputs.lockfile_regenerated == '1'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: pr-lockfile
