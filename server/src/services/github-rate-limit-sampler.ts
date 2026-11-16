@@ -329,9 +329,55 @@ export async function sampleGithubRateLimits(
   } = {},
 ): Promise<void> {
   const credentialsConfigured = deps.credentialsConfigured ?? githubAppCredentialsConfigured;
-  if (!credentialsConfigured()) return;
+  let token: string | null;
+  try {
+    // The unconfigured early return is DELIBERATELY silent -- it does not flag
+    // the probes, and that asymmetry with every other failure below is the
+    // point. `sample_success = 0` means "this tick tried to read and failed";
+    // a process with no App credentials never tried, and never published a
+    // value that could go stale, so an ABSENT series is the honest signal and
+    // a published zero would be a standing false alarm on every deployment
+    // that runs without the GitHub App on purpose. The predicate is an env
+    // read, so it is constant for the process lifetime: there is no state in
+    // which it flips and leaves a stale gauge behind. (PEN-6743, decided
+    // rather than inherited -- it was the second path raised there, and it is
+    // left on these grounds, not overlooked.)
+    //
+    // Note the two outcomes are NOT the same path: returning `false` is this
+    // silent return, while THROWING falls to the catch below and flags every
+    // probe. A predicate that could not answer did not tell us the App is
+    // unconfigured, and "could not determine" is a failed read.
+    if (!credentialsConfigured()) return;
+    token = await (deps.getToken ?? getInstallationToken)();
+  } catch (err) {
+    // A THROW anywhere above -- from the configuration predicate or from the
+    // token fetch -- is treated exactly as a null token, because the flag's entire
+    // job is to say whether this tick produced a reading, and it did not.
+    // Without this the rejection propagates to the scheduler's own
+    // `.catch`, which logs one line and touches NO gauge -- so every route's
+    // `sample_success` keeps its LAST value and a dead sampler reads as
+    // healthy, on the one gauge whose whole purpose is to report that the
+    // sampler is alive. That is the gate-polarity failure this module's
+    // header argues against everywhere else: the failed read's default
+    // coincides with the PASS value, so it returns a confident, correct-looking
+    // verdict instead of a suspicious blank.
+    //
+    // `getInstallationToken` does not throw today -- it wraps
+    // `getInstallationTokenResult`, which returns a typed failure for every
+    // path it can reach -- so this is latent rather than live. It is still
+    // load-bearing: `getToken` and `credentialsConfigured` are injection
+    // points any caller or test can supply a throwing implementation to, and
+    // a future throwing path inside the auth module reaches this with no
+    // change here at all. The defence would otherwise sit two modules away,
+    // in a function nobody editing it would know they were load-bearing for.
+    // (PEN-6743, from an Ally suggestion on #3626.)
+    logger.warn(
+      { err },
+      "github rate-limit sampler: could not obtain an installation token; flagging every probe",
+    );
+    token = null;
+  }
   const probes = deps.probes ?? githubRateLimitProbes();
-  const token = await (deps.getToken ?? getInstallationToken)();
   if (!token) {
     for (const probe of probes) setGithubRateLimitSample(probe.route, null);
     return;

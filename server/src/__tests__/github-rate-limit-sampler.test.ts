@@ -256,6 +256,74 @@ describe("sampleGithubRateLimits", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it("flags every probe when the token fetch THROWS, instead of leaving the last values standing", async () => {
+    // PEN-6743. A null token was always handled; a THROW was not, and the two
+    // failures are the same failure. An unguarded rejection propagates to the
+    // scheduler's own `.catch`, which logs one line and touches NO gauge, so
+    // every route's `sample_success` keeps its LAST value -- a dead sampler
+    // reading as healthy on the one gauge whose whole purpose is to report
+    // that the sampler is alive. That is the gate-polarity shape this suite
+    // pins everywhere else: the failed read's default coincides with the PASS
+    // value, so the verdict looks confident and correct instead of blank.
+    //
+    // Both halves are asserted on purpose. `sample_success = 0` is the fix;
+    // `remaining` STILL READING 4612 is the property the fix must not break,
+    // because publishing a zeroed remaining would fire the exhaustion alarm
+    // the sampler has just failed to observe.
+    const probes = [{ route: "probe-token-throw", path: "/rate_limit" }];
+    await sampleGithubRateLimits({
+      probes,
+      credentialsConfigured: () => true,
+      getToken: async () => "t",
+      fetchImpl: fetchReturning(response(GOOD)),
+    });
+    expect(await metricValue("paperclip_github_rate_limit_sample_success", "probe-token-throw")).toBe(1);
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    const fetchImpl = fetchReturning(response(GOOD));
+    try {
+      await expect(
+        sampleGithubRateLimits({
+          probes,
+          credentialsConfigured: () => true,
+          getToken: async () => {
+            throw new Error("mint failed");
+          },
+          fetchImpl,
+        }),
+      ).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(await metricValue("paperclip_github_rate_limit_sample_success", "probe-token-throw")).toBe(0);
+    expect(await metricValue("paperclip_github_rate_limit_remaining", "probe-token-throw")).toBe(4612);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("flags every probe when the configuration predicate THROWS, which is not the same as returning false", async () => {
+    // The silent return below is for a predicate that ANSWERED `false`. One
+    // that could not answer has told us nothing, so it is a failed read and
+    // gets the flag -- otherwise the identical stale-gauge hole sits one line
+    // above the catch that closes it. Both are injection points here, so a
+    // throwing implementation is reachable without touching the auth module.
+    const warn = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    const getToken = vi.fn(async () => "t");
+    try {
+      await sampleGithubRateLimits({
+        probes: [{ route: "probe-config-throw", path: "/rate_limit" }],
+        credentialsConfigured: () => {
+          throw new Error("config unreadable");
+        },
+        getToken,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+    expect(getToken).not.toHaveBeenCalled();
+    expect(await metricValue("paperclip_github_rate_limit_sample_success", "probe-config-throw")).toBe(0);
+  });
+
   it("does nothing at all when the App is not configured", async () => {
     const getToken = vi.fn(async () => "t");
     await sampleGithubRateLimits({
