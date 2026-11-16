@@ -69,7 +69,9 @@ let lastStallProfileAt = Number.NEGATIVE_INFINITY;
  * Production settings. Each rotation runs Profiler.stop + Profiler.start on the
  * main isolate and blocks the loop for seconds on a worker (start re-logs every
  * compiled function, whatever the sampling interval), so segments are long:
- * 2-min segments were a ~2 s stall every 2 min (BLO-57549).
+ * 2-min segments were a ~2 s stall every 2 min (BLO-57549). A 15-min segment
+ * spans the dump cooldown, so a dump's longest busy run may be an earlier stall
+ * than the one that triggered it: compare `triggerStallMs` to `longestBusyMs`.
  */
 export const CPU_FLIGHT_RECORDER_PRODUCTION_OPTS = { segmentMs: 900_000, samplingIntervalUs: 10_000 } as const;
 
