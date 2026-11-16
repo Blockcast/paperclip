@@ -926,6 +926,18 @@ function configuredTestTimeout(projectDir) {
 //     this entry stays scoped to the BODY arm, which is what it was written
 //     for.
 //
+// PEN-6770 2026-11-16 AMENDS BOTH ENTRIES, not only the alertmanager one, and
+// the amendment is why the booting-HOOK floor at the foot of this file exists
+// beside PEN-6759's override sweep. Each entry above excuses its bodies by
+// pointing at the package's 120s `hookTimeout` -- and that premise was false
+// for 14 hooks across both packages, because a per-hook timeout ARGUMENT CAPS
+// that config rather than raising it. The alertmanager entry is the sharp
+// case: `description-notes.test.ts` booted on `beforeAll(fn, 30_000)` and
+// ejected #3831 in exactly the hook this entry calls covered. The arguments
+// are gone and the coverage is now ENFORCED by the booting-hook floor below
+// rather than assumed here -- so read these two entries as resting on that
+// sweep, and do not re-derive "the hooks are fine" from the config alone.
+//
 // WHAT WOULD SETTLE EITHER: a `Test timed out` in one of these bodies in a
 // merge_group run, or a measurement of copyEmbeddedPostgresTemplate's per-suite
 // cost on the contended pool. The template path (one migrated cluster per job,
@@ -1382,5 +1394,275 @@ test("configuredHookTimeout reads the number, not the prose", () => {
     120_000,
     `expected ${dir} to read 120000ms. If that package's config changed, re-point this control ` +
       `at another config whose comments name several budgets -- do not simply delete it.`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// PEN-6770. The booting-HOOK floor.
+//
+// READ THIS FIRST IF YOU ARE ABOUT TO DELETE ONE OF THE TWO HOOK SWEEPS. The
+// sweep immediately above (`hookOverridesUnderConfig`, PEN-6759) and this one
+// were written about three hours apart by two seats who had each found the
+// same ejection independently, and they look like duplicates. They are not,
+// and NEITHER SUBSUMES THE OTHER:
+//
+//   RELATIVE (PEN-6759, above) -- population: hooks whose body text matches
+//     HOOK_IO. Predicate: `budgetMs < configured`, i.e. an override that
+//     undercuts whatever its own project happened to declare. A hook passing
+//     NO argument can never be an offender there; nothing is "downward".
+//   ABSOLUTE (this one) -- population: hooks that BOOT an embedded Postgres,
+//     including through a file-local wrapper. Predicate:
+//     `effectiveMs < EMBEDDED_POSTGRES_HOOK_FLOOR_MS`, against the ~40s
+//     startup BLO-17026 measured on the contended ARC pool.
+//
+// Two holes this closes that a relative test structurally cannot: (1) a
+// project declaring a SUB-FLOOR `hookTimeout` -- or none, where this falls
+// back to Vitest's bare 10s -- whose booting hook passes no argument: it
+// undercuts nothing, so it is invisible above and under-budgeted here;
+// (2) a hook reaching its boot only through a file-local wrapper, which the
+// relative sweep's direct-text `HOOK_IO.test(body)` does not match -- the
+// exact miss PEN-6254 landed one sweep over. Conversely the relative sweep
+// covers non-booting real-I/O hooks, which this one deliberately scopes out.
+// Delete neither.
+//
+// The hole this was written for is the one that ejected #3831 from the merge
+// queue on 2026-11-16, and it had survived three sweeps:
+//
+//   1. the declaration sweep asks "did this project CHOOSE budgets?" -- a
+//      boolean, answered by the config alone;
+//   2. the booting-BODY floor resolves an OVERRIDE against a floor, because
+//      "a guard that reads the config and stops is defeated by an override it
+//      never looks at" -- but it looks at `it`/`test` bodies only;
+//   3. the real-I/O hook sweep asks the hook question, and asks it as a
+//      DECLARATION again -- never compared to any budget at all.
+//
+// So nobody resolved an EFFECTIVE hook budget against a floor. #3831's head
+// was comment-only and had nothing to do with it: the merge_group run died in
+// `description-notes.test.ts`'s `beforeAll` with "Hook timed out in 30000ms"
+// at zero failed tests, on a worker whose own header read `import 209.59s`.
+// `paperclip-plugin-alertmanager/vitest.config.ts` declares
+// `hookTimeout: 120_000` -- and `beforeAll(fn, 30_000)` wins over it.
+//
+// A per-hook timeout ARGUMENT CAPS the project's `hookTimeout`; it does not
+// raise it. That is the whole defect, and the inline values are older than the
+// config that they now undercut: `1357e3cd0` (2026-09-26) added `}, 30_000)`
+// when the package had no vitest.config.ts at all, so against Vitest's bare 10s
+// default it was a RAISE and it was right. `91e9f56c` (2026-09-28, BLO-37114)
+// added the 120s config and left the arguments in place. From that commit the
+// same literal was a cap, and three later suites copied the shape from the
+// files that already carried it.
+//
+// Discriminated from the confound before this was written: CI passes
+// `--testTimeout=30000` on this lane (scripts/run-vitest-stable.mjs,
+// `arcWorkspaceVitestArgs`) -- the same number -- so the log string alone
+// cannot attribute it. Two-arm probe on vitest 4.1.8, root `projects`, package
+// `hookTimeout: 120_000`, 45s hook, run with `--testTimeout=30000`:
+// `beforeAll(fn, 30_000)` FAILED with the exact CI string, `beforeAll(fn)`
+// PASSED. The arms differ, so the flag does not reach hooks, the package config
+// does, and the inline argument is the cap.
+//
+// This sweep is the hook-shaped twin of the booting-BODY floor above: same
+// floor, same justification (BLO-17026 measured embedded-Postgres startup at
+// ~40s on the contended ARC pool), same resolution rule -- the inline override
+// where one exists, the project config otherwise.
+//
+// Like that one, it is NOT a hang detector and must not be re-tuned as one:
+// pr.yml's job `timeout-minutes` is the hang detector (BLO-35615). Raising a
+// hook budget cannot make a passing hook fail; it only lets a slow boot finish.
+//
+// SCOPE, stated because it is narrower than "hooks that do I/O": this resolves
+// budgets for hooks that START an embedded Postgres, which is the population
+// whose cost BLO-17026 actually measured. A TEARDOWN hook has no such
+// measurement behind it, so it is deliberately left to the real-I/O hook
+// sweep's declaration check rather than held to a floor nobody has justified.
+// That is why `packages/db/src/pipelines-schema.test.ts` keeps its
+// while its `beforeAll` gives its argument up.
+// ---------------------------------------------------------------------------
+
+// `configuredHookTimeout` is deliberately NOT redefined here: the override
+// sweep above already defines it, and PEN-6759 and PEN-6770 had each written
+// their own copy, byte-identical in code once the comments are stripped. Two
+// top-level `function`s of one name in an ES module is a SyntaxError, not a
+// shadow, so the duplicate was dropped at the rebase rather than renamed.
+
+const EMBEDDED_POSTGRES_HOOK_FLOOR_MS = 120_000;
+
+// Every hook in `code` that reaches a boot, with the per-hook budget attached
+// (null when it inherits the project config). Split from the file-reading
+// wrapper for the same reason as its body-shaped twin: the discrimination
+// control feeds it a synthetic source, and a sweep that cannot be shown to
+// REJECT is not a sweep.
+function bootingHooksInSource(code, label) {
+  if (!BOOTS_EMBEDDED_POSTGRES.test(code)) return [];
+
+  // Resolved exactly as the body sweep resolves them. A hook that boots only
+  // through a file-local wrapper is the miss that let PEN-6254 land one sweep
+  // over, and re-deriving a weaker detector here would reintroduce it.
+  const helpers = bootingHelperNames(code);
+  const reachesBoot = (body) =>
+    BOOTS_EMBEDDED_POSTGRES.test(body) || [...helpers].some((name) => callsHelper(body, name));
+
+  const hooks = [];
+  const openers = /\b(?:beforeAll|afterAll|beforeEach|afterEach)\s*\(/g;
+  let match;
+  while ((match = openers.exec(code))) {
+    const close = matchingParen(code, openers.lastIndex - 1);
+    if (close === -1) continue;
+    const body = code.slice(match.index, close + 1);
+    openers.lastIndex = close + 1;
+    if (!reachesBoot(body)) continue;
+    const budget = /,(\s*)([0-9_]+)(\s*,?\s*)\)$/.exec(body.slice(-40));
+    hooks.push({
+      file: label,
+      line: code.slice(0, match.index).split("\n").length,
+      hook: match[0].replace(/\s*\($/, ""),
+      budgetMs: budget ? Number(budget[2].replace(/_/g, "")) : null,
+    });
+  }
+  return hooks;
+}
+
+function bootingHooks(file) {
+  return bootingHooksInSource(readFileSync(file, "utf8"), path.relative(repoRoot, file));
+}
+
+// Effective budget = per-hook override, else the project's configured
+// hookTimeout, else Vitest's bare 10s default.
+//
+// There is deliberately NO exception table here. Every project that boots
+// embedded Postgres in a hook already declares `hookTimeout: 120_000` (server,
+// packages/db, cli, paperclip-plugin-alertmanager), so the config arm has no
+// offenders to excuse, and an empty exception map is dead text that only ever
+// grows a hole. The override arm is never excused in any package, for the
+// reason the body sweep gives: an override is a local statement that this hook
+// needs something other than what its package chose, and one set below the
+// floor on a booting hook is the defect this guard exists for.
+function underBudgetedBootingHooks() {
+  const offenders = [];
+  for (const projectDir of readConfiguredProjectDirs()) {
+    const configured = configuredHookTimeout(projectDir) ?? 10_000;
+    for (const file of testFilesUnder(path.join(repoRoot, projectDir))) {
+      for (const hook of bootingHooks(file)) {
+        const effectiveMs = hook.budgetMs ?? configured;
+        if (effectiveMs >= EMBEDDED_POSTGRES_HOOK_FLOOR_MS) continue;
+        offenders.push({
+          ...hook,
+          projectDir,
+          effectiveMs,
+          source: hook.budgetMs === null ? "config" : "per-hook",
+        });
+      }
+    }
+  }
+  return offenders;
+}
+
+test("every hook that boots embedded Postgres budgets above the ARC startup cost", () => {
+  const offenders = underBudgetedBootingHooks();
+
+  assert.deepEqual(
+    offenders.map(({ file, line, hook, effectiveMs, source }) => `${file}:${line} ${hook} ${effectiveMs}ms (${source})`),
+    [],
+    `These HOOKS start an embedded Postgres inside a budget smaller than ` +
+      `${EMBEDDED_POSTGRES_HOOK_FLOOR_MS}ms, and BLO-17026 measured that startup at ~40s on the ` +
+      `contended ARC pool. They do not fail on their own merits -- they fail when the pool is ` +
+      `busy, and on merge_group that ejects the candidate and costs a full re-traverse of the ` +
+      `queue (PEN-6770, #3831).\n` +
+      `A per-hook timeout ARGUMENT CAPS the project's hookTimeout rather than raising it, so a ` +
+      `package can declare 120s, pass every other sweep in this file, and still boot on 30s. ` +
+      `DROP the inline argument so the project's hookTimeout carries the boot -- do not raise the ` +
+      `argument to match, which leaves the same cap one number later:\n` +
+      offenders
+        .map(({ file, line, hook, effectiveMs, source }) => `  - ${file}:${line} ${hook} ${effectiveMs}ms from ${source}`)
+        .join("\n"),
+  );
+});
+
+test("the booting-hook detector is not vacuous", () => {
+  // Positive control. Without it, a rename of the boot helpers -- or a change
+  // to how hook bodies are sliced -- would make the sweep above pass by
+  // matching nothing at all, which is the same fail-open shape as the inert CLI
+  // flags documented further up this file, and exactly how this hole survived
+  // three sweeps. The anchors are the two boot spellings BOOTS_EMBEDDED_POSTGRES
+  // knows: the embedded cluster (server) and PGlite (alertmanager).
+  for (const anchor of ["server", "packages/plugins/paperclip-plugin-alertmanager"]) {
+    const found = testFilesUnder(path.join(repoRoot, anchor)).flatMap((file) => bootingHooks(file));
+    assert.ok(
+      found.length > 0,
+      `expected the booting-hook detector to find booting hooks under ${anchor}, got none`,
+    );
+  }
+});
+
+test("the booting-hook detector discriminates", () => {
+  // Must-reject, and this is the assertion that pins the actual regression:
+  // an inline argument BELOW the floor has to be reported even though the
+  // project config is above it. Scoring this clean is the defect.
+  const capped = bootingHooksInSource(
+    `beforeAll(async () => {
+       db = new PGlite();
+       await applyMigrations(db);
+     }, 30_000);`,
+    "<synthetic-capped>",
+  );
+  assert.deepEqual(
+    capped.map(({ hook, budgetMs }) => `${hook}:${budgetMs}`),
+    ["beforeAll:30000"],
+    "a hook whose inline argument caps the project hookTimeout was not detected",
+  );
+
+  // Must-accept as INHERITING: no argument means the project config carries
+  // it, which is the shape the fix produces. Reporting a budget here would
+  // make the sweep demand an inline argument -- the opposite of the fix.
+  const inherits = bootingHooksInSource(
+    `beforeAll(async () => {
+       tempDb = await startEmbeddedPostgresTestDatabase("probe-");
+     });`,
+    "<synthetic-inherits>",
+  );
+  assert.deepEqual(
+    inherits.map(({ hook, budgetMs }) => `${hook}:${budgetMs}`),
+    ["beforeAll:null"],
+    "a hook with no inline argument was not scored as inheriting the project config",
+  );
+
+  // Must see through a file-local wrapper, same miss the body sweep measured.
+  const viaWrapper = bootingHooksInSource(
+    `async function startDatabase(prefix) {
+       return startEmbeddedPostgresTestDatabase(prefix);
+     }
+     beforeAll(async () => {
+       tempDb = await startDatabase("probe-");
+     }, 60_000);`,
+    "<synthetic-hook-wrapper>",
+  );
+  assert.deepEqual(
+    viaWrapper.map(({ hook, budgetMs }) => `${hook}:${budgetMs}`),
+    ["beforeAll:60000"],
+    "the booting-hook detector cannot see through a file-local wrapper",
+  );
+
+  // Must-reject: a hook that only USES an already-booted handle boots nothing,
+  // and demanding a budget for it is the over-match that inflated one package
+  // 7 -> 77 when the body sweep was first drafted.
+  assert.deepEqual(
+    bootingHooksInSource(
+      `beforeEach(async () => { await db.query(truncateAll); }, 5_000);`,
+      "<synthetic-receives>",
+    ),
+    [],
+    "a hook that only uses an existing handle was scored as booting one",
+  );
+
+  // Must-reject: a boot in a TEST body is the booting-BODY floor's hazard, on a
+  // different knob. Scoring it here would double-report it and would demand a
+  // hook budget for something no hook runs.
+  assert.deepEqual(
+    bootingHooksInSource(
+      `it("boots", async () => { const db = new PGlite(); expect(db).toBeTruthy(); }, 30_000);`,
+      "<synthetic-body>",
+    ),
+    [],
+    "a boot in a test body was scored against the hook budget",
   );
 });
