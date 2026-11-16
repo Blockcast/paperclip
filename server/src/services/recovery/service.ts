@@ -3228,7 +3228,8 @@ export function recoveryService(
    * returns `completed` from `if (issueStatus === "done" || issueStatus === "cancelled")`,
    * which short-circuits ABOVE the first consultation of `concreteEvidence` — so a succeeded
    * run that merely woke onto an already-terminal row is classified `completed` whether or
-   * not it did anything. `advanced` is evidence-derived; `completed` is row-state-derived.
+   * not it did anything. `advanced` requires concrete evidence, or useful output on a
+   * plan-exempt task; `completed` is row-state-derived and requires neither.
    * Accepting both re-admitted exactly the no-op class `livenessState` was chosen to exclude,
    * and it does so in the fail-open direction: the row is handed back to an owner that has
    * not demonstrably recovered. The guard is therefore scoped to the `completed` arm.
@@ -3263,8 +3264,12 @@ export function recoveryService(
         eq(heartbeatRuns.agentId, agentId),
         eq(heartbeatRuns.status, "succeeded"),
         or(
-          // Evidence-derived: `classifyRunLiveness` reaches this state only under
-          // `if (concreteEvidence)`, so the state IS the evidence and needs no second term.
+          // Evidence-derived, or plan-exempt with useful output: `classifyRunLiveness`
+          // returns `advanced` from `if (concreteEvidence)` AND from
+          // `if (planExempt && usefulOutput)`. The second arm carries no concrete
+          // evidence and so stamps a null `lastUsefulActionAt` — but it still requires
+          // non-empty useful output, so it is not the no-op class this guard is for,
+          // and a second term here would exclude every planning/document task.
           eq(heartbeatRuns.livenessState, "advanced"),
           // Row-state-derived: carries no evidence guarantee of its own, so require the
           // stamp the same classification wrote alongside it.
