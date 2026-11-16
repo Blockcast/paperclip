@@ -2274,41 +2274,56 @@ jobs:
     # and that chain is TWO mechanisms, not one. An earlier list here named
     # five units as co-located; they are not (measured first-party on job
     # 132905274049, PEN-6723):
-    #   * typecheck:build-gaps runs ONE serial loop, over the workspace
-    #     packages whose build script skips tsc -- cli 209s, ui 222s,
+    #   * typecheck:build-gaps runs ONE loop, over the workspace packages
+    #     whose build script skips tsc -- cli 209s, ui 222s,
     #     paperclip-plugin-slack 34s, plugin-llm-wiki 23s,
-    #     plugin-authoring-smoke-example 22s = 510s. Membership is the pnpm
-    #     WORKSPACE set, so pnpm-workspace.yaml's exclusions are
-    #     load-bearing; a filesystem walk over-counts it.
+    #     plugin-authoring-smoke-example 22s. Those ran in SERIES for 510s
+    #     when this was measured; remedy (a) below has since made them
+    #     concurrent, so that 510s is the BEFORE figure, not the live one.
+    #     Membership is the pnpm WORKSPACE set, so pnpm-workspace.yaml's
+    #     exclusions are load-bearing; a filesystem walk over-counts it.
     #   * the server-test identifier check (219s) and the allowlisted server
     #     tests (171s) are separate JOB STEPS of this job. Steps within a
     #     job are strictly serial and cannot be parallelised at all without
     #     being merged into one `run:` block.
-    # Two fixes cost no extra runner slot and are preferred over splitting
+    # Two fixes cost no extra runner slot and were preferred over splitting
     # this into parallel jobs, because arc-paperclip-general is separately
     # starving (13 jobs in the same sample never got a runner at all, one
     # waiting 136 minutes, so a job split spends capacity on the pool
-    # already short):
-    #   (a) parallelise the typecheck:build-gaps loop -- ceiling 510s ->
-    #       ~222s, bounded by ui, i.e. -288s at perfect parallelism and less
-    #       under core contention. HAZARD, invisible from this file: loop
-    #       members do not share a lock. Members that call plugin-sdk
-    #       `ensure-build-deps` serialise on
-    #       node_modules/.cache/paperclip-plugin-build-deps.lock with a 60s
-    #       timeout that THROWS; a member calling plugin-sdk `build` instead
-    #       takes NO lock and writes the same dist. Keep every member on
-    #       `ensure-build-deps` before parallelising this loop.
-    #   (b) stop rebuilding the server here. typecheck:build-gaps runs a
-    #       full `pnpm --filter @paperclipai/server build` -- 253s = 17% of
+    # already short). BOTH HAVE NOW LANDED (PEN-6723). Neither saving below
+    # has been re-measured on this lane yet, so read them as predictions and
+    # take the observed draw from PEN-6723 before citing a number:
+    #   (a) parallelise the typecheck:build-gaps loop -- LANDED. The five
+    #       members ran in series (cli 209s, ui 222s, paperclip-plugin-slack
+    #       34s, plugin-llm-wiki 23s, plugin-authoring-smoke-example 22s =
+    #       510s); they now run concurrently, ceiling ~222s bounded by ui,
+    #       i.e. -288s at perfect parallelism and less under core contention.
+    #       STANDING INVARIANT, invisible from this file and enforced by NO
+    #       check: loop members do not share a lock. The loop hoists one
+    #       plugin-sdk `ensure-build-deps` before the concurrent section,
+    #       which leaves every output fresh, so each member's own
+    #       `ensure-build-deps` returns on ensure-plugin-build-deps.mjs's
+    #       LOCK-FREE fast path and never creates the lock directory. That
+    #       holds only while (i) every workspace consuming plugin-sdk calls
+    #       `ensure-build-deps` and NOT plugin-sdk `build`, which takes no
+    #       lock while writing the same dist, and (ii) no loop member EMITS,
+    #       which would invalidate a sibling's freshness mid-flight. Break
+    #       either and the members race on a 60s lock timeout that THROWS.
+    #       `TYPECHECK_BUILD_GAPS_CONCURRENCY=1` restores the serial loop
+    #       without a revert.
+    #   (b) stop rebuilding the server here -- LANDED. This lane used to run
+    #       a full `pnpm --filter @paperclipai/server build` -- 253s = 17% of
     #       the job on the run above, 385s = 16% on an earlier slower draw
-    #       -- and its only consumer in this lane is
-    #       checkServerRuntimeAssets(), a ten-file presence assertion over
-    #       server/dist. Nothing typechecked here reads server/dist: ui is
-    #       noEmit with no `references`, and cli includes only its own src,
-    #       packages/shared/src and create-paperclip-plugin/src. Before
-    #       dropping it, close two cheap gaps -- the small plugins'
-    #       tsconfigs, and whether any step OUTSIDE this job relies on this
-    #       job having built the server.
+    #       -- whose only consumer here was checkServerRuntimeAssets(), a
+    #       ten-file presence assertion over server/dist. Nothing typechecked
+    #       here reads server/dist: ui is noEmit with no `references`, and
+    #       cli includes only its own src, packages/shared/src and
+    #       create-paperclip-plugin/src. That guard now runs from the root
+    #       `build` script via `--runtime-assets-only`, where `pnpm -r build`
+    #       has just produced the dist it inspects. COVERAGE IS UNCHANGED --
+    #       server's own `build` script emits that dist in both placements --
+    #       and NEITHER placement guards the image that ships, which the
+    #       Dockerfile builds with a `pnpm --filter <pkg> build` per package.
     #
     # Re-measuring note, because two instrument faults invert the reading: a
     # job that never got a runner reports started_at == created_at, so its
@@ -2407,7 +2422,7 @@ jobs:
       #
       # `ensure-build-deps` is NOT redundant with `typecheck:build-gaps`: that
       # script only runs it inside `if (buildGapPackages.length > 0)`
-      # (scripts/run-typecheck-build-gaps.mjs:178-179), so the prerequisite is
+      # (see scripts/run-typecheck-build-gaps.mjs), so the prerequisite is
       # contingent on an unrelated set being non-empty. It is declared inside
       # `typecheck:tests` rather than inlined here, so the invocation has ONE
       # definition that this step and server's own `typecheck` both reach.

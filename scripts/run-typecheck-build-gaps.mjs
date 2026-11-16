@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import os from "node:os";
 
 const repoRoot = process.cwd();
 const args = new Set(process.argv.slice(2));
@@ -178,11 +179,144 @@ console.log(
   `[typecheck:build-gaps] typechecking ${buildGapPackages.length} workspace(s): ${buildGapPackages.map(({ name }) => name).join(", ") || "(none)"}`,
 );
 
+function resolveConcurrency(packageCount) {
+  const configured = process.env.TYPECHECK_BUILD_GAPS_CONCURRENCY;
+
+  if (configured !== undefined && configured.trim() !== "") {
+    const parsed = Number(configured);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      fail(
+        `TYPECHECK_BUILD_GAPS_CONCURRENCY must be a positive integer, got ${JSON.stringify(configured)}`,
+      );
+    }
+    return Math.min(parsed, packageCount);
+  }
+
+  const cpuCount =
+    typeof os.availableParallelism === "function"
+      ? os.availableParallelism()
+      : (os.cpus()?.length ?? 1);
+
+  return Math.max(1, Math.min(packageCount, cpuCount));
+}
+
+// Output is captured rather than inherited: these run concurrently, so
+// interleaving them into the job log would make a tsc error unattributable to
+// the workspace that raised it. Each run's buffer is printed as one block, under
+// a header naming the workspace, by reportWorkspaceResult below.
+function typecheckWorkspace(workspacePkg) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const child = spawn("pnpm", ["--filter", workspacePkg.name, "typecheck"], {
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    const chunks = [];
+    child.stdout.on("data", (chunk) => chunks.push(chunk));
+    child.stderr.on("data", (chunk) => chunks.push(chunk));
+
+    // `error` and `close` can both fire (a failed spawn still closes), so the
+    // first one to arrive wins and the other is dropped.
+    let settled = false;
+    const settle = (status, extraOutput = "") => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({
+        name: workspacePkg.name,
+        status,
+        durationMs: Date.now() - startedAt,
+        output: Buffer.concat(chunks).toString("utf8") + extraOutput,
+      });
+    };
+
+    child.on("error", (error) => {
+      settle(1, `[typecheck:build-gaps] Failed to spawn pnpm: ${error.message}\n`);
+    });
+
+    child.on("close", (code, signal) => {
+      settle(
+        code ?? 1,
+        signal ? `[typecheck:build-gaps] terminated by signal ${signal}\n` : "",
+      );
+    });
+  });
+}
+
+// Results are written back at the item's ORIGINAL index, so `results` is in
+// workspace order however the runs interleave -- which is what makes the exit
+// status below deterministic.
+async function runWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function pump() {
+    for (;;) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await worker(items[index]);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, pump));
+
+  return results;
+}
+
+function reportWorkspaceResult(result) {
+  const seconds = (result.durationMs / 1000).toFixed(1);
+  const verdict = result.status === 0 ? "ok" : `FAILED (exit ${result.status})`;
+  const body = result.output === "" || result.output.endsWith("\n") ? result.output : `${result.output}\n`;
+
+  process.stdout.write(
+    `\n[typecheck:build-gaps] ----- ${result.name}: ${verdict} in ${seconds}s -----\n${body}`,
+  );
+}
+
 if (buildGapPackages.length > 0) {
+  // Hoisted deliberately, and it is what makes the concurrent section below
+  // safe. ensure-plugin-build-deps.mjs returns on a LOCK-FREE fast path when
+  // every output is already fresh, so once this call has run, each member's own
+  // `ensure-build-deps` exits 0 without ever creating the lock directory -- the
+  // 60s lock timeout is unreachable rather than merely unlikely. Two conditions
+  // keep that true and are checked by nothing here: every workspace that
+  // consumes plugin-sdk must call `ensure-build-deps` and NOT plugin-sdk
+  // `build`, which takes no lock while writing the same dist; and no loop member
+  // may EMIT (today cli and the three plugins are `tsc --noEmit`, and ui is
+  // `tsc -b` over a `noEmit` project with no `references`), since an emitting
+  // member could invalidate a sibling's freshness mid-flight.
   run("pnpm", ["--filter", "@paperclipai/plugin-sdk", "ensure-build-deps"]);
 
-  for (const workspacePkg of buildGapPackages) {
-    run("pnpm", ["--filter", workspacePkg.name, "typecheck"]);
+  const concurrency = resolveConcurrency(buildGapPackages.length);
+  console.log(
+    `[typecheck:build-gaps] running ${buildGapPackages.length} typecheck(s), concurrency ${concurrency}`,
+  );
+
+  const results = await runWithConcurrency(buildGapPackages, concurrency, async (workspacePkg) => {
+    const result = await typecheckWorkspace(workspacePkg);
+    reportWorkspaceResult(result);
+    return result;
+  });
+
+  // Every member runs even once one has failed, so a single job reports every
+  // broken workspace instead of only the first. The exit status is the first
+  // failure in workspace order, which is what the previous serial loop exited
+  // with. process.exitCode rather than process.exit() so the buffered output
+  // above is flushed before the process ends.
+  const failures = results.filter((result) => result.status !== 0);
+  if (failures.length > 0) {
+    console.error(
+      `[typecheck:build-gaps] ${failures.length} of ${results.length} workspace typecheck(s) failed: ${failures
+        .map(({ name }) => name)
+        .join(", ")}`,
+    );
+    process.exitCode = failures[0].status;
   }
 }
 
@@ -197,10 +331,23 @@ if (buildGapPackages.length > 0) {
 // scripts/.
 //
 // The guard now runs from the root `build` script instead, via
-// `--runtime-assets-only`, which is where `pnpm -r build` has just produced the
-// dist it inspects. That is strictly STRONGER, not merely cheaper: here it
-// checked a dist built by an invocation that existed only to feed it, where in
-// `build` it checks the dist the real build emits. pr.yml's Build lane runs
-// `pnpm build` under the identical path selector as this lane
-// (`release_dry_run_needed`), so the two run and skip together and no diff that
-// can reach the server build escapes the check.
+// `--runtime-assets-only`, where `pnpm -r build` has just produced the dist it
+// inspects. COVERAGE IS UNCHANGED AND COST IS WHAT CHANGED: the producer is the
+// same in both placements -- server's own `build` script emits that dist, and
+// `pnpm -r build` runs that same script -- so the guard inspects bytes made by
+// the same invocation either way. An earlier revision of this comment called the
+// move "strictly STRONGER, not merely cheaper"; that was wrong and is WITHDRAWN.
+// pr.yml's Build lane runs `pnpm build` under the identical path selector as
+// this lane (`release_dry_run_needed`), so the two run and skip together and no
+// diff that can reach the server build escapes the check.
+//
+// ⚠ Neither placement guards the image that SHIPS. The Dockerfile builds each
+// package with its own `pnpm --filter <pkg> build`, ending at
+// `pnpm --filter @paperclipai/server build`, and never invokes root `pnpm build`
+// -- so do not read this move as extending coverage to the published image.
+//
+// ⚠ One speculative bound, recorded so it is not mistaken for a finding: under
+// `pnpm -r build` the guard runs after EVERY package has built, so a future
+// package whose build clobbered server/dist would be caught here where the old
+// build-server-then-check ordering would have missed it. There is no such
+// package today and no instance has been observed.
