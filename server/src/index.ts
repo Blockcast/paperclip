@@ -77,7 +77,16 @@ import {
   schedulerLeaseHolder,
   type SchedulerLeaseHolder,
 } from "./services/scheduler-lease.js";
-import { superviseWorkerSingleton } from "./services/worker-singleton-supervisor.js";
+import {
+  superviseWorkerSingleton,
+  type WorkerSingletonStartPhase,
+} from "./services/worker-singleton-supervisor.js";
+import {
+  APPROVAL_GATE_RECONCILER_TICK_PHASE,
+  MERGED_PR_RECONCILER_TICK_PHASE,
+  PR_REVIEW_STATE_RECONCILER_TICK_PHASE,
+  TERMINAL_GATE_RECONCILER_TICK_PHASE,
+} from "./services/reconciler-tick-phase.js";
 import { setDbInheritedTimeouts } from "./services/metrics.js";
 import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
@@ -1042,8 +1051,30 @@ export async function startServer(): Promise<StartedServer> {
   // Stop handles, so shutdown can stop every singleton before it releases the
   // lease rather than leave this process running them beside the next holder.
   const workerSingletonStops: Array<() => void> = [];
-  const superviseLeased = (name: string, start: () => (() => void) | void) => {
-    workerSingletonStops.push(superviseWorkerSingleton(name, shouldRunWorkerSingletons, start));
+  /**
+   * PEN-6750. `startPhase` pins a loop's FIRST tick -- and so, since
+   * `setInterval` preserves phase, every subsequent tick -- to a chosen minute,
+   * rather than to whatever minute this pod happened to acquire the lease at.
+   * Omit it and the loop starts immediately, exactly as before.
+   *
+   * Kill switch: `PAPERCLIP_RECONCILER_TICK_PHASE_ENABLED=false` restores the
+   * immediate start for every loop without reverting the chosen minutes. It
+   * exists because a phase costs up to one alignment period of delay before the
+   * first tick after a restart, and an operator mid-incident should be able to
+   * buy that back without a deploy.
+   */
+  const reconcilerTickPhaseEnabled =
+    process.env.PAPERCLIP_RECONCILER_TICK_PHASE_ENABLED !== "false";
+  const superviseLeased = (
+    name: string,
+    start: () => (() => void) | void,
+    { startPhase }: { startPhase?: WorkerSingletonStartPhase } = {},
+  ) => {
+    workerSingletonStops.push(
+      superviseWorkerSingleton(name, shouldRunWorkerSingletons, start, {
+        startPhase: reconcilerTickPhaseEnabled ? (startPhase ?? null) : null,
+      }),
+    );
   };
   // BLO-47803: a follower worker forwards plugin routes to the lease holder.
   const resolvePluginHolderUrl = leaseHolderUrlResolver(db as any, {
@@ -2934,11 +2965,16 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "Merged-PR reconciler sweep failed");
         });
       // BLO-46694: lease holder only.
-      superviseLeased("merged-pr-reconciler", () => {
-        runReconcilerSweepTick();
-        const timer = setInterval(runReconcilerSweepTick, reconcilerIntervalMs);
-        return () => clearInterval(timer);
-      });
+      superviseLeased(
+        "merged-pr-reconciler",
+        () => {
+          runReconcilerSweepTick();
+          const timer = setInterval(runReconcilerSweepTick, reconcilerIntervalMs);
+          return () => clearInterval(timer);
+        },
+        // PEN-6750: a stated minute-of-hour, not the lease minute.
+        { startPhase: MERGED_PR_RECONCILER_TICK_PHASE },
+      );
     }
   }
 
@@ -3318,12 +3354,18 @@ export async function startServer(): Promise<StartedServer> {
         "Open-PR review-state reconciler enabled (BLO-30259)",
       );
       // BLO-46694: lease holder only.
-      superviseLeased("pr-review-state-reconciler", () =>
-        startPrReviewStateReconciler(
-          db,
-          config.prReviewStateReconcilerIntervalMinutes * 60 * 1000,
-          { maxPullRequests: config.prReviewStateMaxPullRequestsPerRepo },
-        ),
+      superviseLeased(
+        "pr-review-state-reconciler",
+        () =>
+          startPrReviewStateReconciler(
+            db,
+            config.prReviewStateReconcilerIntervalMinutes * 60 * 1000,
+            { maxPullRequests: config.prReviewStateMaxPullRequestsPerRepo },
+          ),
+        // PEN-6750: the other 360-minute GitHub reader. A different minute from
+        // `merged-pr-reconciler` on purpose -- same interval, so a shared minute
+        // is a shared tick instant for the life of the process.
+        { startPhase: PR_REVIEW_STATE_RECONCILER_TICK_PHASE },
       );
     }
   }
@@ -3347,8 +3389,14 @@ export async function startServer(): Promise<StartedServer> {
         "Approval-gate reconciler enabled (BLO-29359)",
       );
       // BLO-46694: lease holder only.
-      superviseLeased("approval-gate-reconciler", () =>
-        startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000),
+      superviseLeased(
+        "approval-gate-reconciler",
+        () =>
+          startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000),
+        // PEN-6750: a 10-minute loop cannot dodge the exhausted band -- six
+        // ticks an hour put two of them inside any 20-minute window -- so this
+        // buys stagger against `terminal-gate-reconciler`, not budget.
+        { startPhase: APPROVAL_GATE_RECONCILER_TICK_PHASE },
       );
     }
   }
@@ -3380,11 +3428,15 @@ export async function startServer(): Promise<StartedServer> {
         "Terminal-gate reconciler enabled (BLO-27515)",
       );
       // BLO-46694: lease holder only.
-      superviseLeased("terminal-gate-reconciler", () =>
-        startTerminalGateReconciler(
-          db,
-          config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
-        ),
+      superviseLeased(
+        "terminal-gate-reconciler",
+        () =>
+          startTerminalGateReconciler(
+            db,
+            config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
+          ),
+        // PEN-6750: staggered against `approval-gate-reconciler`.
+        { startPhase: TERMINAL_GATE_RECONCILER_TICK_PHASE },
       );
     }
   }
