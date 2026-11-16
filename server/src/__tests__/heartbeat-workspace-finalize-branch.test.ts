@@ -280,7 +280,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-finalize-branch-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     const servicesToDrain = [...heartbeatServices];

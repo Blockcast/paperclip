@@ -26,7 +26,7 @@ describeEmbeddedPostgres("wake idempotency receipts", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-wake-idempotency-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(agentWakeupRequests);
