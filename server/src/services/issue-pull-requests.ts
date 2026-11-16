@@ -457,10 +457,11 @@ export async function reconcileMergedPullRequests(
    * PEN-6733: true when the enumeration stopped before the window was
    * exhausted, so `enumerated` is a PREFIX rather than a count.
    *
-   * Both truncating paths below already log, and a log line is not a value a
-   * caller can act on: the rollup still reported a clean pass. A sweep that
-   * covered part of a window must not be arithmetically indistinguishable
-   * from one that covered all of it.
+   * All three truncating paths below leave a log line -- two of their own, and
+   * the all-unreadable path only through the per-page unreadable WARN -- and a
+   * log line is not a value a caller can act on: the rollup still reported a
+   * clean pass. A sweep that covered part of a window must not be
+   * arithmetically indistinguishable from one that covered all of it.
    */
   enumerationTruncated: boolean;
 }> {
@@ -753,7 +754,7 @@ export async function reconcileMergedPullRequests(
       enumerationTruncated = true;
       break;
     }
-    // PEN-6733: the third truncation, and the only one with no log line of its
+    // PEN-6733: the third truncation, and the one that HAD no log line of its
     // own -- the server says there is another page and the loop simply runs
     // out of iterations. A window wider than the cap returns a PREFIX that is
     // arithmetically identical to a complete sweep.
