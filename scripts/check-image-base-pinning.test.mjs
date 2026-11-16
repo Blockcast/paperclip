@@ -70,14 +70,7 @@ const PUBLISHED_IMAGES = [
 
 // Known-unpinned bases. Each entry records a gap rather than hiding one;
 // removing an entry is the fix, and adding one needs a reason written here.
-const ALLOWED_LITERAL_BASES = new Map([
-  [
-    "ghcr.io/github/github-mcp-server:v1.0.3",
-    "An intermediate stage of the main server image. docker.yml resolves a " +
-      "digest for the RUNTIME base only. Out of PEN-5927's scope, which covered " +
-      "the five side-image workflows; recorded so the next reader sees it.",
-  ],
-]);
+const ALLOWED_LITERAL_BASES = new Map([]);
 
 const VARIABLE = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/;
 
