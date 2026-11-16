@@ -20,7 +20,21 @@ export default defineConfig({
     // `pipelines-schema.test.ts:50`, whose boot is in the `beforeAll`).
     // So `testTimeout` reaches no Postgres-booting body at all, and
     // `hookTimeout` reaches exactly one block: the bare `afterEach` at
-    // `pool-timeout-bounds.test.ts:49`. In particular it does NOT cover
+    // `pool-timeout-bounds.test.ts:49`.
+    //
+    // 2026-11-16 (PEN-6772): THE SENTENCE ABOVE WAS TRUE WHEN WRITTEN AND IS
+    // NOW FALSE, and the way it went false is the point. 12 booting bodies in
+    // this package -- 8 in `client.test.ts`, 4 in `pool-timeout-bounds.test.ts`
+    // -- were passing a file-local `= 60_000` constant as their trailing
+    // argument, which CAPS the 120 s set below rather than raising it. So the
+    // PEN-6254 raise did not reach the bodies it was written for: they stayed
+    // on exactly the 60 s that evicted #3530. Nothing could say so, because
+    // every floor sweep in scripts/__tests__/vitest-project-coverage.test.mjs
+    // read the budget with a numeric-literal regex and scored a NAMED CONSTANT
+    // as "inherits the config" -- a pass. Those arguments are now gone and the
+    // sweeps read non-literal spellings, so those 12 bodies DO fall through to
+    // `testTimeout` and it is load-bearing for them. Do not reintroduce a
+    // per-test argument in this package: raise the value below instead. In particular it does NOT cover
     // `pipelines-schema.test.ts:41`, the one `beforeAll` boot — that hook
     // closes `}, 60_000)` itself, as does its `afterAll` at :46.
     // Contrast the alertmanager package, where a per-test `beforeEach` closes
