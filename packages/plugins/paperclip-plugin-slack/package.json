@@ -14,7 +14,7 @@
     "build": "node ./esbuild.config.mjs",
     "build:tsc": "tsc",
     "clean": "rm -rf dist",
-    "typecheck": "pnpm --filter @paperclipai/plugin-sdk build && tsc --noEmit",
+    "typecheck": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {

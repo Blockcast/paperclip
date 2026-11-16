@@ -2260,8 +2260,9 @@ jobs:
     # a pull_request run heading for the ceiling is usually superseded by a
     # push first (29 such cancels in the same sample), while a merge_group run
     # has nothing to interrupt it, so it runs all the way to the cap. A kill
-    # there evicts the entry and SPENDS A HUMAN ENQUEUE ACT -- #3806 consumed
-    # three of kkroo's on 2026-11-15 alone. The lane itself is not pool
+    # there evicts the entry and SPENDS A HUMAN ENQUEUE ACT -- #3806 lost
+    # three human enqueue acts to cap kills on 2026-11-15 alone. The lane
+    # itself is not pool
     # dependent: at n=337 the two pools' medians are indistinguishable (23.8
     # vs 24.3), and arc-merge-queue's tail only READS lower because the cap
     # right-censors it.
@@ -2269,21 +2270,45 @@ jobs:
     # ⛔ The expiry, because a third raise on the same lane is a treadmill and
     # should be dated rather than discovered: at the measured p99 growth
     # (+48% over 64 days) 60 is consumed around mid-January 2027. Do not
-    # simply raise it again then. The lane is a SERIAL CHAIN OF FIVE
-    # INDEPENDENT typecheck/build units -- @paperclipai/ui 428s, the
-    # @paperclipai/server build inside typecheck:build-gaps 385s, the server
-    # test identifier check 365s, cli 324s, the allowlisted server tests 300s
-    # -- about 1800s of a 2390s job, and the cap bounds their SUM. Two fixes
-    # cost no extra runner slot and are preferred over splitting this into
-    # parallel jobs, because arc-paperclip-general is separately starving (13
-    # jobs in the same sample never got a runner at all, one waiting 136
-    # minutes, so a job split spends capacity on the pool already short):
-    #   (a) parallelise those units inside this job -- expected wall clock
-    #       max(unit) + fixed, ~14 min against ~24 today;
-    #   (b) stop rebuilding the server here. typecheck:build-gaps runs a full
-    #       `pnpm --filter @paperclipai/server build` = 385s = 16% of the job,
-    #       and Build builds the server too. Unverified whether that dist is
-    #       restorable here -- a candidate, not a finding.
+    # simply raise it again then. The cap bounds the SUM of a serial chain,
+    # and that chain is TWO mechanisms, not one. An earlier list here named
+    # five units as co-located; they are not (measured first-party on job
+    # 132905274049, PEN-6723):
+    #   * typecheck:build-gaps runs ONE serial loop, over the workspace
+    #     packages whose build script skips tsc -- cli 209s, ui 222s,
+    #     paperclip-plugin-slack 34s, plugin-llm-wiki 23s,
+    #     plugin-authoring-smoke-example 22s = 510s. Membership is the pnpm
+    #     WORKSPACE set, so pnpm-workspace.yaml's exclusions are
+    #     load-bearing; a filesystem walk over-counts it.
+    #   * the server-test identifier check (219s) and the allowlisted server
+    #     tests (171s) are separate JOB STEPS of this job. Steps within a
+    #     job are strictly serial and cannot be parallelised at all without
+    #     being merged into one `run:` block.
+    # Two fixes cost no extra runner slot and are preferred over splitting
+    # this into parallel jobs, because arc-paperclip-general is separately
+    # starving (13 jobs in the same sample never got a runner at all, one
+    # waiting 136 minutes, so a job split spends capacity on the pool
+    # already short):
+    #   (a) parallelise the typecheck:build-gaps loop -- ceiling 510s ->
+    #       ~222s, bounded by ui, i.e. -288s at perfect parallelism and less
+    #       under core contention. HAZARD, invisible from this file: loop
+    #       members do not share a lock. Members that call plugin-sdk
+    #       `ensure-build-deps` serialise on
+    #       node_modules/.cache/paperclip-plugin-build-deps.lock with a 60s
+    #       timeout that THROWS; a member calling plugin-sdk `build` instead
+    #       takes NO lock and writes the same dist. Keep every member on
+    #       `ensure-build-deps` before parallelising this loop.
+    #   (b) stop rebuilding the server here. typecheck:build-gaps runs a
+    #       full `pnpm --filter @paperclipai/server build` -- 253s = 17% of
+    #       the job on the run above, 385s = 16% on an earlier slower draw
+    #       -- and its only consumer in this lane is
+    #       checkServerRuntimeAssets(), a ten-file presence assertion over
+    #       server/dist. Nothing typechecked here reads server/dist: ui is
+    #       noEmit with no `references`, and cli includes only its own src,
+    #       packages/shared/src and create-paperclip-plugin/src. Before
+    #       dropping it, close two cheap gaps -- the small plugins'
+    #       tsconfigs, and whether any step OUTSIDE this job relies on this
+    #       job having built the server.
     #
     # Re-measuring note, because two instrument faults invert the reading: a
     # job that never got a runner reports started_at == created_at, so its
