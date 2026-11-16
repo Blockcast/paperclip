@@ -36,11 +36,20 @@ type WorkerSingletonScheduler = {
   clearTimeout: (t: ReturnType<typeof setTimeout>) => void;
 };
 
+/**
+ * The timers are looked up on the global object on every call, not captured
+ * once when this module is imported. Writing this object as
+ * `{ setInterval, clearInterval, ... }` binds each function at import time,
+ * which silently defeats a `vi.spyOn(globalThis, "setInterval")` installed
+ * afterwards: the supervisor keeps calling the real timer while the test
+ * believes it is driving a hand-run clock, and the test then fails claiming
+ * the supervised loop never started (PEN-6750).
+ */
 const defaultScheduler: WorkerSingletonScheduler = {
-  setInterval,
-  clearInterval,
-  setTimeout,
-  clearTimeout,
+  setInterval: (cb, ms) => setInterval(cb, ms),
+  clearInterval: (t) => clearInterval(t),
+  setTimeout: (cb, ms) => setTimeout(cb, ms),
+  clearTimeout: (t) => clearTimeout(t),
 };
 
 /**

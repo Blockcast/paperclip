@@ -2600,7 +2600,21 @@ describe("startServer worker-tier singletons (BLO-46694)", () => {
     "linear-tunnel",
     "bundled-plugin-auto-install",
   ];
+  // PEN-6750: these four read GitHub, so their FIRST tick is deferred to a
+  // chosen minute-of-hour instead of firing at whatever minute this pod
+  // happened to acquire the lease at. They are supervised and lease-gated
+  // exactly like the rest -- on the holder they log "deferred" rather than
+  // "started" until their minute comes round. Sorted, because `singletonLog`
+  // sorts.
+  const PHASED = [
+    "approval-gate-reconciler",
+    "merged-pr-reconciler",
+    "pr-review-state-reconciler",
+    "terminal-gate-reconciler",
+  ];
+  const GATED_IMMEDIATE = GATED.filter((name) => !PHASED.includes(name));
   const ORIGINAL_GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+  const ORIGINAL_TICK_PHASE = process.env.PAPERCLIP_RECONCILER_TICK_PHASE_ENABLED;
 
   const singletonConfig = () =>
     buildTestConfig({
@@ -2647,12 +2661,23 @@ describe("startServer worker-tier singletons (BLO-46694)", () => {
     loadConfigMock.mockReturnValue(singletonConfig());
     process.env.BETTER_AUTH_SECRET = "test-secret";
     process.env.GITHUB_TOKEN = "test-token";
+    // PEN-6750 kill switch. What these tests are for is that EVERY worker-tier
+    // singleton is lease-gated, which is independent of the minute it first
+    // ticks at; holding the phase off keeps that invariant asserted over the
+    // whole GATED set, and leaves no real deferral timer armed behind the
+    // test. The default -- phases on -- has its own test below.
+    process.env.PAPERCLIP_RECONCILER_TICK_PHASE_ENABLED = "false";
   });
 
   afterEach(() => {
     singletonLease.leader = true;
     if (ORIGINAL_GITHUB_TOKEN === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = ORIGINAL_GITHUB_TOKEN;
+    if (ORIGINAL_TICK_PHASE === undefined) {
+      delete process.env.PAPERCLIP_RECONCILER_TICK_PHASE_ENABLED;
+    } else {
+      process.env.PAPERCLIP_RECONCILER_TICK_PHASE_ENABLED = ORIGINAL_TICK_PHASE;
+    }
   });
 
   it("a follower starts none of them, and hands createApp a gate that reads false", async () => {
@@ -2684,6 +2709,47 @@ describe("startServer worker-tier singletons (BLO-46694)", () => {
     expect(singletonStarts.startHumanGatedDigestSweep).toHaveBeenCalledTimes(1);
     const opts = createAppMock.mock.calls[0]?.[1] as { shouldRunWorkerSingletons?: () => boolean };
     expect(opts.shouldRunWorkerSingletons?.()).toBe(true);
+  });
+
+  // PEN-6750. The production default -- no kill switch -- defers the four
+  // GitHub-reading reconcilers to a chosen minute instead of firing them at
+  // whatever minute the lease was acquired at.
+  it("by default the GitHub-reading reconcilers wait for their chosen tick phase", async () => {
+    delete process.env.PAPERCLIP_RECONCILER_TICK_PHASE_ENABLED;
+    // A deferred start parks on a REAL `setTimeout`, up to one phase period
+    // out -- and the next :02-of-ten can be milliseconds away, which would
+    // fire the start inside a later test. Record every timer armed here and
+    // cancel it when this test ends.
+    const armed: Array<ReturnType<typeof setTimeout>> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const timeoutSpy = vi
+      .spyOn(globalThis, "setTimeout")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        const handle = realSetTimeout(callback, delay);
+        armed.push(handle);
+        return handle;
+      }) as unknown as typeof setTimeout);
+    try {
+      await startServer();
+
+      // Everything unphased still starts at once...
+      expect(singletonLog("worker singleton started on the scheduler lease holder")).toEqual(
+        expect.arrayContaining(GATED_IMMEDIATE),
+      );
+      // ...and the phased four are DEFERRED, not skipped: still supervised,
+      // still lease-gated, waiting on their minute. Exactly these four, so a
+      // phase cannot be hung on a fifth loop without this test saying so.
+      expect(singletonLog("worker singleton start deferred to its chosen tick phase")).toEqual(
+        PHASED,
+      );
+      // The sweep has therefore NOT run yet, which is the point of the phase.
+      // What happens when the phase elapses belongs to
+      // `worker-singleton-supervisor.test.ts`, which drives an injected clock.
+      expect(singletonStarts.reconcilerSweepTick).not.toHaveBeenCalled();
+    } finally {
+      timeoutSpy.mockRestore();
+      for (const handle of armed) clearTimeout(handle);
+    }
   });
 
   // The supervisors re-check the lease on its renew interval.
