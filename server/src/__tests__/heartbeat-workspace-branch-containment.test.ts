@@ -995,7 +995,7 @@ describeEmbeddedPostgres("heartbeat workspace branch containment", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-branch-containment-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     const servicesToDrain = [...heartbeatServices];

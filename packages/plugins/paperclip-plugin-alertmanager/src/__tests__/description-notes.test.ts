@@ -310,7 +310,7 @@ beforeAll(async () => {
   truncateAll = `TRUNCATE ${tables.rows
     .map((r) => r.qualified)
     .join(", ")} RESTART IDENTITY CASCADE`;
-}, 30_000);
+});
 
 beforeEach(async () => {
   await db.query(truncateAll);

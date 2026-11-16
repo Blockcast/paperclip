@@ -139,7 +139,7 @@ describeEmbeddedPostgres("additive agent grant route", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-grants-routes-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterEach(async () => {
     await db.delete(activityLog);

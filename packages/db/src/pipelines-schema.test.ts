@@ -41,7 +41,7 @@ describeEmbeddedPostgres("pipeline schema", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pipeline-schema-");
     db = createDb(tempDb.connectionString);
-  }, 60_000);
+  });
 
   afterAll(async () => {
     await tempDb?.cleanup();
