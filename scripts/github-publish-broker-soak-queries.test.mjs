@@ -161,17 +161,24 @@ function regexOf(id) {
 }
 
 /**
- * Apply a shipped query's LogQL LINE FILTERS to a candidate line, in order.
+ * Apply a LogQL LINE FILTER CHAIN to a candidate line, in order.
  * Covers the four forms this file uses: `|=` / `!=` (substring) and `|~` / `!~`
  * (regex). This evaluates the SHIPPED string rather than a restatement of it,
  * so a matcher that drifts from classifyBrokerLine fails here rather than in
  * production six weeks later.
+ *
+ * FAILS CLOSED ON ANY STAGE IT DOES NOT UNDERSTAND (PEN-5205). `seen > 0` only
+ * proves that at least one filter was read; it says nothing about the rest of
+ * the chain. A query that grows a parser, label-filter or formatting stage --
+ * `| json`, `| logfmt`, `| line_format ...`, `| level="error"` -- has that stage
+ * silently skipped by this evaluator, and the agreement assertions would then
+ * attest to a query Loki evaluates differently. So the chain must be FULLY
+ * CONSUMED: anything the matcher leaves behind is a stage this file cannot
+ * evaluate, and an unevaluated stage must read as a failure rather than as
+ * agreement. Taking `filters` rather than an id is what lets the regression
+ * test below exercise that guard on a synthetic chain.
  */
-function queryMatches(id, line) {
-  const q = BROKER_QUERIES.find((x) => x.id === id);
-  assert.ok(q, `no query ${id}`);
-  assert.ok(q.logql.startsWith(BROKER_STREAM), `${id} is not scoped to the broker stream`);
-  const filters = q.logql.slice(BROKER_STREAM.length);
+function evaluateLineFilters(label, filters, line) {
   const re = /\s*(\|=|!=|\|~|!~)\s*`([^`]*)`/g;
   let m;
   let seen = 0;
@@ -182,8 +189,24 @@ function queryMatches(id, line) {
     const hit = op === "|=" || op === "!=" ? line.includes(arg) : new RegExp(arg).test(line);
     if (hit !== (op === "|=" || op === "|~")) ok = false;
   }
-  assert.ok(seen > 0, `${id} has no line filters`);
+  assert.ok(seen > 0, `${label} has no line filters`);
+  const residue = filters.replace(re, "").trim();
+  assert.equal(
+    residue,
+    "",
+    `${label} carries a LogQL stage this test cannot evaluate: ${JSON.stringify(residue)}. ` +
+      "Teach evaluateLineFilters that stage before shipping the query -- a skipped stage " +
+      "would make the agreement assertions pass on a query Loki reads differently.",
+  );
   return ok;
+}
+
+/** Apply a SHIPPED query's line-filter chain to a candidate line. */
+function queryMatches(id, line) {
+  const q = BROKER_QUERIES.find((x) => x.id === id);
+  assert.ok(q, `no query ${id}`);
+  assert.ok(q.logql.startsWith(BROKER_STREAM), `${id} is not scoped to the broker stream`);
+  return evaluateLineFilters(id, q.logql.slice(BROKER_STREAM.length), line);
 }
 
 describe("classifyBrokerLine", () => {
@@ -392,6 +415,39 @@ describe("shipped LogQL matchers agree with classifyBrokerLine", () => {
     assert.ok(queryMatches("startup_failure_other", "REFUSING in shouty caps is not a refusal opening"));
     assert.ok(!queryMatches("startup_failure_other", LINES.refusalConfig));
     assert.ok(!queryMatches("startup_failure_other", LINES.listening));
+  });
+
+  it("⛔ refuses to evaluate a query carrying a stage it does not understand (PEN-5205)", () => {
+    // The guard this pins is in evaluateLineFilters, and it fails CLOSED: a
+    // stage the matcher does not consume must make the suite FAIL, never be
+    // skipped into a passing agreement assertion. Every shipped query today is
+    // a stream selector plus line filters, so nothing here is live -- this is
+    // the trap set for the NEXT query, which is exactly why it needs a fixture.
+    //
+    // Positive control FIRST, both polarities: a chain of only handled ops
+    // still evaluates and still discriminates, so a throw below is the new
+    // guard firing rather than the evaluator refusing everything.
+    assert.equal(evaluateLineFilters("control", " |= `alpha` !~ `omega`", "alpha beta"), true);
+    assert.equal(evaluateLineFilters("control", " |= `alpha` !~ `omega`", "omega alpha"), false);
+
+    for (const stage of [
+      "| json",
+      "| logfmt",
+      '| line_format "{{.msg}}"',
+      '| detected_level="error"',
+      "| unwrap duration",
+      "| pattern `<_> code=<code>`",
+    ]) {
+      assert.throws(
+        () => evaluateLineFilters("synthetic", " |= `alpha` " + stage, "alpha"),
+        /cannot evaluate/,
+        "a `" + stage + "` stage must fail the suite rather than be skipped",
+      );
+    }
+
+    // A chain with NO handled op at all keeps failing on the pre-existing
+    // `seen > 0` arm, so the two assertions stay distinguishable.
+    assert.throws(() => evaluateLineFilters("synthetic", " | json", "alpha"), /has no line filters/);
   });
 });
 
