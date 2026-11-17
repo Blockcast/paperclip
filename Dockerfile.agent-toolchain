@@ -241,21 +241,27 @@ RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
 # Pins below are kept on releases built with go >= 1.25.7: older builds carry
 # stdlib CVE-2025-68121 (Critical), which Harbor reports on every downstream image (BLO-56939).
 ARG KIND_VERSION=v0.33.0
-RUN curl -fsSL "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64" \
-       -o /usr/local/bin/kind \
-  && chmod +x /usr/local/bin/kind \
-  && kind version | grep -Fq "${KIND_VERSION} "
+# The upstream release binaries of kind v0.33.0 (go1.26.7) and kubelogin v1.36.4
+# (go1.26.6) carry Go stdlib Highs fixed only in 1.26.9+/1.27.2+, and the image's
+# own Go (1.25.x) has no fix at all. So build both from source on a pinned newer
+# toolchain; GOTOOLCHAIN downloads are checksum-verified via sum.golang.org (BLO-57664).
+ARG GO_TOOL_BUILD_TOOLCHAIN=go1.27.4
+RUN GOTOOLCHAIN=${GO_TOOL_BUILD_TOOLCHAIN} GOBIN=/usr/local/bin /usr/local/go/bin/go install \
+       sigs.k8s.io/kind@${KIND_VERSION} \
+  && rm -rf /root/go /root/.cache \
+  && kind version | grep -Fq "${KIND_VERSION} ${GO_TOOL_BUILD_TOOLCHAIN} "
 
 # kubelogin (kubectl-oidc_login) — matches devbox 03-k8s-tools.sh; needed
 # for OIDC-authed kubeconfigs that paperclip-0 will start handing to agents
 # once the kubernetes-admin@kubernetes context is rotated out.
 ARG KUBELOGIN_VERSION=v1.36.4
-RUN curl -fsSL "https://github.com/int128/kubelogin/releases/download/${KUBELOGIN_VERSION}/kubelogin_linux_amd64.zip" \
-       -o /tmp/kubelogin.zip \
-  && unzip -d /tmp /tmp/kubelogin.zip \
-  && mv /tmp/kubelogin /usr/local/bin/kubectl-oidc_login \
-  && chmod +x /usr/local/bin/kubectl-oidc_login \
-  && rm -f /tmp/kubelogin.zip /tmp/LICENSE
+RUN GOTOOLCHAIN=${GO_TOOL_BUILD_TOOLCHAIN} GOBIN=/tmp/kubelogin-bin /usr/local/go/bin/go install \
+       -ldflags "-X main.version=${KUBELOGIN_VERSION}" \
+       github.com/int128/kubelogin@${KUBELOGIN_VERSION} \
+  && mv /tmp/kubelogin-bin/kubelogin /usr/local/bin/kubectl-oidc_login \
+  && rm -rf /tmp/kubelogin-bin /root/go /root/.cache \
+  && kubectl-oidc_login --version | grep -Fq "${KUBELOGIN_VERSION}" \
+  && /usr/local/go/bin/go version /usr/local/bin/kubectl-oidc_login | grep -Fq "${GO_TOOL_BUILD_TOOLCHAIN}"
 
 # yq — PEN-4932. Image-owned, replacing the copy that currently reaches agents
 # only through the shared `paperclip-data` PVC at `/paperclip/bin/yq` (and a
