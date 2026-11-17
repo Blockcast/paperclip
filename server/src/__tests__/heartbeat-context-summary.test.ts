@@ -4197,6 +4197,18 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // carries only `expectedRevisionId` and the code, so a run that relied on the body
     // would find no current id in exactly the case the lock exists for.
     expect(markdown).toContain("Do not count on the error body to carry the current revision");
+    // PEN-6793 follow-up. The claim above is right about WHICH branch populates
+    // `latestRevisionId` and was silent about WHERE to read it. Both ids sit under
+    // `details`; only `code` is hoisted to the top level, so a caller that read `code`
+    // there is taught the wrong path for the two fields that tell the branches apart,
+    // and a top-level read returns `null` for both -- which renders an ordinary
+    // pre-check refusal as the race branch. Measured by @Ceo on PEN-731 and confirmed
+    // at source in `errors.ts` + `middleware/error-handler.ts`.
+    expect(markdown).toContain("`details.expectedRevisionId`, `details.latestRevisionId`");
+    expect(markdown).toContain("`code` IS hoisted to the top level");
+    // The behavioural half (@Cto): the cheap wrong remedy for a 409 is to re-pin,
+    // which is exactly the fail-open split. Rebase the BODY.
+    expect(markdown).toContain("re-pinning alone is the split named below");
     // Same review: `title` is covered by the same CAS and named in the opening line, so the
     // instruction to send the precondition must not silently drop it.
     expect(markdown).toContain("Send it on every `title` or `description` edit");
@@ -4899,6 +4911,10 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // The adjacency advice SURVIVES. It is still the right thing to do, it is just not the
     // only guard, and a correction that deleted it would trade one understatement for another.
     expect(markdown).toContain("Keeping the re-read in the same run and immediately before the write");
+    // That prefix matched the RETIRED sentence too ("...is the only guard on that
+    // window"), so it cannot by itself tell the new form from the old. Pin the
+    // retirement directly.
+    expect(markdown).not.toContain("the only guard on that window");
   });
 
   // Fourth finding at the fourth head, and the only one that corrects a statement of FACT
@@ -4937,7 +4953,12 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // loss. `jq -j` appends nothing and makes the check honest.
     // `// ""` guards a null description: a bare `.description` under `jq -j` writes the four
     // literal bytes `null` into desc.md, and the prepend then publishes the word.
-    expect(markdown).toContain("Produce it with `jq -j '.description // \"\"'`");
+    // PEN-6793 follow-up: `desc.md` is now cut from a SAVED response (`row.json`)
+    // rather than from an anonymous pipe, because the builder below has to read the
+    // revision pin from that same response. A second GET for the pin alone would BE
+    // the split the same-read proviso forbids, so the recipe makes it structural.
+    expect(markdown).toContain("produce `desc.md` with `jq -j '.description // \"\"' row.json`");
+    expect(markdown).toContain("both come from ONE saved response");
     expect(markdown).toContain("never `jq -r`, which appends a trailing newline");
     // Split into its own sentence AFTER the `jq -r` one: as a parenthetical it made the
     // following "which appends a trailing newline" attach to the bare `.description` instead
@@ -4954,9 +4975,21 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // on -- "nothing is retyped, so nothing can be mistyped" -- is true of the HUMAN step and
     // false of the ENCODER, which is the step it quietly substituted.
     expect(markdown).toContain('python3 -I -c "import io,json;');
+    // PEN-6793 follow-up (Ally review of #3853, Important). The clause now names the
+    // CAS as the guard that DETECTS a write in the re-read window -- but this recipe,
+    // which the same paragraph calls PREFERRED, built a body with no `baseRevisionId`.
+    // Per the CAS bullet, omitting the field is UNCHECKED, so a seat following the
+    // concrete recipe got the digest and none of the detection the prose promised. The
+    // validator accepts the field -- `baseRevisionId: z.string().guid().nullable().optional()`
+    // in `packages/shared/src/validators/issue.ts` -- so nothing forced the omission. Pinned
+    // WITH the pin in it so recipe and claim cannot drift apart again.
     expect(markdown).toContain(
-      "json.dumps({'description':io.open('desc.md',encoding='utf-8',newline='').read()})",
+      "json.dumps({'description':io.open('desc.md',encoding='utf-8',newline='').read(),'baseRevisionId':row.get('latestFieldRevisionId')})",
     );
+    expect(markdown).toContain("row=json.load(io.open('row.json',encoding='utf-8'))");
+    expect(markdown).toContain("a PATCH carrying no `baseRevisionId` is UNCHECKED");
+    // `None` -> `null` is the ENFORCED value; omitting the key is the unchecked one.
+    expect(markdown).toContain("the ENFORCED value, where omitting the key is not");
     // `newline=''` is not decoration. Without it Python opens in text mode with
     // newline=None, so universal-newline translation rewrites every CRLF and bare CR to LF
     // before json.dumps sees the text -- the replacement encoder reproducing, in a quieter
