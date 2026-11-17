@@ -71,6 +71,7 @@ import {
   AGENT_NOTES_MARKER,
   composeDescription,
   preservedNotes,
+  TruncatedBodyError,
 } from "../description-notes.js";
 import {
   buildAggregateIssueDescription,
@@ -167,6 +168,41 @@ function payloadFor(alert: AlertmanagerAlert): AlertmanagerWebhookPayload {
   };
 }
 
+/**
+ * PEN-6796 — the host's LIST projection, reproduced.
+ *
+ * `issueService.list` runs every row through `projectIssueListDescription`
+ * (`server/src/services/issues.ts`), which clips `description` to the first
+ * {@link HOST_LIST_DESCRIPTION_CAP} CODE POINTS and reports the clip
+ * out-of-band as `descriptionTruncated`. `issues.get` does not: it returns the
+ * stored column whole.
+ *
+ * Until this existed the double returned the same live row object from both,
+ * so `list` and `get` were INDISTINGUISHABLE here while the real host differs
+ * on exactly the property `composeDescription` depends on. The suite could not
+ * express PEN-6796 at all — not because a case was missing, but because the
+ * fake had no cap to trip. A double that models the host's SHAPE and not its
+ * PROJECTION certifies the shape and is silent on the projection.
+ *
+ * Counted in code points, like the server: `Array.from` iterates code points
+ * where `.length` counts UTF-16 units, so an astral character inside the
+ * prefix would otherwise put the two instruments one apart.
+ */
+const HOST_LIST_DESCRIPTION_CAP = 1200;
+
+function projectListDescription(value: string): {
+  description: string;
+  descriptionTruncated: boolean;
+} {
+  const points = Array.from(value);
+  return points.length <= HOST_LIST_DESCRIPTION_CAP
+    ? { description: value, descriptionTruncated: false }
+    : {
+        description: points.slice(0, HOST_LIST_DESCRIPTION_CAP).join(""),
+        descriptionTruncated: true,
+      };
+}
+
 /** Same shape as `aggregate-description.test.ts`; the body each write leaves is the subject. */
 function mkIssues() {
   const rows = new Map<
@@ -194,14 +230,21 @@ function mkIssues() {
           originId?: string;
           status?: string;
         }) =>
-          [...rows.values()].filter(
-            (row) =>
-              (!filter.originKind || row.originKind === filter.originKind) &&
-              (!filter.originId || row.originId === filter.originId) &&
-              (!filter.originFingerprint ||
-                row.originFingerprint === filter.originFingerprint) &&
-              (!filter.status || row.status === filter.status),
-          ),
+          [...rows.values()]
+            .filter(
+              (row) =>
+                (!filter.originKind || row.originKind === filter.originKind) &&
+                (!filter.originId || row.originId === filter.originId) &&
+                (!filter.originFingerprint ||
+                  row.originFingerprint === filter.originFingerprint) &&
+                (!filter.status || row.status === filter.status),
+            )
+            // PEN-6796: a DETACHED, CLIPPED projection — what the host returns.
+            // Detached as well as clipped: the real list row is built from a
+            // SELECT, so a caller holding one cannot reach the stored column
+            // through it. Returning the live object let a caller read a whole
+            // body the host would never have handed it.
+            .map((row) => ({ ...row, ...projectListDescription(row.description) })),
       ),
       get: vi.fn(async (id: string) => rows.get(id) ?? null),
       create: vi.fn(async (input: Record<string, unknown>) => {
@@ -591,5 +634,231 @@ describe("PEN-6218 — an agent's notes survive the delivery paths", () => {
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("before refreshing its aggregate body"),
     );
+  });
+});
+
+/**
+ * An alert whose rendered body alone exceeds the host's list cap, so the
+ * marker — which `composeDescription` writes AFTER the rendered half — lands
+ * past the clip. This is the live shape and not a contrived one: the body
+ * carries the alert's own `description` annotation, and a runbook-grade
+ * annotation routinely runs past the cap by itself. Measured on PEN-5068, the
+ * row this was found on: marker at code point 1485 against a cap of 1200.
+ */
+function longAlertFor(
+  fingerprint: string,
+  startsAt: string,
+  workflow = "build",
+  status: "firing" | "resolved" = "firing",
+): AlertmanagerAlert {
+  const alert = alertFor(fingerprint, startsAt, workflow, status);
+  return {
+    ...alert,
+    annotations: {
+      ...alert.annotations,
+      description: "Runbook detail for the on-call responder. ".repeat(40),
+    },
+  };
+}
+
+/** Code points, like the host's cap — never `.length`, which counts UTF-16 units. */
+const codePoints = (value: string) => Array.from(value).length;
+
+describe("PEN-6796 — notes survive a NEW FINGERPRINT attaching to an aggregate", () => {
+  it("keeps notes when the marker sits past the host's list cap", async () => {
+    const { ctx, issues } = mkCtx();
+    await deliver(ctx, longAlertFor(FP_A, STARTS_A));
+    const row = onlyIssue(issues);
+
+    // The PEN-5068 precondition, asserted rather than assumed: if the body
+    // ever shrinks below the cap this case stops testing what it claims to,
+    // and would pass vacuously.
+    const markerAt = codePoints(row.description.slice(0, row.description.indexOf(AGENT_NOTES_MARKER)));
+    expect(markerAt).toBeGreaterThan(HOST_LIST_DESCRIPTION_CAP);
+
+    row.description = `${row.description}\n${AGENT_NOTE}`;
+
+    // A DIFFERENT fingerprint: this JOINS the aggregate row rather than
+    // re-firing the alert that created it, so the handler takes the
+    // `created === false` refresh and finds its row through
+    // `findActiveAggregateIssue` — i.e. through `issues.list`.
+    await deliver(ctx, longAlertFor(FP_B, STARTS_B, "deploy"));
+
+    const body = onlyIssue(issues).description;
+    expect(body).toContain(AGENT_NOTE);
+    // DISCRIMINATING. "Notes survived" alone has two preimages: the row was
+    // hydrated and rewritten (what we want), or `composeDescription` refused
+    // the truncated body and the tolerated `catch` skipped the write entirely
+    // (the fallback). Only the refreshed member table separates them — and
+    // leaving it unrefreshed is the BLO-42850 wrong-close mechanism, so the
+    // fallback must not be mistaken for the fix.
+    expect(body).toContain("### Active members (2)");
+    expect(body).toContain(FP_B);
+    expect(body.split(AGENT_NOTES_MARKER)).toHaveLength(2);
+  });
+
+  it("keeps the WHOLE note when the marker is inside the cap but the notes are not", async () => {
+    // The quieter half of PEN-6796. When the rendered head is short the marker
+    // DOES survive the clip, so `preservedNotes` finds it and returns the tail
+    // — of a body that stops at 1200 code points. Nothing is reported, nothing
+    // looks wrong, and the notes come back SHORTER. A total loss at least
+    // announces itself by being total; this one lands as a plausible,
+    // silently-trimmed note.
+    const { ctx, issues } = mkCtx();
+    await deliver(ctx, alertFor(FP_A, STARTS_A));
+    const row = onlyIssue(issues);
+
+    const markerAt = codePoints(row.description.slice(0, row.description.indexOf(AGENT_NOTES_MARKER)));
+    expect(markerAt).toBeLessThan(HOST_LIST_DESCRIPTION_CAP);
+
+    // Long enough that the clip lands INSIDE it rather than past its end.
+    const longNote = `${AGENT_NOTE}\n\n${"Falsified fp-7a21 at 11:04Z. ".repeat(60)}`;
+    row.description = `${row.description}\n${longNote}`;
+    expect(codePoints(row.description)).toBeGreaterThan(HOST_LIST_DESCRIPTION_CAP);
+
+    await deliver(ctx, alertFor(FP_B, STARTS_B, "deploy"));
+
+    const body = onlyIssue(issues).description;
+    expect(body).toContain(longNote);
+    expect(body).toContain("### Active members (2)");
+  });
+
+  it("keeps the target row's notes when an aggregate REBINDS onto it", async () => {
+    // The second site fed by `findActiveAggregateIssue`, and a different row
+    // from the one the delivery is tracking: `existing` still points at the
+    // row that was auto-cancelled on resolve, while the aggregate has since
+    // been re-created elsewhere. `takeOver` publishes onto that winner, so the
+    // notes at risk are the WINNER's.
+    const { ctx, issues } = mkCtx();
+    await deliver(ctx, longAlertFor(FP_A, STARTS_A));
+    const first = onlyIssue(issues);
+
+    // A resolves: `autoCloseOnResolve` cancels its row, freeing the aggregate.
+    await deliver(ctx, longAlertFor(FP_A, STARTS_A, "build", "resolved"));
+    expect(first.status).toBe("cancelled");
+
+    // B fires: no active row for the aggregate, so this files a NEW one.
+    await deliver(ctx, longAlertFor(FP_B, STARTS_B, "deploy"));
+    const winner = [...issues.rows.values()].find((row) => row.id !== first.id);
+    expect(winner).toBeDefined();
+    winner!.description = `${winner!.description}\n${AGENT_NOTE}`;
+
+    // A fires again. Its tracked row is the cancelled one, the live winner is
+    // a different row, so this rebinds rather than reopening in place.
+    await deliver(ctx, longAlertFor(FP_A, STARTS_A));
+
+    // DISCRIMINATING: proves the delivery actually took the `takeOver` branch
+    // rather than passing because it quietly did something else. A case that
+    // merely re-ran the attach path would satisfy the notes assertion below
+    // while testing nothing new.
+    expect(ctx.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.aggregate.rebound",
+      1,
+      expect.anything(),
+    );
+    expect(winner!.description).toContain(AGENT_NOTE);
+  });
+
+  it("refuses the refresh rather than destroying notes when the row cannot be re-read", async () => {
+    // The OTHER arm of the fix, and the one this issue's done-when offers as
+    // an alternative: when hydration fails there is no complete body to
+    // compose onto, so the description write is skipped for this sync. The
+    // rendered half goes stale and recovers on the next delivery; the notes
+    // survive. Chosen deliberately over writing the prefix, because a stale
+    // projection is visible and self-correcting while a note destroyed in
+    // another actor's transaction is neither.
+    const { ctx, issues, logger } = mkCtx();
+    await deliver(ctx, longAlertFor(FP_A, STARTS_A));
+    const row = onlyIssue(issues);
+    row.description = `${row.description}\n${AGENT_NOTE}`;
+    const issueId = row.id;
+
+    issues.api.get.mockImplementation(async (id: string) => {
+      if (id === issueId) throw new Error("issues.get failed");
+      return issues.rows.get(id) ?? null;
+    });
+
+    await deliver(ctx, longAlertFor(FP_B, STARTS_B, "deploy"));
+
+    const body = onlyIssue(issues).description;
+    expect(body).toContain(AGENT_NOTE);
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("could not re-read the full body"),
+    );
+  });
+
+  it("hydrates on length alone when the host sends no truncation flag", async () => {
+    // `descriptionTruncated` is the authoritative signal; the code-point
+    // length test behind it exists so a host that stops sending the flag
+    // cannot silently restore this defect. Without this case that fallback is
+    // unreachable from the suite — the double always sets the flag, so
+    // deleting the fallback turned nothing red (mutation 4).
+    const { ctx, issues } = mkCtx();
+    await deliver(ctx, longAlertFor(FP_A, STARTS_A));
+    const row = onlyIssue(issues);
+    row.description = `${row.description}\n${AGENT_NOTE}`;
+
+    const withFlag = issues.api.list.getMockImplementation()!;
+    issues.api.list.mockImplementation((async (filter: {
+      originFingerprint?: string;
+      originKind?: string;
+      originId?: string;
+      status?: string;
+    }) => {
+      const listed = (await withFlag(filter)) as Array<Record<string, unknown>>;
+      // Still CLIPPED — only the out-of-band tell is gone, which is why the
+      // return type no longer matches the double's and has to be cast.
+      return listed.map(({ descriptionTruncated: _dropped, ...rest }) => rest);
+    }) as never);
+
+    await deliver(ctx, longAlertFor(FP_B, STARTS_B, "deploy"));
+
+    const body = onlyIssue(issues).description;
+    expect(body).toContain(AGENT_NOTE);
+    expect(body).toContain("### Active members (2)");
+  });
+});
+
+describe("PEN-6796 — composeDescription refuses a body it was told is a prefix", () => {
+  const wholeBodyWithNote = () =>
+    `${composeDescription("**Summary**: s", null)}\n${AGENT_NOTE}`;
+
+  it("throws rather than reading a missing marker as 'no notes'", () => {
+    const clipped = Array.from(wholeBodyWithNote())
+      .slice(0, HOST_LIST_DESCRIPTION_CAP)
+      .join("");
+
+    expect(() =>
+      composeDescription("**Summary**: s", {
+        description: clipped,
+        descriptionTruncated: true,
+      }),
+    ).toThrow(TruncatedBodyError);
+  });
+
+  it("composes normally on a complete row, so the guard refuses prefixes and not every row", () => {
+    // NEGATIVE CONTROL for the case above, on the same terms as mutation 8 in
+    // the matrix: a guard that simply threw on every row would pass that case
+    // and take every delivery path down with it.
+    const whole = wholeBodyWithNote();
+
+    expect(
+      composeDescription("**Summary**: s", { description: whole, descriptionTruncated: false }),
+    ).toContain(AGENT_NOTE);
+    // Flag ABSENT is not flag TRUE. A host that stops sending it must degrade
+    // to the pre-PEN-6796 behaviour, never to refusing every write.
+    expect(composeDescription("**Summary**: s", { description: whole })).toContain(AGENT_NOTE);
+    // And a bare string still composes: the create path has no row to pass.
+    expect(composeDescription("**Summary**: s", whole)).toContain(AGENT_NOTE);
+  });
+
+  it("treats an absent body as 'no notes', not as a prefix", () => {
+    // `description: undefined` is what a FAILED re-read leaves behind. It must
+    // keep meaning "nothing to carry" — the documented resolve-path
+    // degradation — so only a positive `descriptionTruncated` is an error.
+    expect(composeDescription("**Summary**: s", { description: undefined })).toContain(
+      AGENT_NOTES_MARKER,
+    );
+    expect(composeDescription("**Summary**: s", null)).toContain(AGENT_NOTES_MARKER);
   });
 });

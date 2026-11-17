@@ -1199,6 +1199,40 @@ are preserved across syncs ...
 | **A row written before this shipped** | has no marker. An append made on a body this render still reproduces byte-for-byte is rescued on the first sync (the shape measured on PEN-4835); anything else falls through to the pre-PEN-6218 behaviour and is lost, which is no worse than before |
 | **A render that SHRANK** | the rescue is refused. A prefix match alone does not mean "notes were appended": a smaller render of the same alert is a prefix of a bigger one, so a two-member aggregate losing a member would otherwise read its own `### Active members (2)` table — naming the alert that just cleared — as notes and carry it forward forever. `looksSelfRendered` in `description-notes.ts` refuses any tail that opens with a section this plugin renders, or with a table row. It errs toward refusing, because losing a note costs one sync on a legacy row and keeping stale rendered content is permanent |
 | **Notes that quote the marker** | safe. The split is on the **first** occurrence, so a copy inside someone's notes costs a duplicated marker, never their text |
+| **Composing onto a row you looked up** | pass the **ROW**, never `row.description`. `issues.list` clips `description` to its first 1200 code points and flags the clip as `descriptionTruncated`; `issues.get` returns the column whole. `composeDescription` takes the row so that flag travels with the body, and refuses a known prefix rather than reading the missing marker as "no notes" (PEN-6796) |
+
+⚠️ **PEN-6796 — the durability claim above was FALSE on the aggregate-attach
+path until 2026-11-17, and the loss is silent.** `findActiveAggregateIssue`
+resolves its row through `issues.list`, so it was handed the 1200-code-point
+PREFIX. On any row whose rendered half is longer than that the marker is
+itself past the clip, so the split point is missing, the legacy prefix rescue
+cannot match a stored prefix shorter than the render, and `preservedNotes`
+returns `"\n"` — every byte of notes dropped. Measured on PEN-5068: marker at
+code point 1485, a 9,709-byte standing block destroyed in one write, by the
+delivery that attached a second provider's fingerprint to the aggregate. It
+fires on an ATTACH or a REBIND and not on the ordinary same-fingerprint sync,
+which reads its row with `issues.get` — which is why the row survived 15
+consecutive re-renders and died on the 16th.
+
+The quieter half of the same defect: when the rendered head is SHORT the
+marker survives the clip, so the notes are found and returned — truncated at
+1200. Nothing is reported and the note simply comes back shorter.
+
+`findActiveAggregateIssue` now re-reads the full column before returning, so
+every caller composes onto a complete body. If that re-read fails there is no
+complete body to compose onto, and the description refresh is **skipped for
+that sync** rather than publishing the prefix: the rendered half goes stale
+and recovers on the next delivery, while the notes survive. That trade is
+deliberate — a stale projection is visible and self-correcting, a note
+destroyed in another actor's transaction is neither.
+
+⚠️ **Rows written before this deploys.** Nothing is permanently lost: the
+destroyed text is intact in `GET /api/issues/:id/field-revisions`, which is
+why this was `high` and not `critical`. A row that lost its notes shows a
+below-marker region of exactly one byte (`"\n"`) — that signature, with a
+machine-authored revision (`createdByAgentId: null`), is the fingerprint of
+this defect rather than of a hand edit.
+
 
 ⚠️ The rescue is best-effort and one-shot by construction — it runs only
 while a row has no marker, and the row acquires one on its first sync. The two
