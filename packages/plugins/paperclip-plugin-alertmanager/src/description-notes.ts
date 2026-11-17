@@ -16,6 +16,22 @@
  * forward verbatim, forever, by whichever path writes next. The banner just
  * above the marker says so in the row itself, because the writing run never
  * reads this file — it reads the field it is about to overwrite.
+ *
+ * ⚠ PEN-6796 — "by whichever path writes next" was the claim, and it held for
+ * every path that read its row with `issues.get` and for none that read it
+ * with `issues.list`. A list row's `description` is the first 1200 code
+ * points, so on a row whose rendered half is longer than that the marker is
+ * itself past the clip: the split point is missing, the legacy rescue below
+ * cannot match a stored prefix shorter than the render, and this module
+ * returns "no notes" onto a row that has them. Measured on PEN-5068 — 9,709
+ * bytes destroyed by the delivery that attached a second fingerprint to the
+ * aggregate, after 15 consecutive same-fingerprint syncs had preserved them.
+ *
+ * So `current` now takes the ROW, {@link NotesSource}, and a body the caller
+ * knows is a prefix is REFUSED rather than silently split. The lookup that
+ * fed the two aggregate paths (`findActiveAggregateIssue`) re-reads the whole
+ * column before returning, so in practice the refusal fires only when that
+ * re-read failed.
  */
 
 import { MACHINE_RENDERED_NOTICE } from "./issue-mapping.js";
@@ -44,6 +60,54 @@ const NOTES_BANNER = [
   "is overwritten with no notice and no comment. Notes written **below** the line are",
   "preserved across syncs — put durable state there, or in a comment.",
 ].join("\n");
+
+/**
+ * A body source that knows whether it is the whole stored column.
+ *
+ * PEN-6796: the host's `issues.list` returns `description` CLIPPED to its
+ * first 1200 code points and reports the clip out-of-band as
+ * `descriptionTruncated` (`projectIssueListDescription`,
+ * `server/src/services/issues.ts`); `issues.get` returns the column whole.
+ * Handing {@link composeDescription} a list row therefore asks it to split a
+ * body it cannot see the end of — and on any row whose rendered half is longer
+ * than the cap, the marker itself is past the clip, so the split point is
+ * missing, the legacy prefix rescue cannot match a stored prefix shorter than
+ * the render, and every byte of notes is dropped.
+ *
+ * Passing the ROW rather than `row.description` is what makes that
+ * undetectable-by-inspection case detectable: the flag travels with the body
+ * instead of being something each call site has to remember.
+ */
+export type NotesSource = {
+  description?: string | null;
+  descriptionTruncated?: boolean | null;
+};
+
+/**
+ * Raised when the body offered as "what the row currently holds" is a known
+ * PREFIX of it.
+ *
+ * Thrown rather than degraded on purpose. The alternative — treating a prefix
+ * as the whole body — is exactly PEN-6796: it returns "no notes" and the write
+ * that follows destroys them, with a 200 and a byte-exact same-run read-back.
+ * Both aggregate call sites already wrap their description refresh in a
+ * tolerated `try`/`catch`, so this surfaces as "the rendered half is stale for
+ * one sync" — recovered by the next delivery — instead of a silent, permanent
+ * loss. A stale projection is a real cost (BLO-41538) and it is the cheaper
+ * one, because it is visible and self-correcting.
+ */
+export class TruncatedBodyError extends Error {
+  constructor() {
+    super(
+      "paperclip-plugin-alertmanager: refusing to compose a body onto a " +
+        "TRUNCATED description. The current body is the host's list projection " +
+        "(first 1200 code points), not the stored column, so the notes marker " +
+        "and everything below it may be past the clip. Re-read the row with " +
+        "`issues.get` before composing (PEN-6796).",
+    );
+    this.name = "TruncatedBodyError";
+  }
+}
 
 /**
  * The notes half of an existing body: everything after the marker, verbatim.
@@ -182,13 +246,35 @@ function looksSelfRendered(candidate: string): boolean {
  * Idempotent — `compose(r, compose(r, x)) === compose(r, x)` — so an unchanged
  * alert re-rendered onto its own row writes the same bytes rather than
  * accumulating banners.
+ *
+ * `current` takes the ROW wherever the caller holds one, so
+ * {@link NotesSource.descriptionTruncated} travels with the body and a list
+ * row cannot be composed onto by accident (PEN-6796). A bare string is still
+ * accepted for the create path, which has no row, and for direct unit cases.
+ *
+ * @throws {TruncatedBodyError} when `current` is a known prefix of the column.
  */
 export function composeDescription(
   rendered: string,
-  current: string | null | undefined,
+  current: string | null | undefined | NotesSource,
 ): string {
   const head = trimTrailingSpace(rendered);
-  return `${head}\n\n${NOTES_BANNER}\n${AGENT_NOTES_MARKER}${preservedNotes(rendered, current)}`;
+  return `${head}\n\n${NOTES_BANNER}\n${AGENT_NOTES_MARKER}${preservedNotes(rendered, bodyOf(current))}`;
+}
+
+/**
+ * The stored body behind a {@link NotesSource}, or the string itself.
+ *
+ * ⚠ The refusal is keyed on the flag being EXACTLY `true`, never on the body
+ * being absent. A row read that failed leaves `description` undefined, and
+ * `undefined` already means "no notes" to `preservedNotes` — which is the
+ * documented, tolerated degradation on the resolve path. Only a POSITIVE
+ * "this is a prefix" is an error.
+ */
+function bodyOf(current: string | null | undefined | NotesSource): string | null | undefined {
+  if (current == null || typeof current === "string") return current;
+  if (current.descriptionTruncated === true) throw new TruncatedBodyError();
+  return current.description;
 }
 
 function trimTrailingSpace(value: string): string {

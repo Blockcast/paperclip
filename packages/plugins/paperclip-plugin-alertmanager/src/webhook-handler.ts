@@ -221,8 +221,22 @@ type IssueReference = {
    * PEN-6218: the body already on the row. Carried so a description write can
    * keep the notes half (see `composeDescription`) without a second read — the
    * host returns it on every `issues.list`/`issues.get` row.
+   *
+   * ⚠ PEN-6796: it is RETURNED on both and COMPLETE on only one. `issues.list`
+   * clips it to the first 1200 code points; `issues.get` returns the stored
+   * column. The sentence above was true about PRESENCE and was read as a claim
+   * about COMPLETENESS, which is how a list row reached `composeDescription`
+   * and destroyed 9,709 bytes of notes on PEN-5068. Anything that composes
+   * onto this must come from `findActiveAggregateIssue` (which hydrates) or
+   * from `issues.get` directly.
    */
   description?: string | null;
+  /**
+   * PEN-4450's out-of-band tell, forwarded by the host on list rows: `true`
+   * means `description` above is a PREFIX. `composeDescription` refuses such a
+   * body rather than reading the missing marker as "no notes".
+   */
+  descriptionTruncated?: boolean | null;
 };
 
 type AggregateMemberResolution = {
@@ -262,6 +276,54 @@ function q(ns: string, table: string): string {
   return `${ns}.${table}`;
 }
 
+/**
+ * The host's list cap, duplicated as a FALLBACK ONLY (PEN-4450 /
+ * `ISSUE_LIST_DESCRIPTION_MAX_CHARS`).
+ *
+ * `descriptionTruncated` is the primary signal and the only one that is
+ * authoritative; this exists so a host that stops sending it cannot silently
+ * restore PEN-6796. It degrades safely in both directions: a cap RAISED
+ * server-side makes this over-trigger, costing a redundant `issues.get`, and a
+ * cap LOWERED makes it under-trigger, which the boolean still covers.
+ */
+const HOST_LIST_DESCRIPTION_CAP = 1200;
+
+/**
+ * A row whose `description` is the whole stored column, re-reading it when the
+ * caller was handed the list projection (PEN-6796).
+ *
+ * On a failed re-read the body is dropped and the flag is KEPT, so the row
+ * still answers "does an active aggregate issue exist?" — which is all
+ * `coverage.ts` asks — while any attempt to compose onto it raises
+ * `TruncatedBodyError` instead of quietly publishing a body with no notes.
+ * Dropping the body without keeping the flag would be the original defect.
+ */
+async function withCompleteDescription(
+  ctx: PluginContext,
+  companyId: string,
+  issue: IssueReference,
+): Promise<IssueReference> {
+  const truncated =
+    issue.descriptionTruncated === true ||
+    // Only reached when the host sends no flag; see the constant above.
+    (issue.descriptionTruncated == null &&
+      typeof issue.description === "string" &&
+      Array.from(issue.description).length >= HOST_LIST_DESCRIPTION_CAP);
+  if (!truncated) return issue;
+  try {
+    const whole = (await ctx.issues.get(issue.id, companyId)) as IssueReference | null;
+    if (whole && typeof whole.description === "string") {
+      return { ...issue, description: whole.description, descriptionTruncated: false };
+    }
+  } catch (err) {
+    ctx.logger.warn(
+      `paperclip-plugin-alertmanager: could not re-read the full body of issue ${issue.id}; ` +
+        `its description refresh is skipped this sync so the notes below the marker survive: ${String(err)}`,
+    );
+  }
+  return { ...issue, description: undefined, descriptionTruncated: true };
+}
+
 export async function findActiveAggregateIssue(
   ctx: PluginContext,
   companyId: string,
@@ -282,7 +344,11 @@ export async function findActiveAggregateIssue(
       status,
       limit: 1,
     });
-    if (issue) return issue;
+    // PEN-6796: hydrated HERE rather than at each call site. Five of this
+    // function's six callers feed the row straight into `composeDescription`,
+    // so the invariant belongs to the lookup — a sixth caller added later
+    // inherits it instead of having to know about the cap.
+    if (issue) return await withCompleteDescription(ctx, companyId, issue as IssueReference);
   }
   return null;
 }
@@ -2812,7 +2878,7 @@ export async function handleFiring(
             existing.paperclipIssueId,
             {
               ...(issue.status !== "done" ? { status: "done" as const } : {}),
-              description: composeDescription(newDescription, issue.description),
+              description: composeDescription(newDescription, issue),
               assigneeAgentId: null,
               assigneeUserId: null,
             },
@@ -2845,8 +2911,10 @@ export async function handleFiring(
                   description: composeDescription(
                     await describeOnto(target.id),
                     // The target row's own notes, not ours: this body is being
-                    // published onto a DIFFERENT row than `existing`.
-                    target.description,
+                    // published onto a DIFFERENT row than `existing`. Passed as
+                    // the ROW so a truncated list projection is refused rather
+                    // than read as "no notes" (PEN-6796).
+                    target,
                   ),
                 },
                 existing.paperclipCompanyId,
@@ -2880,7 +2948,7 @@ export async function handleFiring(
                 existing.paperclipIssueId,
                 {
                   status: reopenStatus,
-                  description: composeDescription(newDescription, issue?.description),
+                  description: composeDescription(newDescription, issue),
                 },
                 existing.paperclipCompanyId,
                 undefined,
@@ -2945,7 +3013,7 @@ export async function handleFiring(
         } else if (decision.kind === "refresh") {
           await ctx.issues.update(
             existing.paperclipIssueId,
-            { description: composeDescription(newDescription, issue?.description) },
+            { description: composeDescription(newDescription, issue) },
             existing.paperclipCompanyId,
             undefined,
             { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -3611,7 +3679,7 @@ export async function handleFiring(
     try {
       await ctx.issues.update(
         issue.id,
-        { description: composeDescription(description, issue.description) },
+        { description: composeDescription(description, issue) },
         companyId,
         undefined,
         { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -4091,7 +4159,7 @@ export async function handleResolved(
             });
           await ctx.issues.update(
             aggregateResolution.issueId,
-            { description: composeDescription(description, row?.description) },
+            { description: composeDescription(description, row) },
             existing.paperclipCompanyId,
           );
         }
