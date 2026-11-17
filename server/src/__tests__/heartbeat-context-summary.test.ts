@@ -4860,15 +4860,45 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
   // actually loses data is a sibling writing in the window BETWEEN your re-read and your
   // PATCH -- there your digest MATCHES, because your bytes did land, and their block is
   // gone. The clause never claimed a match proves no loss, but a reader finishing a
-  // digest-centred procedure will infer it, and that inference is the whole failure. The
-  // re-read's ADJACENCY to the write is the only guard on that window, so the clause has
-  // to say so rather than leave the digest looking sufficient.
-  it("denies that a matching digest proves nothing was overwritten", () => {
+  // digest-centred procedure will infer it, and that inference is the whole failure.
+  //
+  // PEN-6793 corrected what the clause then said about the REMEDY. It called the re-read's
+  // ADJACENCY to the write "the only guard on that window", which is measured wrong, and
+  // wrong in the direction that makes the pin read as ceremony: narrowing the window is a
+  // MITIGATION -- it lowers the probability and detects nothing -- while the `baseRevisionId`
+  // CAS is a DETECTION that fails closed. A sibling's write moves `latestFieldRevisionId`
+  // past the pin, so the PATCH is refused 409 and stores nothing. Measured 2026-11-17 with
+  // ONE byte-identical body across three arms: superseded pin refused 409 with the row
+  // unchanged, `null` pin on a never-revised row accepted, current pin accepted -- so the
+  // guard discriminates rather than refusing every pin, which is what makes the refusal mean
+  // something rather than being the only answer the endpoint has.
+  //
+  // The proviso is the load-bearing half and the directive stated it nowhere: a CAS guards a
+  // POINTER, so it is sound exactly while the pin and the body come from the SAME read. Pin
+  // refreshed late -- for the id alone, body still in a variable from an earlier read -- and
+  // it passes every time on content it no longer describes. That split reads as hygiene, and
+  // the two pin sources the directive names are the affordance for it.
+  it("denies that a matching digest proves nothing was overwritten, and names the CAS as the guard that fails closed", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
     expect(markdown).toContain("a MATCHING digest proves only that your bytes landed");
     expect(markdown).toContain("never that nothing was overwritten");
-    expect(markdown).toContain("the only guard on that window; the digest cannot see it");
+    expect(markdown).toContain("the digest cannot see that window at all");
+    // The correction, pinned as a PAIR: adjacency NARROWS, the CAS DETECTS. Dropping either
+    // half restores the understatement, because "narrows" alone still reads as the only move
+    // available and "detects" alone loses the reason to keep the re-read adjacent.
+    expect(markdown).toContain("NARROWS that window, which lowers the odds and detects nothing");
+    expect(markdown).toContain("compare-and-set is what DETECTS a write inside it");
+    // Fails CLOSED, in terms a reader of only this block can act on: a stale pin is refused
+    // and writes nothing, so the sibling's block is still there to rebase onto.
+    expect(markdown).toContain("refused 409 `stale_base_revision` and STORES NOTHING");
+    // The proviso. A pin drawn from a different read than the body passes every time while
+    // describing content it no longer covers -- the one way to hold the CAS and still lose.
+    expect(markdown).toContain("SOUND ONLY WHILE THE PIN AND THE BODY COME FROM THE SAME READ");
+    expect(markdown).toContain("it passes every time, on content it no longer describes");
+    // The adjacency advice SURVIVES. It is still the right thing to do, it is just not the
+    // only guard, and a correction that deleted it would trade one understatement for another.
+    expect(markdown).toContain("Keeping the re-read in the same run and immediately before the write");
   });
 
   // Fourth finding at the fourth head, and the only one that corrects a statement of FACT
