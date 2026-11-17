@@ -1554,8 +1554,10 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   });
 
   // `blocked` is deliberately absent from ISSUE_PARK_EXPIRY_WAKE_STATUSES, so the park sweep
-  // never wakes a blocked row and a park on one must not cover -- on the status conjunct and,
-  // since the term is now scoped to the `in_review` arm, on the call site too.
+  // never wakes a blocked row and a park on one must not cover. PEN-6800 makes this test
+  // strictly MORE load-bearing: a `blocked` blocker matches no earlier arm, so it now REACHES
+  // the terminal park term, and the status conjunct inside the predicate is the only thing
+  // still refusing it. The call-site half of this test's original justification is gone.
   it("does not cover a parked blocker whose status the park sweep never wakes (PEN-5021)", async () => {
     const { companyId, agentId } = await createCompany("PPN");
     const parentId = await insertIssue({ companyId, identifier: "PPN-1", title: "Parent", status: "blocked" });
@@ -1607,10 +1609,17 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  // Scoping control. All five measured PEN-5021 instances are `in_review`; a `todo` blocker
-  // reaches the leaf arm instead and must keep reading `needs_attention`. A status-agnostic
-  // park check placed ahead of that arm would silently cover this row.
-  it("does not cover a parked todo blocker: the park term is scoped to in_review (PEN-5021)", async () => {
+  // PEN-6800, and this test's assertion is the INVERSE of what it asserted until then. It
+  // pinned PEN-5021's scoping: all five instances measured then were `in_review`, so the park
+  // term was consulted in that arm only and a parked `todo` blocker fell to the terminal
+  // verdict as hard attention. Eight instances have since arrived and none is `in_review` --
+  // five live `blocked` rows were each minting a false `severity: "high"` operator item off
+  // exactly this shape. The term is now consulted at the terminal verdict too, so a parked,
+  // agent-assigned, invokable `todo` leaf reads `covered`.
+  //
+  // This is the LOUD direction. The quiet one -- that the new call site must not mask a
+  // deeper item -- is pinned separately below, and that is the test that matters.
+  it("covers a parked todo blocker at the terminal leaf verdict (PEN-6800)", async () => {
     const { companyId, agentId } = await createCompany("PPQ");
     const parentId = await insertIssue({ companyId, identifier: "PPQ-1", title: "Parent", status: "blocked" });
     const blockerId = await insertIssue({
@@ -1626,10 +1635,11 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
 
     expect(parent?.blockerAttention).toMatchObject({
-      state: "needs_attention",
-      reason: "attention_required",
-      coveredBlockerCount: 0,
-      attentionBlockerCount: 1,
+      state: "covered",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
     });
   });
 
@@ -1665,6 +1675,163 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       coveredBlockerCount: 0,
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PPR-3",
+    });
+  });
+
+  // ---------------------------------------------------------------------------------
+  // PEN-6800: the park term's SECOND call site -- the terminal leaf verdict in
+  // `classifyPath`, reachable only when `downstream.length === 0`. PEN-5021 scoped the term
+  // to the `in_review` arm on the evidence then available; every instance measured since has
+  // been `todo` or `in_progress`, reaching the terminal verdict and reading hard attention.
+  //
+  // The quiet direction is the one worth pinning. `covers a parked todo blocker` above is the
+  // loud half and would pass under a careless HOIST too; the masking controls below are what
+  // separate the terminal placement from a hoist, and they are the reason this is safe.
+  // ---------------------------------------------------------------------------------
+
+  // THE control for the quiet direction, at the status the whole cohort was measured on. A
+  // hoist -- or any placement ahead of the recursion -- covers this row and the cancelled
+  // grandchild leaves the operator feed silently. The terminal site cannot: the
+  // `downstream.length > 0` block returns on all three of its branches, so the park term is
+  // never consulted on a node that still has a child to walk.
+  it("surfaces a hard-attention descendant through a parked todo blocker (PEN-6800)", async () => {
+    const { companyId, agentId } = await createCompany("PPV");
+    const parentId = await insertIssue({ companyId, identifier: "PPV-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPV-2",
+      title: "Parked todo blocker with a child",
+      status: "todo",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    const cancelledLeafId = await insertIssue({
+      companyId,
+      identifier: "PPV-3",
+      title: "Cancelled grandchild blocker",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: cancelledLeafId, blockedIssueId: blockerId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PPV-3",
+    });
+  });
+
+  // The invokability conjunct, at the new call site. It is what retired the first of the
+  // three hazards PEN-5021 named, and it is refused twice here: once by the leaf invokability
+  // arm that sits directly above the terminal verdict, and once by the predicate's own third
+  // conjunct. Neither is relied on alone.
+  it("does not cover a parked todo blocker owned by a paused agent (PEN-6800)", async () => {
+    const { companyId, pausedAgentId } = await createCompany("PPU");
+    const parentId = await insertIssue({ companyId, identifier: "PPU-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPU-2",
+      title: "Parked todo blocker owned by a paused agent",
+      status: "todo",
+      assigneeAgentId: pausedAgentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+  });
+
+  // `backlog` is OUT OF SCOPE and this pins it. The status IS in
+  // ISSUE_PARK_EXPIRY_WAKE_STATUSES, so the predicate itself would admit this row -- what
+  // refuses it is the `backlog && assigneeAgentId` arm returning AHEAD of the recursion,
+  // untouched by PEN-6800. Consulting the park term at THAT arm would buy back the masking
+  // hazard on the one status where it is still open, so widening there needs its own row.
+  // If this test ever goes red, the term has been moved somewhere it must not be.
+  it("does not cover a parked backlog blocker: that arm precedes the recursion (PEN-6800)", async () => {
+    const { companyId, agentId } = await createCompany("PPW");
+    const parentId = await insertIssue({ companyId, identifier: "PPW-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPW-2",
+      title: "Parked backlog blocker",
+      status: "backlog",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+  });
+
+  // Expiry is the default at the new call site too, so suppression cannot decay into
+  // permanent silence: a park nobody restates stops covering on its own. The `in_review`
+  // twin of this control is `stalls an in_review blocker whose deliberate park has lapsed`.
+  it("does not cover a todo blocker whose deliberate park has lapsed (PEN-6800)", async () => {
+    const { companyId, agentId } = await createCompany("PPS");
+    const parentId = await insertIssue({ companyId, identifier: "PPS-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPS-2",
+      title: "Lapsed park todo blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+  });
+
+  // The other newly-covered status. `todo` is the measured cohort; `in_progress` reaches the
+  // same terminal verdict and is covered by the same conjuncts, so it is pinned rather than
+  // left to be inferred.
+  it("covers a parked in_progress blocker at the terminal leaf verdict (PEN-6800)", async () => {
+    const { companyId, agentId } = await createCompany("PPT");
+    const parentId = await insertIssue({ companyId, identifier: "PPT-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPT-2",
+      title: "Parked in_progress leaf blocker",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
     });
   });
 

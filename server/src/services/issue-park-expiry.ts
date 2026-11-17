@@ -19,11 +19,13 @@
  *    until PEN-4871: the row above stopped being FLAGGED as stranded and went on being
  *    WOKEN anyway, ~9 minutes after every park, at full agent-session cost.
  *  - `hasLiveDeliberateParkWakePath` (`services/issues.ts`) — the blocker-attention walk's
- *    `in_review` arm (PEN-5021). The odd one out: it suppresses a false `stalled`
- *    CLASSIFICATION rather than a wake, so a blocker deliberately stood down stops minting
- *    a `severity: "high"` attention item. Listed because this registry is of park READERS,
- *    and that caller existed while the sentence above still read "three places" — the exact
- *    drift this list exists to prevent, reproduced on the list itself.
+ *    `in_review` arm (PEN-5021) and, since PEN-6800, its TERMINAL leaf verdict as well. That
+ *    second call site is the one that reaches the `todo`/`in_progress` population, where
+ *    every instance measured after PEN-5021 landed. The odd one out: it suppresses a false
+ *    `stalled` CLASSIFICATION rather than a wake, so a blocker deliberately stood down stops
+ *    minting a `severity: "high"` attention item. Listed because this registry is of park
+ *    READERS, and that caller existed while the sentence above still read "three places" —
+ *    the exact drift this list exists to prevent, reproduced on the list itself.
  *  - `deliberateParkWindow` (`services/productivity-review.ts`) — the `long_active_duration`
  *    trigger (PEN-4522, #3316, merged 2026-11-03T09:39Z). The second odd one out, and why the
  *    sentence above no longer says every reader defers to the boolean: this one needs a START

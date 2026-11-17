@@ -3975,9 +3975,12 @@ function hasInvokableBlockerAssignee(
  *    BLO-22660). This is the fourth caller, not a fourth copy. A lapsed or unparseable
  *    deadline reads as not-parked, so suppression expires on its own.
  *  - `isIssueParkExpiryWakeStatus` — the sweep wakes `backlog`/`todo`/`in_progress`/
- *    `in_review` only. Redundant at the single call site below, which is already inside the
- *    `in_review` arm, and kept anyway so the predicate states the whole condition under
- *    which a park owes a wake rather than half of it.
+ *    `in_review` only. It was redundant while the only call site sat inside the `in_review`
+ *    arm, and was kept anyway so the predicate stated the whole condition under which a park
+ *    owes a wake rather than half of it. At the terminal call site added by PEN-6800 it is
+ *    LOAD-BEARING: it is the conjunct that keeps `blocked` — deliberately absent from
+ *    `ISSUE_PARK_EXPIRY_WAKE_STATUSES` (PEN-5291) — reading hard attention there. Stating
+ *    the whole condition is what let that second call site be added without re-deriving it.
  *  - an agent to wake, and no human assignee — `issueParkOwesReleaseWake` requires both,
  *    because `enqueueWakeup` takes an agent id and a park on a human-assigned row is a note
  *    to a person rather than a schedulable wake. Human-assigned blockers already reach
@@ -3987,13 +3990,44 @@ function hasInvokableBlockerAssignee(
  *    SERVED. A park whose assignee is paused, terminated or in another company is owed a
  *    wake that no runnable agent can take, so it is not attendance.
  *
- * Call site is the `in_review` arm only, deliberately. A park is the same statement about
- * attendance on every status the sweep wakes, but the earlier, status-agnostic placement of
- * this check short-circuited ahead of the `backlog` arm, the downstream recursion and the
- * leaf invokability check — which could turn `needs_attention` into `covered` and, worse,
- * stop the walk before a hard-attention item deeper in the chain was ever reached. All five
- * measured instances are `in_review`; widening past the evidence here buys nothing and risks
- * the quiet direction, which PEN-5021 records as the more expensive of the two.
+ * TWO call sites (PEN-6800), and the second is placed where the hazard that scoped the first
+ * cannot arise.
+ *
+ * PEN-5021 shipped this term inside the `in_review` arm only, on the honest ground that all
+ * five instances measured then were `in_review`. Eight have since arrived and NONE of them
+ * is `in_review`. A blocker that is parked, agent-assigned, invokable and genuinely owed a
+ * release wake, but on `todo` or `in_progress`, matched no arm in `classifyPath`, fell to
+ * the terminal `unattended()` and minted the same false `severity: "high"` operator item
+ * this predicate exists to prevent — the identical defect arriving on a different status.
+ * Scope-to-the-evidence was not wrong; it has to be revisited when the evidence arrives, and
+ * nothing wakes the author when it does.
+ *
+ * ⛔ The remedy is NOT a hoist, and PEN-5021's warning still stands verbatim against one: a
+ * status-agnostic placement short-circuits ahead of the `backlog` arm, the downstream
+ * recursion and the leaf invokability check, which could turn `needs_attention` into
+ * `covered` and, worse, stop the walk before a hard-attention item deeper in the chain was
+ * ever reached. That quiet direction remains the more expensive of the two.
+ *
+ * The second call site is the TERMINAL `unattended()` in `classifyPath`, which retires that
+ * hazard BY CONSTRUCTION rather than by argument. The `if (downstream.length > 0)` block
+ * returns on every one of its three branches (`hardAttention`, `stalledEntry`, all-covered),
+ * so the terminal return is reachable ONLY when `downstream.length === 0`: the walk is
+ * already exhausted and there is nothing left to mask. It also sits BELOW the leaf
+ * invokability arm, so a park owned by a paused, terminated or foreign-company agent is
+ * refused twice.
+ *
+ * It cannot mask a stale human-assigned `stalled` verdict either, and that is structural
+ * rather than lucky: `humanAssignedStale` is set only when `assigneeUserId` is present, this
+ * predicate returns false on exactly that, and the PEN-5105 arm above only reaches `stale`
+ * when no park is live. The two can never both hold.
+ *
+ * ⛔ `backlog` is deliberately NOT covered by this change. It IS in
+ * `ISSUE_PARK_EXPIRY_WAKE_STATUSES`, so the term would be semantically right there — but the
+ * `backlog && assigneeAgentId` arm returns AHEAD of the recursion, so consulting the term at
+ * THAT arm buys the masking hazard back on the one status where it is still open. A
+ * `backlog` blocker therefore reaches the terminal site only when it has no agent assignee,
+ * where the invokability conjunct refuses it anyway. Widening to that arm needs its own
+ * evidence and its own row.
  */
 function hasLiveDeliberateParkWakePath(
   node: Pick<IssueBlockerAttentionNode, "status" | "assigneeAgentId" | "assigneeUserId" | "parkedUntil">,
@@ -4562,6 +4596,21 @@ async function listIssueBlockerAttentionMap(
 
     if (node.assigneeAgentId && !hasInvokableBlockerAssignee(node.assigneeAgentId, agentsById, companyId)) {
       return unattended();
+    }
+
+    // PEN-6800: the SECOND call site of the park term, and the walk is EXHAUSTED when it
+    // runs. The `if (downstream.length > 0)` block above returns on every one of its three
+    // branches, so this point is reachable only when `downstream.length === 0` -- there is
+    // no deeper item left for a `covered` verdict to mask. That is what makes this
+    // placement safe where a hoist is not; see `hasLiveDeliberateParkWakePath`, which
+    // carries the full argument and the warning against hoisting.
+    //
+    // Order against the invokability arm directly above is deliberate rather than
+    // incidental: a park owned by a paused, terminated or foreign-company agent is refused
+    // twice over, once by that arm and once by this predicate's own third conjunct. Either
+    // alone would do; neither is relied on alone.
+    if (hasLiveDeliberateParkWakePath(node, blockerAttentionNowMs, agentsById, companyId)) {
+      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
 
     return unattended();
