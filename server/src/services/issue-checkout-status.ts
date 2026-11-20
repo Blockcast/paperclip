@@ -3,7 +3,7 @@ import { heartbeatRuns, issueRelations, issues, type Db, type DbTransaction } fr
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 import { buildIssueMonitorEligibilityClear } from "./issue-execution-policy.js";
 import { logIssueMonitorClearedUndeliverable, type ActivityPublish } from "./activity-log.js";
-import { externalWaitFromDescription } from "./external-wait-declaration.js";
+import { externalWaitDescriptionCandidate, externalWaitFromDescription } from "./external-wait-declaration.js";
 
 type DbOrTransaction = Db | DbTransaction;
 
@@ -327,7 +327,7 @@ async function selectDeclaredExternalWaitIds(
   scope: SQL | undefined,
 ): Promise<string[]> {
   const candidates = await dbOrTx
-    .select({ id: issues.id, description: issues.description })
+    .select({ id: issues.id, description: externalWaitDescriptionCandidate })
     .from(issues)
     .where(and(scope, eq(issues.checkoutRestoreStatus, "blocked"), restorableCheckoutPromotion));
 
