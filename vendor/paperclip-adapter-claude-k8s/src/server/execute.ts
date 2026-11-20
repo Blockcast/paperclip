@@ -793,8 +793,9 @@ async function tailPodLogFile(
   let offset = 0;
   try {
     while (!stopSignal.stopped) {
-      const stat = await fs.stat(filePath);
-      const size = stat.size;
+      // BLO-58502: fstat the open handle rather than re-walking the CephFS path every
+      // poll; per live run this was the top `stat` self-time frame in stall profiles.
+      const { size } = await handle.stat();
       if (size > offset) {
         const buf = Buffer.alloc(size - offset);
         const { bytesRead } = await handle.read(buf, 0, buf.length, offset);

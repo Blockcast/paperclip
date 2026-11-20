@@ -91,7 +91,7 @@ import {
   lockIssueOwnership,
   restoreCheckoutPromotedStatus,
 } from "./issue-checkout-status.js";
-import { externalWaitFromDescription } from "./external-wait-declaration.js";
+import { externalWaitDescriptionCandidate, externalWaitFromDescription } from "./external-wait-declaration.js";
 // PEN-6587 moved the definition to a leaf module so `issue-checkout-status.ts` can read it
 // without closing an import cycle. Re-exported here so every existing importer is unchanged.
 export { externalWaitFromDescription };
@@ -5407,7 +5407,8 @@ export async function listBlockedIssueAutoResumeSuppressions(
       // projects the first ISSUE_LIST_DESCRIPTION_MAX_CHARS and that is exactly what made
       // the blocked-inbox oracle disagree with its own list in BLO-31839 — a park declared
       // past the cutoff parsed as `null`. Here that would silently drain it (BLO-30445).
-      description: issues.description,
+      // BLO-58502: the candidate projection is still the full column when it can match.
+      description: externalWaitDescriptionCandidate,
       // BLO-27553: the liveness clause is load-bearing, and its absence made this
       // suppression PERMANENT. `gateSignals` is written into `executionState.monitor`
       // when a monitor is armed and is NEVER erased when that monitor is cleared or

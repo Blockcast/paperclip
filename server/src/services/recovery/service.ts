@@ -90,6 +90,7 @@ import {
   lockIssueParentMutationCompany,
   type IssueDependencyReadiness,
 } from "../issues.js";
+import { externalWaitDescriptionCandidate } from "../external-wait-declaration.js";
 import {
   issueLockOwnerStateMatches,
   lockIssueOwnership,
@@ -12036,7 +12037,7 @@ export function recoveryService(
           // BLO-24662: only used to derive the `hasExternalWaitOwner` boolean below. The
           // prose itself never reaches the classifier — a description can carry
           // external-wait details that are redacted on read.
-          description: issues.description,
+          description: externalWaitDescriptionCandidate,
         })
         .from(issues)
         .where(
