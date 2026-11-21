@@ -122,7 +122,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ steps.target.outputs.full }}
@@ -551,7 +551,7 @@ jobs:
       blocked: ${{ steps.check.outputs.blocked }}
     steps:
       - name: Checkout workflow scripts
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
       - name: Check for an existing pending production approval
@@ -589,7 +589,7 @@ jobs:
       blocked: ${{ steps.check.outputs.blocked }}
     steps:
       - name: Checkout workflow scripts
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
       - name: Re-check for a pending production approval right before deploy
@@ -655,7 +655,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && needs.build-and-push.outputs.target_sha || github.sha }}
@@ -793,7 +793,7 @@ jobs:
       # checkout stays in place: the Helm chart and application artifact must
       # still come from the historical commit being rolled out.
       - name: Checkout release tooling at trusted revision
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-tooling
@@ -1935,7 +1935,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout workflow scripts
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
       - name: Assert this dispatch reached a deploy outcome
@@ -1991,7 +1991,7 @@ jobs:
       actions: read
       checks: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Report the unpublished image to Alertmanager
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -2031,7 +2031,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Resolve the image-delivery alert (and prove the channel still works)
         env:
           BUILD_RESULT: ${{ needs.build-and-push.result }}
