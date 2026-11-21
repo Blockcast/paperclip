@@ -117,7 +117,7 @@ test("the Docker workflow keeps launcher credentials separate from vendor creden
   assert.doesNotMatch(dockerWorkflow, /secrets\.PAPERCLIP_BOARD_TOKEN/);
   assert.match(
     dockerWorkflow,
-    /uses: actions\/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2\.2\.2/,
+    /uses: actions\/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3\.3\.0/,
   );
   assert.match(dockerWorkflow, /app-id: \$\{\{ vars\.COMMITPERCLIP_APP_ID \}\}/);
   assert.match(
