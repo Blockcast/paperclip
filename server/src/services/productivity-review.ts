@@ -2545,6 +2545,45 @@ const notPreDispatchCancelledSql = or(
   notInArray(heartbeatRuns.errorCode, PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES),
 );
 
+// BLO-58522 ruling (a): runs that executed ZERO model turns are not churn — they
+// are infrastructure or dispatcher telemetry with no agent conduct to judge. The
+// set is the pre-dispatch cancellations above plus the claude-k8s adapter's
+// fail-closed refusals raised BEFORE `buildJobManifest` (no Job, no prompt, no
+// CLI spawn — see heartbeat.ts BLO-17938 and zero-token-startup-failure.ts).
+//
+// Keyed on a POSITIVELY populated `errorCode` on a TERMINAL row, never on absent
+// telemetry (`usageJson`/`logBytes` null), per the ruling: absence reads as zero
+// and would exclude real runs. That is also why a cancellation code like
+// `issue_cancelled` or `external_wait_yield` is NOT here — those can land after
+// turns executed, and a run cancelled after executing turns is conduct (it is
+// how a runaway loop gets killed), so it stays in the count. The broader
+// `isInfraClassErrorCodeRun` set is not reused for the same reason: it includes
+// provider codes (`claude_transient_upstream`, `rate_limit_exhausted`) whose
+// runs can be billed mid-turn.
+//
+// The terminal-status guard is load-bearing for the reason given on
+// `notPreDispatchCancelledSql`: `errorCode` is also written on live
+// `scheduled_retry` rows, which the churn bar must keep counting.
+const ZERO_TURN_RUN_ERROR_CODES = [
+  ...PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES,
+  "k8s_concurrency_guard_unreachable",
+  "k8s_concurrent_run_blocked",
+  "k8s_agent_workspace_pvc_failed",
+  "skill_materialization_pending",
+];
+function isZeroTurnRun(run: Pick<HeartbeatRunRow, "status" | "errorCode">): boolean {
+  return (
+    TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]) &&
+    run.errorCode != null &&
+    ZERO_TURN_RUN_ERROR_CODES.includes(run.errorCode)
+  );
+}
+const notZeroTurnRunSql = or(
+  notInArray(heartbeatRuns.status, [...TERMINAL_RUN_STATUSES]),
+  isNull(heartbeatRuns.errorCode),
+  notInArray(heartbeatRuns.errorCode, ZERO_TURN_RUN_ERROR_CODES),
+);
+
 // True when no adapter container was ever created for this run, so nothing
 // capable of writing a comment ever existed (BLO-23096: `preferred_workspace_
 // unrealizable` / `adapter_failed` pre-adapter setup failures, observed at
@@ -4503,6 +4542,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
           notPreDispatchCancelledSql,
+          notZeroTurnRunSql,
         ),
       )
       .then((rows) => rows[0]?.count ?? 0);
@@ -5461,12 +5501,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // post-hoc `return null` on `trigger === "high_churn"`: `high_churn`
     // outranks `runaway_execution` and `long_active_duration`, so suppressing
     // after the ladder would discard a co-fired trigger with it.
+    //
+    // BLO-58522 ruling (a): zero-turn runs (`isZeroTurnRun`) are dropped from the
+    // all-`advanced` test as they are from the run count. `> 0` is checked on the
+    // REDUCED set, so a burst made entirely of zero-turn runs cannot pass
+    // vacuously — it either falls under the bar on the reduced count or fires.
+    const turnExecutingRuns = latestRuns.filter((run) => !isZeroTurnRun(run));
     const progressBurst =
       isProgressPullRequest(latestPullRequest) &&
       runtimeFailureStreak === 0 &&
       noCommentStreak === 0 &&
-      latestRuns.length > 0 &&
-      latestRuns.every((run) => run.livenessState === "advanced");
+      turnExecutingRuns.length > 0 &&
+      turnExecutingRuns.every((run) => run.livenessState === "advanced");
     const highChurn =
       (runCountLastHour >= thresholds.highChurnHourly ||
         churnCommentCountLastHour >= thresholds.highChurnHourly ||

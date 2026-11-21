@@ -1476,6 +1476,115 @@ describeEmbeddedPostgres("productivity review service", () => {
         const [review] = await listProductivityReviews(seeded.companyId);
         expect(review?.description).toContain("Primary trigger: `runaway_execution`");
       });
+
+      // BLO-58522 ruling (a). Runs that executed ZERO model turns — identified by
+      // a positively populated pre-turn `errorCode` on a terminal row — are
+      // dropped from the run count and from the all-`advanced` test. A run
+      // cancelled AFTER executing turns is conduct and stays in both. Each cell
+      // below is red when its guard is reverted on its own.
+      describe("zero-turn runs (BLO-58522 ruling a)", () => {
+        const minutesAgo = (m: number) => new Date(now.getTime() - m * 60 * 1000);
+        const zeroTurnGuardRuns = (
+          seeded: Awaited<ReturnType<typeof seedAssignedIssue>>,
+          count: number,
+          at: Date,
+          extra: Partial<Parameters<typeof insertRuns>[0]> = {},
+        ) =>
+          insertRuns({
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            issueId: seeded.issueId,
+            count,
+            now: at,
+            status: "failed",
+            livenessState: "failed",
+            errorCode: "k8s_concurrency_guard_unreachable",
+            usageJson: null,
+            logBytes: 1537,
+            ...extra,
+          });
+        const nineCommentedRuns = (seeded: Awaited<ReturnType<typeof seedAssignedIssue>>) =>
+          insertRuns({
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            issueId: seeded.issueId,
+            count: 9,
+            now,
+            withRunComments: true,
+          });
+
+        // BLO-57350 shape: k8s concurrency-guard refusals inflate the hourly
+        // count past the bar. Older than the real runs, so the runtime-failure
+        // walk breaks on the newest (advanced) run and only the count arm is
+        // under test. Guard: `notZeroTurnRunSql` in `countIssueRunsSince`.
+        it("does not count zero-turn runs toward the churn bar", async () => {
+          const seeded = await seedAssignedIssue();
+          await zeroTurnGuardRuns(seeded, 5, minutesAgo(20));
+          await nineCommentedRuns(seeded);
+          const result = await reconcile(seeded.companyId);
+          expect(result.created).toBe(0);
+        });
+
+        // Same counts, but the five older runs were cancelled AFTER executing
+        // turns: that is conduct, so they count and the bar is reached.
+        it("still counts a run cancelled after it executed turns", async () => {
+          const seeded = await seedAssignedIssue();
+          await zeroTurnGuardRuns(seeded, 5, minutesAgo(20), {
+            status: "cancelled",
+            livenessState: null,
+            errorCode: "issue_cancelled",
+            usageJson: { inputTokens: 40, outputTokens: 900 },
+            logBytes: 90_000,
+          });
+          await nineCommentedRuns(seeded);
+          await expectHighChurn(seeded.companyId);
+        });
+
+        // BLO-55398 component: dispatcher-suppressed duplicates sit in the
+        // sampled runs with `livenessState: null`. Guard: the
+        // `turnExecutingRuns` filter in `progressBurst`.
+        it("suppresses a progress burst carrying zero-turn duplicate-dispatch cancellations", async () => {
+          const seeded = await freshMergedPr();
+          await churn(seeded, minutesAgo(1));
+          await zeroTurnGuardRuns(seeded, 3, now, {
+            status: "cancelled",
+            livenessState: null,
+            errorCode: "duplicate_dispatch_suppressed",
+            startedAt: null,
+            logBytes: null,
+          });
+          const result = await reconcile(seeded.companyId);
+          expect(result.created).toBe(0);
+        });
+
+        it("still fires when a sampled run was cancelled after executing turns", async () => {
+          const seeded = await freshMergedPr();
+          await churn(seeded, minutesAgo(1));
+          await insertRuns({
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            issueId: seeded.issueId,
+            count: 1,
+            now,
+            withRunComments: true,
+            status: "cancelled",
+            livenessState: null,
+            errorCode: "issue_cancelled",
+            usageJson: { inputTokens: 40, outputTokens: 900 },
+          });
+          await expectHighChurn(seeded.companyId);
+        });
+
+        // No vacuous pass: every sampled run is zero-turn, so the reduced set is
+        // empty and all-`advanced` would be trivially true. The run arm reads 0;
+        // churn comes from the comment arm. Liveness is `advanced` (artificial)
+        // so neither streak can carry the fire — only the `> 0` guard can.
+        it("fires when every sampled run is zero-turn", async () => {
+          const seeded = await freshMergedPr();
+          await zeroTurnGuardRuns(seeded, 10, now, { livenessState: "advanced", withRunComments: true });
+          await expectHighChurn(seeded.companyId);
+        });
+      });
     });
 
     describe("a fresh assignee-filed linked issue (A2)", () => {
