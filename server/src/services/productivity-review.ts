@@ -59,6 +59,7 @@ import {
   isExternalWaitYieldRun,
   isInfraClassErrorCodeRun,
   isInfraFailureRun,
+  runUsageHasNoModelTokens,
   runUsageTokenCounts,
 } from "./recovery/zero-token-startup-failure.js";
 import { extractNextActionFromText } from "./run-liveness.js";
@@ -2535,6 +2536,26 @@ function isNeverExecutedRun(
 // membership, not by construction. Add any non-terminal code to that list with
 // the status guard removed and capacity-parked runs silently stop being
 // countable.
+// BLO-58522 ruling (a): a run that ended having executed ZERO model turns —
+// never invoked, failed before its first turn, or cancelled before its first
+// turn. It is platform telemetry, not conduct, so it is excluded from the
+// `high_churn` run count and from the progress-burst all-`advanced` test.
+//
+// Keyed on a POSITIVELY populated field: a terminal status AND a non-null
+// usage blob that measures zero tokens. `usageJson: null` is unknown, not zero
+// (BLO-22097) — `runUsageHasNoModelTokens(null)` is true, so the explicit
+// null guard is load-bearing: without it every run whose usage was never
+// recorded would silently leave the churn count. A run cancelled AFTER it
+// executed turns carries non-zero usage and stays counted; that is how a
+// runaway loop gets killed, and it is conduct.
+function isZeroTurnRun(run: Pick<HeartbeatRunRow, "status" | "usageJson">): boolean {
+  return (
+    TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]) &&
+    run.usageJson != null &&
+    runUsageHasNoModelTokens(run.usageJson)
+  );
+}
+
 const PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES = [
   "duplicate_dispatch_suppressed",
   "issue_dependencies_blocked",
@@ -4493,8 +4514,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
+    // BLO-58522: filtered in JS so `isZeroTurnRun` stays the single definition
+    // (the token keys come in two spellings plus `raw*` twins).
     return db
-      .select({ count: sql<number>`count(*)::int` })
+      .select({ status: heartbeatRuns.status, usageJson: heartbeatRuns.usageJson })
       .from(heartbeatRuns)
       .where(
         and(
@@ -4505,7 +4528,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           notPreDispatchCancelledSql,
         ),
       )
-      .then((rows) => rows[0]?.count ?? 0);
+      .then((rows) => rows.filter((run) => !isZeroTurnRun(run)).length);
   }
 
   /**
@@ -5461,12 +5484,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // post-hoc `return null` on `trigger === "high_churn"`: `high_churn`
     // outranks `runaway_execution` and `long_active_duration`, so suppressing
     // after the ladder would discard a co-fired trigger with it.
+    //
+    // BLO-58522 ruling (a): zero-turn runs (`isZeroTurnRun`) are excluded from
+    // the all-`advanced` test — they carry no conduct to judge. The non-empty
+    // check is over the REDUCED set: a sample that is entirely zero-turn must
+    // not pass vacuously through `every()`; it either falls under the churn bar
+    // on the reduced count or it fires.
+    const turnExecutingRuns = latestRuns.filter((run) => !isZeroTurnRun(run));
     const progressBurst =
       isProgressPullRequest(latestPullRequest) &&
       runtimeFailureStreak === 0 &&
       noCommentStreak === 0 &&
-      latestRuns.length > 0 &&
-      latestRuns.every((run) => run.livenessState === "advanced");
+      turnExecutingRuns.length > 0 &&
+      turnExecutingRuns.every((run) => run.livenessState === "advanced");
     const highChurn =
       (runCountLastHour >= thresholds.highChurnHourly ||
         churnCommentCountLastHour >= thresholds.highChurnHourly ||

@@ -1429,6 +1429,123 @@ describeEmbeddedPostgres("productivity review service", () => {
         await expectHighChurn(seeded.companyId);
       });
 
+      // BLO-58522 ruling (a). A zero-turn run is terminal with a MEASURED zero
+      // usage blob. These are dependency-gate cancellations so they stay
+      // transparent to both streaks and isolate the ruling's own guards.
+      const zeroUsage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0 };
+      async function zeroTurnRuns(
+        seeded: Awaited<ReturnType<typeof seedAssignedIssue>>,
+        count: number,
+        at: Date,
+        extra: { withRunComments?: boolean; errorCode?: string } = {},
+      ) {
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count,
+          now: at,
+          status: "cancelled",
+          livenessState: "failed",
+          usageJson: zeroUsage,
+          logBytes: 0,
+          errorCode: extra.errorCode ?? "issue_dependencies_blocked",
+          withRunComments: extra.withRunComments,
+        });
+      }
+
+      // Shape 1 of BLO-58522: an otherwise-clean progress burst whose sample
+      // also holds zero-turn runs. They are not `advanced`, so before the ruling
+      // they blocked suppression. Guard: the all-`advanced` filter.
+      it("does not generate when the only non-advanced runs executed zero turns", async () => {
+        const seeded = await freshMergedPr();
+        await churn(seeded);
+        await zeroTurnRuns(seeded, 2, new Date(now.getTime() - 20 * 60 * 1000));
+        const result = await reconcile(seeded.companyId);
+        expect(result.created).toBe(0);
+      });
+
+      // Guard: the count exclusion. 9 executing runs + 1 zero-turn run is 10
+      // raw (the hourly bar) but 9 net. The extra runs carry no comment, so the
+      // comment arm (9) cannot reach the bar on its own in this and the next two. Not a dependency-gate cancel, which the
+      // SQL already drops; a provider-capacity cancel before the first turn.
+      it("does not count a zero-turn run toward the churn bar", async () => {
+        const seeded = await seedAssignedIssue();
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 9,
+          now,
+          withRunComments: true,
+        });
+        await zeroTurnRuns(seeded, 1, new Date(now.getTime() - 20 * 60 * 1000), {
+          errorCode: "k8s_concurrency_guard_unreachable",
+        });
+        const result = await reconcile(seeded.companyId);
+        expect(result.created).toBe(0);
+      });
+
+      // Same as above, but the cancelled run executed turns: it is conduct and
+      // MUST still count. Guard: `isZeroTurnRun` keyed on measured usage, not
+      // on status.
+      it("still counts a run cancelled after it executed turns", async () => {
+        const seeded = await seedAssignedIssue();
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 9,
+          now,
+          withRunComments: true,
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now: new Date(now.getTime() - 20 * 60 * 1000),
+          status: "cancelled",
+          livenessState: "failed",
+          usageJson: { inputTokens: 1200, outputTokens: 300 },
+        });
+        await expectHighChurn(seeded.companyId);
+      });
+
+      // Same count, but usage was never RECORDED (null). Unknown is not zero:
+      // the run stays counted. Guard: the `usageJson != null` conjunct.
+      it("still counts a terminal run whose usage was never recorded", async () => {
+        const seeded = await seedAssignedIssue();
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 9,
+          now,
+          withRunComments: true,
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now: new Date(now.getTime() - 20 * 60 * 1000),
+          status: "cancelled",
+          livenessState: "failed",
+          usageJson: null,
+        });
+        await expectHighChurn(seeded.companyId);
+      });
+
+      // No vacuous pass: every sampled run is zero-turn, so the reduced set is
+      // empty and `every()` is trivially true. Churn arrives on the run-scoped
+      // comment arm. Guard: the non-empty check over the reduced set.
+      it("still fires when every sampled run is zero-turn", async () => {
+        const seeded = await freshMergedPr();
+        await zeroTurnRuns(seeded, 10, now, { withRunComments: true });
+        await expectHighChurn(seeded.companyId);
+      });
+
       // The guard sits BEFORE `choosePrimaryTrigger`. A post-hoc `return null`
       // on `trigger === "high_churn"` would also drop this co-fired runaway run,
       // because `high_churn` outranks it in the ladder. Churn here is the
