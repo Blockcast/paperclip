@@ -59,6 +59,7 @@ import {
   isExternalWaitYieldRun,
   isInfraClassErrorCodeRun,
   isInfraFailureRun,
+  runUsageHasNoModelTokens,
   runUsageTokenCounts,
 } from "./recovery/zero-token-startup-failure.js";
 import { extractNextActionFromText } from "./run-liveness.js";
@@ -2615,6 +2616,48 @@ function isNeverInvokedRun(
   return (run.logBytes ?? 0) === 0;
 }
 
+// BLO-51422 / BLO-58522 ruling (a): a run that executed ZERO model turns is no
+// conduct of the assignee's, so it is removed from the `high_churn` run count
+// and from the progress-burst all-`advanced` test. A run that was cancelled or
+// failed AFTER executing turns stays counted -- that is how a runaway loop gets
+// killed, and it must remain visible.
+//
+// Positive evidence only, never absence (the ruling's condition 1): an absent
+// field reads as zero, so keying on one would exclude real runs. Two arms:
+//   - a closed set of adapter refusals raised before any Job exists (see the
+//     BLO-17938 / PEN-4932 notes in heartbeat.ts and
+//     ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES) -- no prompt, no CLI, no turn;
+//   - a usage blob that EXPLICITLY records zero input and zero output tokens
+//     (and no cache traffic). `runUsageTokenCounts` reads a missing key as 0,
+//     so the two primary keys are checked for presence first.
+// `usageJson: null` and all-null telemetry (never-invoked) are deliberately
+// NOT matched here; such runs keep counting. Prefer counting, as everywhere in
+// this file.
+const PRE_TURN_REFUSAL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "k8s_concurrent_run_blocked",
+  "k8s_concurrency_guard_unreachable",
+  "k8s_agent_workspace_pvc_failed",
+  "skill_materialization_pending",
+]);
+
+function hasFiniteTokenKey(usage: Record<string, unknown>, keys: readonly string[]): boolean {
+  return keys.some((key) => {
+    const raw = usage[key];
+    const value = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : raw;
+    return typeof value === "number" && Number.isFinite(value);
+  });
+}
+
+function isZeroTurnRun(run: Pick<HeartbeatRunRow, "status" | "errorCode" | "usageJson">): boolean {
+  if (!TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number])) return false;
+  if (run.errorCode != null && PRE_TURN_REFUSAL_ERROR_CODES.has(run.errorCode)) return true;
+  const usage = run.usageJson;
+  if (usage == null) return false;
+  if (!hasFiniteTokenKey(usage, ["inputTokens", "input_tokens"])) return false;
+  if (!hasFiniteTokenKey(usage, ["outputTokens", "output_tokens"])) return false;
+  return runUsageHasNoModelTokens(usage);
+}
+
 // The most common `errorCode` among `runs`, but ONLY when it holds a strict
 // majority — a plurality decided by run ordering would render as a definite
 // diagnosis of the window when none exists (e.g. 2 infra + 2 dependency-gate
@@ -4492,9 +4535,12 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     );
   }
 
+  // BLO-58522 ruling (a): zero-turn runs (`isZeroTurnRun`) are dropped from the
+  // `high_churn` denominator. Filtered in JS over the window's rows rather than
+  // re-spelled in SQL so there is one definition; the 6h window is small.
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
     return db
-      .select({ count: sql<number>`count(*)::int` })
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, usageJson: heartbeatRuns.usageJson })
       .from(heartbeatRuns)
       .where(
         and(
@@ -4505,7 +4551,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           notPreDispatchCancelledSql,
         ),
       )
-      .then((rows) => rows[0]?.count ?? 0);
+      .then((rows) => rows.filter((run) => !isZeroTurnRun(run)).length);
   }
 
   /**
@@ -5461,12 +5507,19 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // post-hoc `return null` on `trigger === "high_churn"`: `high_churn`
     // outranks `runaway_execution` and `long_active_duration`, so suppressing
     // after the ladder would discard a co-fired trigger with it.
+    //
+    // BLO-58522 ruling (a): zero-turn runs are excluded from the all-`advanced`
+    // test (and from the churn count, in `countIssueRunsSince`). The non-empty
+    // check runs on the REDUCED set: an all-zero-turn sample must not pass
+    // vacuously -- it either falls under the churn bar on the reduced count or
+    // it fires.
+    const turnExecutingRuns = latestRuns.filter((run) => !isZeroTurnRun(run));
     const progressBurst =
       isProgressPullRequest(latestPullRequest) &&
       runtimeFailureStreak === 0 &&
       noCommentStreak === 0 &&
-      latestRuns.length > 0 &&
-      latestRuns.every((run) => run.livenessState === "advanced");
+      turnExecutingRuns.length > 0 &&
+      turnExecutingRuns.every((run) => run.livenessState === "advanced");
     const highChurn =
       (runCountLastHour >= thresholds.highChurnHourly ||
         churnCommentCountLastHour >= thresholds.highChurnHourly ||

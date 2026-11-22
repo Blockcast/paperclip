@@ -1476,6 +1476,122 @@ describeEmbeddedPostgres("productivity review service", () => {
         const [review] = await listProductivityReviews(seeded.companyId);
         expect(review?.description).toContain("Primary trigger: `runaway_execution`");
       });
+
+      // BLO-58522 ruling (a). A run that executed ZERO model turns is not
+      // conduct: it drops out of the churn count and out of the all-`advanced`
+      // test. Identified only from positively-populated fields -- a pre-Job
+      // adapter refusal code, or a usage blob that explicitly records zero
+      // tokens. Each cell is one revert away from red.
+      describe("zero-turn runs (BLO-58522 ruling a)", () => {
+        const zeroTurnRefusal = (seeded: Awaited<ReturnType<typeof seedAssignedIssue>>, at: Date, count = 1) =>
+          insertRuns({
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            issueId: seeded.issueId,
+            count,
+            now: at,
+            status: "failed",
+            livenessState: "failed",
+            usageJson: null,
+            logBytes: 0,
+            errorCode: "k8s_concurrency_guard_unreachable",
+          });
+        // 9 commented `advanced` runs: one under `highChurnHourly` (10).
+        const nineAdvanced = (seeded: Awaited<ReturnType<typeof seedAssignedIssue>>) =>
+          insertRuns({
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            issueId: seeded.issueId,
+            count: 9,
+            now,
+            withRunComments: true,
+          });
+        const oneOlderRun = (
+          seeded: Awaited<ReturnType<typeof seedAssignedIssue>>,
+          extra: { status: string; livenessState: string; usageJson: Record<string, unknown> | null },
+        ) =>
+          insertRuns({
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            issueId: seeded.issueId,
+            count: 1,
+            now: new Date(now.getTime() - 20 * 60 * 1000),
+            withRunComments: true,
+            ...extra,
+          });
+
+        it("a pre-Job refusal does not count toward the churn bar", async () => {
+          const seeded = await seedAssignedIssue();
+          await nineAdvanced(seeded);
+          await zeroTurnRefusal(seeded, new Date(now.getTime() - 20 * 60 * 1000));
+          const result = await reconcile(seeded.companyId);
+          expect(result.created).toBe(0);
+        });
+
+        it("an explicit zero-token run does not count toward the churn bar", async () => {
+          const seeded = await seedAssignedIssue();
+          await nineAdvanced(seeded);
+          await oneOlderRun(seeded, {
+            status: "failed",
+            livenessState: "failed",
+            usageJson: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheCreationInputTokens: 0 },
+          });
+          const result = await reconcile(seeded.companyId);
+          expect(result.created).toBe(0);
+        });
+
+        // Condition 1: a run cancelled AFTER executing turns is conduct.
+        it("a run cancelled after executing turns still counts", async () => {
+          const seeded = await seedAssignedIssue();
+          await nineAdvanced(seeded);
+          await oneOlderRun(seeded, {
+            status: "cancelled",
+            livenessState: "failed",
+            usageJson: { inputTokens: 1200, outputTokens: 300 },
+          });
+          await expectHighChurn(seeded.companyId);
+        });
+
+        // Condition 1: absence is not zero. A usage blob with no token keys
+        // reads as 0 through `runUsageTokenCounts` and must not be excluded.
+        it("a usage blob with no token keys still counts", async () => {
+          const seeded = await seedAssignedIssue();
+          await nineAdvanced(seeded);
+          await oneOlderRun(seeded, { status: "failed", livenessState: "failed", usageJson: { costUsd: 0.4 } });
+          await expectHighChurn(seeded.companyId);
+        });
+
+        // Shape 1 (BLO-57350 / BLO-57371): the reduced count still clears the
+        // bar, and a zero-turn refusal in the sample must not veto suppression.
+        it("does not let a zero-turn run fail the all-`advanced` test", async () => {
+          const seeded = await freshMergedPr();
+          await churn(seeded);
+          await zeroTurnRefusal(seeded, new Date(now.getTime() - 20 * 60 * 1000), 2);
+          const result = await reconcile(seeded.companyId);
+          expect(result.created).toBe(0);
+          expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+        });
+
+        // Condition 2: no vacuous pass. Every sampled run is zero-turn, so the
+        // reduced run set is empty; churn comes from the comment arm. The
+        // liveness is `advanced` and every run carries a comment only so that
+        // neither streak masks the non-empty guard this cell exists to pin.
+        it("still fires when every sampled run is zero-turn", async () => {
+          const seeded = await freshMergedPr();
+          await insertRuns({
+            companyId: seeded.companyId,
+            agentId: seeded.coderId,
+            issueId: seeded.issueId,
+            count: 10,
+            now,
+            withRunComments: true,
+            status: "failed",
+            livenessState: "advanced",
+            errorCode: "k8s_concurrency_guard_unreachable",
+          });
+          await expectHighChurn(seeded.companyId);
+        });
+      });
     });
 
     describe("a fresh assignee-filed linked issue (A2)", () => {
