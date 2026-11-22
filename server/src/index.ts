@@ -126,7 +126,9 @@ import {
   maybeDumpStallFlightRecording,
   startCpuFlightRecorder,
   maybeTakeCpuProfile,
+  STALL_PROFILE_MIN_STALL_MS,
 } from "./services/cpu-profile.js";
+import { readOffCpuSamples, startOffCpuSampler, summarizeOffCpuSamples } from "./services/off-cpu-sampler.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -1493,10 +1495,20 @@ export async function startServer(): Promise<StartedServer> {
     startCpuFlightRecorder(CPU_FLIGHT_RECORDER_PRODUCTION_OPTS).catch((err) =>
       logger.error({ err }, "CPU flight recorder failed to start"),
     );
+    // The profile cannot see a stall spent blocked in the kernel; this names it (BLO-58777).
+    startOffCpuSampler();
     setEventLoopStallListener((stallMs) => {
-      maybeDumpStallFlightRecording(stallMs, { dir: config.heapSnapshotDir, keep: 3 })
-        .then((res) => {
-          if (res) logger.warn({ file: res.file, triggerStallMs: stallMs, ...res.summary }, "CPU profile written");
+      const to = Date.now();
+      // The listener fires up to one sample interval after the stall ends, so widen the window.
+      const offCpu =
+        stallMs >= STALL_PROFILE_MIN_STALL_MS
+          ? readOffCpuSamples(to - stallMs - 2_000, to).then((s) => (s ? summarizeOffCpuSamples(s) : null))
+          : Promise.resolve(null);
+      Promise.all([maybeDumpStallFlightRecording(stallMs, { dir: config.heapSnapshotDir, keep: 3 }), offCpu])
+        .then(([res, off]) => {
+          if (res) logger.warn({ file: res.file, triggerStallMs: stallMs, ...res.summary, offCpu: off }, "CPU profile written");
+          // Profile is on cooldown, but the off-CPU summary is cheap and per-stall.
+          else if (off?.samples) logger.warn({ triggerStallMs: stallMs, offCpu: off }, "event-loop stall off-CPU samples");
         })
         .catch((err) =>
           logger.error({ err, dir: config.heapSnapshotDir }, "stall-triggered CPU profile capture failed"),
