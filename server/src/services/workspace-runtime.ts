@@ -3179,6 +3179,14 @@ export async function reconcilePendingForwardBranchAfterPersistence(input: {
   return result;
 }
 
+async function isWorktreeRepairedTo(worktreePath: string, expectedBranchName: string) {
+  const branch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], worktreePath).catch(() => null);
+  if (branch !== expectedBranchName) return false;
+  const status = await runGit(["status", "--porcelain", "--untracked-files=all"], worktreePath).catch(() => null);
+  if (status === null || status.trim().length > 0) return false;
+  return (await detectGitWorktreeInProgressOperation(worktreePath)) === null;
+}
+
 export async function ensureGitWorktreeBranchCoherent(input: {
   db?: Db | null;
   repoRoot: string;
@@ -3296,19 +3304,37 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     evidence.safeRepair.eligible = true;
     evidence.safeRepair.attempted = true;
     evidence.safeRepair.reason = "dirty worktree can be quarantined on a rescue branch before restoring the recorded branch";
-    const result = await quarantineDirtyWorktreeBranchIncoherence({
-      db: input.db,
-      repoRoot: input.repoRoot,
-      worktreePath: input.worktreePath,
-      expectedBranchName,
-      sourceIssue: input.sourceIssue,
-      executionWorkspaceId: input.executionWorkspaceId ?? null,
-      heartbeatRunId: input.heartbeatRunId ?? null,
-      evidence,
-      phase: input.reconcileOperationPhase,
-      recorder: input.recorder ?? null,
-      recreateExpectedBranch,
-    });
+    let result: Awaited<ReturnType<typeof quarantineDirtyWorktreeBranchIncoherence>>;
+    try {
+      result = await quarantineDirtyWorktreeBranchIncoherence({
+        db: input.db,
+        repoRoot: input.repoRoot,
+        worktreePath: input.worktreePath,
+        expectedBranchName,
+        sourceIssue: input.sourceIssue,
+        executionWorkspaceId: input.executionWorkspaceId ?? null,
+        heartbeatRunId: input.heartbeatRunId ?? null,
+        evidence,
+        phase: input.reconcileOperationPhase,
+        recorder: input.recorder ?? null,
+        recreateExpectedBranch,
+      });
+    } catch (error) {
+      // BLO-55723 / BLO-54736: two prepares for the same issue raced the repair inside one
+      // second; the loser's `checkout -b` collided with the winner's rescue branch and blocked
+      // the row although the winner had already repaired it. If the tree now reads repaired,
+      // accept the peer's repair instead of failing.
+      if (!(await isWorktreeRepairedTo(input.worktreePath, expectedBranchName))) throw error;
+      evidence.safeRepair.succeeded = true;
+      evidence.safeRepair.reason = "dirty worktree was repaired by a concurrent attempt";
+      return {
+        branchName: expectedBranchName,
+        reconciledForward: false,
+        warnings: [
+          `Execution workspace dirty quarantine repair lost a race to a concurrent attempt, which had already restored recorded branch "${expectedBranchName}" on a clean worktree; continuing on it.`,
+        ],
+      };
+    }
     evidence.safeRepair.succeeded = true;
     evidence.safeRepair.reason = result.clearedInProgressOperation
       ? `dirty worktree quarantined on ${result.rescueBranch} at ${formatShortSha(result.rescueCommitSha)}; interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} state cleared`
