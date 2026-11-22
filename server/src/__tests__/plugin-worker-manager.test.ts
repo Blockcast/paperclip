@@ -49,6 +49,7 @@ const INVOCATION_SCOPE_WORKER_ENTRYPOINT = path.join(
   "plugin-worker-invocation-scope.cjs",
 );
 const TERMINATED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-terminated.cjs");
+const STDIN_CLOSED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-stdin-closed.cjs");
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -249,6 +250,43 @@ describe("plugin-worker-manager stderr failure context", () => {
       expect(unhandledRejection).not.toHaveBeenCalled();
     } finally {
       process.off("unhandledRejection", unhandledRejection);
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
+  it("does not raise an uncaughtException when writing to a worker whose stdin is closed (BLO-58597)", async () => {
+    const uncaught = vi.fn();
+    process.on("uncaughtException", uncaught);
+    logSpies.warn.mockClear();
+
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: STDIN_CLOSED_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
+      apiVersion: 1,
+      hostHandlers: {},
+      rpcTimeoutMs: 200,
+    });
+
+    try {
+      await handle.start();
+      // Let the child close fd 0 before the host writes to it.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      const pending = handle.call(
+        "environmentExecute" as keyof HostToWorkerMethods,
+        {} as HostToWorkerMethods[keyof HostToWorkerMethods][0],
+      );
+      await pending.catch(() => undefined);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(uncaught).not.toHaveBeenCalled();
+      expect(fieldsLoggedAs(logSpies.warn, "worker stdin write failed (child gone)")).toEqual([
+        expect.objectContaining({ code: "EPIPE" }),
+      ]);
+    } finally {
+      process.off("uncaughtException", uncaught);
       await handle.stop().catch(() => undefined);
     }
   });
