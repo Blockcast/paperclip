@@ -1078,6 +1078,12 @@ export function createPluginWorkerHandle(
       });
     }
 
+    // BLO-58597: a write to a child that has closed its stdin fails ASYNC with
+    // EPIPE on this socket; unhandled, that error kills the whole host process.
+    child.stdin?.on("error", (err: NodeJS.ErrnoException) => {
+      log.warn({ code: err.code, err: err.message }, "worker stdin write failed (child gone)");
+    });
+
     // Handle process exit
     child.on("exit", (code, signal) => {
       handleProcessExit(code, signal);
