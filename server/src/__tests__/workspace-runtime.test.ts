@@ -8320,6 +8320,58 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     ]));
   }, 20_000);
 
+  // BLO-55723 / BLO-54736: two prepares raced the repair inside one second. The peer
+  // quarantined to the same second-resolution rescue name, so our `checkout -b` collided
+  // ("already exists") and the row was blocked although the tree was already repaired.
+  async function runRaceWithPeerRepair(peerRepairs: boolean) {
+    const expectedBranch = peerRepairs ? "PAP-470-recorded" : "PAP-471-recorded";
+    const actualBranch = peerRepairs ? "PAP-470-live" : "PAP-471-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: peerRepairs ? "PAP-470" : "PAP-471",
+      claimant: "none",
+    });
+    const recorder: WorkspaceOperationRecorder = {
+      ...createWorkspaceOperationRecorderDouble().recorder,
+      recordOperation: async (op) => {
+        const rescue = op.command?.match(/^git checkout -b (paperclip\/rescue\/\S+)$/)?.[1];
+        if (rescue) {
+          // The peer wins the race with the identical rescue name.
+          await readGit(worktreePath, ["checkout", "-b", rescue]);
+          if (peerRepairs) {
+            await readGit(worktreePath, ["add", "-A"]);
+            await readGit(worktreePath, ["commit", "-m", "peer rescue"]);
+            await readGit(worktreePath, ["checkout", expectedBranch]);
+          } else {
+            await readGit(worktreePath, ["checkout", actualBranch]);
+          }
+        }
+        const result = await op.run();
+        return { id: "op", status: result.status ?? "succeeded" } as unknown as WorkspaceOperation;
+      },
+    };
+    const attempt = restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids, recorder });
+    return { attempt, worktreePath, expectedBranch };
+  }
+
+  it("accepts a concurrent attempt's repair when the rescue branch name collides", async () => {
+    const { attempt, worktreePath, expectedBranch } = await runRaceWithPeerRepair(true);
+    const restored = await attempt;
+    expect(restored?.branchName).toBe(expectedBranch);
+    expect(restored?.warnings.some((w) => w.includes("lost a race to a concurrent attempt"))).toBe(true);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+  }, 20_000);
+
+  it("still fails a rescue-branch collision when the worktree was not repaired", async () => {
+    const { attempt, worktreePath } = await runRaceWithPeerRepair(false);
+    await expect(attempt).rejects.toMatchObject({ code: "workspace_validation_failed" });
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
+  }, 20_000);
+
   // BLO-55723: the recorded branch was deleted (closed PR) while the worktree sat
   // dirty on another branch; the repair used to refuse forever.
   it("quarantines dirty work and recreates the recorded branch when it no longer exists", async () => {
