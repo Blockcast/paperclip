@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  offCpuSamplerWorkerForTest,
   readOffCpuSamples,
   startOffCpuSampler,
   stopOffCpuSampler,
@@ -31,6 +32,28 @@ describe.runIf(process.platform === "linux")("off-CPU sampler (BLO-58777)", () =
     const from = Date.now();
     await settle(600);
     expect(await readOffCpuSamples(from, Date.now())).toEqual([]);
+  });
+
+  it("degrades to null, without throwing, once the worker has exited", async () => {
+    startOffCpuSampler({ beatMs: 20, pollMs: 50, staleMs: 200 });
+    const worker = offCpuSamplerWorkerForTest()!;
+    // postMessage throwing synchronously (ERR_WORKER_NOT_RUNNING) before "exit" has been delivered.
+    worker.postMessage = () => {
+      throw Object.assign(new Error("Worker is not running"), { code: "ERR_WORKER_NOT_RUNNING" });
+    };
+    const t0 = Date.now();
+    await expect(readOffCpuSamples(0, Date.now(), 5_000)).resolves.toBeNull();
+    expect(Date.now() - t0).toBeLessThan(1_000); // answered at once, not by the timeout
+    expect(offCpuSamplerWorkerForTest()).toBeNull();
+    await worker.terminate();
+
+    // An exit on its own also retires the sampler, so a restart gets a live worker.
+    startOffCpuSampler({ beatMs: 20, pollMs: 50, staleMs: 200 });
+    const second = offCpuSamplerWorkerForTest()!;
+    await second.terminate();
+    await settle(50);
+    expect(offCpuSamplerWorkerForTest()).toBeNull();
+    await expect(readOffCpuSamples(0, Date.now())).resolves.toBeNull();
   });
 
   it("reads null when not running", async () => {
