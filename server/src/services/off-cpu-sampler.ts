@@ -49,7 +49,7 @@ setInterval(() => {
 parentPort.on("message", ({ id, from, to }) => parentPort.postMessage({ id, samples: ring.filter((s) => s.t >= from && s.t <= to) }));
 `;
 
-type Sampler = { worker: Worker; timer: ReturnType<typeof setInterval>; pending: Map<number, (s: OffCpuSample[]) => void>; nextId: number };
+type Sampler = { worker: Worker; timer: ReturnType<typeof setInterval>; pending: Map<number, (s: OffCpuSample[] | null) => void>; nextId: number };
 let sampler: Sampler | null = null;
 
 /** Idempotent. Linux only (reads /proc); a no-op elsewhere. */
@@ -76,16 +76,30 @@ export function startOffCpuSampler(opts: { beatMs?: number; pollMs?: number; sta
     s.pending.get(id)?.(samples);
     s.pending.delete(id);
   });
-  // A dead sampler must not take the worker process with it; readers then time out to null.
+  // A dead sampler must not take the worker process with it: swallow the error, drop the sampler on
+  // exit (which follows an error), and answer any waiting reader with null.
   worker.on("error", () => undefined);
+  worker.on("exit", () => retire(s));
   sampler = s;
+}
+
+function retire(s: Sampler): void {
+  clearInterval(s.timer);
+  for (const resolve of s.pending.values()) resolve(null);
+  s.pending.clear();
+  if (sampler === s) sampler = null;
 }
 
 export function stopOffCpuSampler(): void {
   if (!sampler) return;
-  clearInterval(sampler.timer);
-  void sampler.worker.terminate();
-  sampler = null;
+  const s = sampler;
+  retire(s);
+  void s.worker.terminate();
+}
+
+/** Test seam: the live sampler worker, so a test can kill it. */
+export function offCpuSamplerWorkerForTest(): Worker | null {
+  return sampler?.worker ?? null;
 }
 
 /** Samples taken in [from, to] (epoch ms). Never rejects: null when not running or the worker does not answer. */
@@ -103,7 +117,15 @@ export function readOffCpuSamples(from: number, to: number, timeoutMs = 2_000): 
       clearTimeout(timer);
       resolve(samples);
     });
-    s.worker.postMessage({ id, from, to });
+    try {
+      s.worker.postMessage({ id, from, to });
+    } catch {
+      // ERR_WORKER_NOT_RUNNING before "exit" has fired: this runs inside the stall listener, so degrade.
+      clearTimeout(timer);
+      s.pending.delete(id);
+      retire(s);
+      resolve(null);
+    }
   });
 }
 
