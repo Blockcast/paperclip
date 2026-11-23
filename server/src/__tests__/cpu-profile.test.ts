@@ -118,7 +118,16 @@ describe("summarizeCpuProfile (BLO-51594)", () => {
   });
 
   it("is empty, not throwing, on a profile with no samples", () => {
-    expect(summarizeCpuProfile({ nodes })).toEqual({ longestBusyMs: 0, topFrames: [] });
+    expect(summarizeCpuProfile({ nodes })).toEqual({ longestBusyMs: 0, topFrames: [], maxSampleGapMs: 0 });
+  });
+
+  it("reports a sampling gap that longestBusyMs cannot see (BLO-58781)", () => {
+    // 1.4 s busy run, then a 9 s hole with no samples charged to an idle sample: an off-CPU stall.
+    const samples = [4, 4, 6, 5];
+    const timeDeltas = [0, 0.7e6, 0.7e6, 9e6];
+    const s = summarizeCpuProfile({ nodes, samples, timeDeltas });
+    expect(s.longestBusyMs).toBe(1_400);
+    expect(s.maxSampleGapMs).toBe(9_000);
   });
 });
 

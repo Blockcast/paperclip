@@ -66,6 +66,10 @@ let lastStallProfileAt = Number.NEGATIVE_INFINITY;
  * dump writes whichever of the two holds the longer busy run.
  */
 /**
+ * NOT started in production since BLO-58781: on paperclip-1 each rotation was a 2-4 s stall every
+ * 15 min and each dump one more, while it attributed 1 of 15 stalls >=5 s (the rest had no samples
+ * in them, i.e. off-CPU; off-cpu-sampler.ts names those). The sentinel profile still works on demand.
+ *
  * Production settings. Each rotation runs Profiler.stop + Profiler.start on the
  * main isolate and blocks the loop for seconds on a worker (start re-logs every
  * compiled function, whatever the sampling interval), so segments are long:
@@ -165,6 +169,11 @@ export type CpuProfileSummary = {
   longestBusyMs: number;
   /** Heaviest self-time frames inside that run, each with its JS caller chain (innermost first). */
   topFrames: { selfMs: number; stack: string[] }[];
+  /**
+   * Longest gap between two consecutive samples (BLO-58781). A stall with no samples in it (main
+   * thread blocked in the kernel, or the process stopped) shows here, not in `longestBusyMs`.
+   */
+  maxSampleGapMs: number;
 };
 
 /**
@@ -212,7 +221,8 @@ export function summarizeCpuProfile(profile: CpuProfile, top = 5): CpuProfileSum
     .sort((a, b) => b[1] - a[1])
     .slice(0, top)
     .map(([id, selfUs]) => ({ selfMs: Math.round(selfUs / 1000), stack: stackOf(id) }));
-  return { longestBusyMs: Math.round(best.us / 1000), topFrames };
+  const maxSampleGapUs = deltas.reduce((m, d) => Math.max(m, d), 0);
+  return { longestBusyMs: Math.round(best.us / 1000), topFrames, maxSampleGapMs: Math.round(maxSampleGapUs / 1000) };
 }
 
 async function writeCpuProfile(
