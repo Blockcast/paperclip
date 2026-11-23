@@ -121,10 +121,8 @@ import {
   takeHeapSnapshot,
 } from "./services/heap-snapshot.js";
 import {
-  CPU_FLIGHT_RECORDER_PRODUCTION_OPTS,
   CPU_PROFILE_SENTINEL_BASENAME,
   maybeDumpStallFlightRecording,
-  startCpuFlightRecorder,
   maybeTakeCpuProfile,
   STALL_PROFILE_MIN_STALL_MS,
 } from "./services/cpu-profile.js";
@@ -1489,12 +1487,9 @@ export async function startServer(): Promise<StartedServer> {
           ),
         );
     }, 60_000).unref?.();
-    // Flight recorder (BLO-51594): a profile started after a stall cannot
-    // contain it, so keep one running and dump the segment the stall landed in.
-    // Rotation cost is why the segment is long; see the constant (BLO-57549).
-    startCpuFlightRecorder(CPU_FLIGHT_RECORDER_PRODUCTION_OPTS).catch((err) =>
-      logger.error({ err }, "CPU flight recorder failed to start"),
-    );
+    // The CPU flight recorder is deliberately not started (BLO-58781): its rotation
+    // stalled the loop for seconds every 15 min and it could not see off-CPU stalls.
+    // maybeDumpStallFlightRecording below then resolves null; the off-CPU summary still logs.
     // The profile cannot see a stall spent blocked in the kernel; this names it (BLO-58777).
     startOffCpuSampler();
     setEventLoopStallListener((stallMs) => {
