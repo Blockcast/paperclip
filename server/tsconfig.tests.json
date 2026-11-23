@@ -90,6 +90,7 @@
     "src/__tests__/monitor-clear-activity-defer-publish.test.ts",
     "src/__tests__/monitor-cleared-payload-agreement.test.ts",
     "src/__tests__/native-memory-metrics.test.ts",
+    "src/__tests__/off-cpu-sampler.test.ts",
     "src/__tests__/open-pull-requests-at-head.test.ts",
     "src/__tests__/orphan-artifact-path-agreement.test.ts",
     "src/__tests__/orphan-reap-adapter-invoke-probe-batching.test.ts",
