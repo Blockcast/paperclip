@@ -2815,6 +2815,22 @@ async function recordDirtyQuarantineOperation(input: {
   });
 }
 
+async function isWorktreeRepairedTo(worktreePath: string, expectedBranchName: string) {
+  const branch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], worktreePath).catch(() => null);
+  if (branch !== expectedBranchName) return false;
+  const status = await runGit(["status", "--porcelain", "--untracked-files=all"], worktreePath).catch(() => null);
+  if (status === null || status.trim().length > 0) return false;
+  return (await detectGitWorktreeInProgressOperation(worktreePath)) === null;
+}
+
+// Thrown only when our own rescue `checkout -b` collided with a peer's identically named rescue
+// branch AND the tree already reads repaired, i.e. this attempt changed nothing and the peer did.
+class DirtyQuarantineRepairedByConcurrentAttempt extends Error {
+  constructor(readonly rescueBranch: string) {
+    super(`dirty quarantine rescue branch ${rescueBranch} was created by a concurrent attempt`);
+  }
+}
+
 async function quarantineDirtyWorktreeBranchIncoherence(input: {
   db: Db;
   repoRoot: string;
@@ -2868,8 +2884,10 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
 
   let rescueBranchCreated = false;
   let expectedBranchRestored = false;
+  let creatingRescueBranch = false;
   try {
     const quarantinedIndexLockPath = await ensureGitIndexIsUnlocked(input.worktreePath);
+    creatingRescueBranch = true;
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
       args: ["checkout", "-b", rescueBranch],
@@ -3014,6 +3032,18 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
       ...comments,
     };
   } catch (error) {
+    // BLO-55723 / BLO-54736: a same-second peer prepare already created this rescue branch.
+    // Accept only if our failure was that very `checkout -b` (nothing of ours ran yet), the
+    // peer's rescue ref exists, and the tree reads repaired; any later failure stays fatal.
+    if (
+      creatingRescueBranch
+      && !rescueBranchCreated
+      && await runGit(["rev-parse", "--verify", "--quiet", `refs/heads/${rescueBranch}`], input.worktreePath)
+        .then(() => true, () => false)
+      && await isWorktreeRepairedTo(input.worktreePath, input.expectedBranchName)
+    ) {
+      throw new DirtyQuarantineRepairedByConcurrentAttempt(rescueBranch);
+    }
     if (rescueBranchCreated && !expectedBranchRestored) {
       await runGit(["checkout", input.expectedBranchName], input.worktreePath).catch(() => null);
     }
@@ -3179,14 +3209,6 @@ export async function reconcilePendingForwardBranchAfterPersistence(input: {
   return result;
 }
 
-async function isWorktreeRepairedTo(worktreePath: string, expectedBranchName: string) {
-  const branch = await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], worktreePath).catch(() => null);
-  if (branch !== expectedBranchName) return false;
-  const status = await runGit(["status", "--porcelain", "--untracked-files=all"], worktreePath).catch(() => null);
-  if (status === null || status.trim().length > 0) return false;
-  return (await detectGitWorktreeInProgressOperation(worktreePath)) === null;
-}
-
 export async function ensureGitWorktreeBranchCoherent(input: {
   db?: Db | null;
   repoRoot: string;
@@ -3320,13 +3342,10 @@ export async function ensureGitWorktreeBranchCoherent(input: {
         recreateExpectedBranch,
       });
     } catch (error) {
-      // BLO-55723 / BLO-54736: two prepares for the same issue raced the repair inside one
-      // second; the loser's `checkout -b` collided with the winner's rescue branch and blocked
-      // the row although the winner had already repaired it. If the tree now reads repaired,
-      // accept the peer's repair instead of failing.
-      if (!(await isWorktreeRepairedTo(input.worktreePath, expectedBranchName))) throw error;
+      // BLO-55723 / BLO-54736: a same-issue peer prepare won the repair race; see the throw site.
+      if (!(error instanceof DirtyQuarantineRepairedByConcurrentAttempt)) throw error;
       evidence.safeRepair.succeeded = true;
-      evidence.safeRepair.reason = "dirty worktree was repaired by a concurrent attempt";
+      evidence.safeRepair.reason = `dirty worktree was repaired by a concurrent attempt on ${error.rescueBranch}`;
       return {
         branchName: expectedBranchName,
         reconciledForward: false,
