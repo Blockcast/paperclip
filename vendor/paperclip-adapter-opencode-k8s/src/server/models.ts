@@ -8,6 +8,8 @@ export const STATIC_MODELS: AdapterModel[] = [
   // current workhorse, GPT-6 Astra the frontier tier, GPT-6 Sol/Luna the
   // previous workhorse and the fast/cheap tier, GPT-5.6 Sol/Terra/Luna and
   // GPT-5.5 the older generations still served.
+  { id: "openai/gpt-6.2-sol", label: "openai/gpt-6.2-sol" },
+  { id: "openai/gpt-6.2-astra", label: "openai/gpt-6.2-astra" },
   { id: "openai/gpt-6.1-sol", label: "openai/gpt-6.1-sol" },
   { id: "openai/gpt-6-astra", label: "openai/gpt-6-astra" },
   { id: "openai/gpt-6-sol", label: "openai/gpt-6-sol" },
