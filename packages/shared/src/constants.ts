@@ -623,6 +623,43 @@ export type SystemIssueDocumentKey = (typeof SYSTEM_ISSUE_DOCUMENT_KEYS)[number]
  */
 export const ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY = "status-adjudication" as const;
 
+/**
+ * The literal route that writes the key above, and the sentence that names it.
+ *
+ * PEN-7126: until this constant existed, that route was spelled out in exactly
+ * ONE place — the done gate's 422 — and that text is emitted only on an
+ * ATTEMPTED CLOSE. A run dispatched with `writeContainment: "status_only"`
+ * reads its evidence block, posts a verdict as a COMMENT and ends, so it never
+ * attempts the close and never receives the one message that names the carrier.
+ * The messages it does receive ("Paperclip needs a disposition before this
+ * issue can continue.", then the exhausted-recovery notice) named no carrier at
+ * all, and neither did the generated `## Manager Decision` block.
+ *
+ * Measured on the Penstock fleet 2026-11-24: 72 agent runs across 32 open
+ * `issue_productivity_review` rows, 9 of them on one row inside six hours, each
+ * writing a CORRECT verdict to a carrier the closing guard cannot read. Writing
+ * this document closed all 32 on the first attempt — that uniformity is the
+ * control identifying the carrier, not the verdict, as the whole cause.
+ *
+ * So the route is a shared constant rather than a literal per call site: the
+ * surfaces a status-only run actually reads BEFORE it ends have to name it too,
+ * and a second spelling is how they drift back apart.
+ */
+export const ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE =
+  `PUT /api/issues/:id/documents/${ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY}` as const;
+
+/**
+ * One sentence, shared by every surface that has to tell an agent where a
+ * disposition goes. Deliberately leads with what a COMMENT does not do: in the
+ * measured loop above, every looping run had already written the verdict as a
+ * comment, so a notice that only named the document would have read as an
+ * additional option rather than as a correction.
+ */
+export const ISSUE_STATUS_ADJUDICATION_CARRIER_NOTICE =
+  "A disposition is a status change, and a comment body does not record one. A cheap status-only " +
+  "recovery run, which may not author deliverables, records its verdict at " +
+  `${ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE} and then sets the status.`;
+
 const SYSTEM_ISSUE_DOCUMENT_KEY_SET = new Set<string>(SYSTEM_ISSUE_DOCUMENT_KEYS);
 
 export function isSystemIssueDocumentKey(key: string): key is SystemIssueDocumentKey {

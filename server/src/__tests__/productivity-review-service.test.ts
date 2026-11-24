@@ -25,7 +25,12 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS, MAX_ISSUE_REQUEST_DEPTH } from "@paperclipai/shared";
+import {
+  ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE,
+  MAX_ISSUE_REQUEST_DEPTH,
+} from "@paperclipai/shared";
 import {
   DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY,
   DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS,
@@ -2913,6 +2918,65 @@ describeEmbeddedPostgres("productivity review service", () => {
     // The sanctioned alternative path, so the limit is not a bare prohibition.
     expect(description).toContain("must be complete at creation");
     expect(description).toContain("goes in a comment on this review issue");
+  });
+
+  // PEN-7126: the Manager Decision block told a reviewer which verdict to
+  // reach and never where to record it. A review row dispatches
+  // `writeContainment: "status_only"`, where the done gate refuses a close with
+  // no execution run, no PR link and no run-attributed durable artifact — and
+  // the only artifact that lane may author is the status-adjudication
+  // document. That rule lived in exactly one place, the gate's own 422, which a
+  // run that records a verdict and ends never triggers. Measured on the
+  // Penstock fleet: 72 runs across 32 rows, 9 on one row in six hours, every
+  // verdict correct and written as a comment; writing the document closed all
+  // 32 first try.
+  //
+  // Asserted on BOTH trigger branches, because the block is appended outside
+  // the trigger conditional and a regression that moved it inside one branch
+  // would still pass a single-branch test.
+  it("tells the reviewer which carrier closes the review row, on every trigger branch (PEN-7126)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+
+    const fourVerdict = await seedAssignedIssue();
+    await insertRuns({
+      companyId: fourVerdict.companyId,
+      agentId: fourVerdict.coderId,
+      issueId: fourVerdict.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: fourVerdict.companyId });
+    const fourVerdictDescription = (await listProductivityReviews(fourVerdict.companyId))[0]?.description ?? "";
+
+    const runtimeFailure = await seedAssignedIssue();
+    await insertRuns({
+      companyId: runtimeFailure.companyId,
+      agentId: runtimeFailure.coderId,
+      issueId: runtimeFailure.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      status: "failed",
+      livenessState: "failed",
+      usageJson: { inputTokens: 0, outputTokens: 0 },
+      logBytes: 111_337,
+    });
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: runtimeFailure.companyId });
+    const runtimeFailureDescription = (await listProductivityReviews(runtimeFailure.companyId))[0]?.description ?? "";
+
+    // Control: the two rows really are on different branches, so a single
+    // rendering path cannot be satisfying both assertions below.
+    expect(fourVerdictDescription).toContain("- Block with an unblock owner");
+    expect(runtimeFailureDescription).toContain("Route to platform/SRE for one of:");
+
+    for (const description of [fourVerdictDescription, runtimeFailureDescription]) {
+      expect(description).toContain("## Recording the verdict");
+      expect(description).toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY);
+      expect(description).toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE);
+      // The correction, not just the pointer: every looping run had already
+      // written the verdict as a comment, so naming the document without
+      // ruling out the comment reads as an extra option.
+      expect(description).toContain("A verdict written only as a comment closes nothing");
+    }
   });
 
   // BLO-22097 Ally follow-up: a streak that mixes an explicit measured zero

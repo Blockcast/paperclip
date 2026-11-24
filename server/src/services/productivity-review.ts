@@ -5,6 +5,7 @@ import {
   clampIssueRequestDepth,
   isProductivityReviewOptedOut as isPolicyProductivityReviewOptedOut,
   ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS,
+  ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE,
   NON_HUMAN_USER_SENTINEL_IDS,
 } from "@paperclipai/shared";
 import type { IssueProductivityReviewTrigger } from "@paperclipai/shared";
@@ -5982,6 +5983,36 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return isPolicyProductivityReviewOptedOut(issue.executionPolicy);
   }
 
+  // PEN-7126: appended to EVERY trigger branch of the Manager Decision block,
+  // because the defect was never which verdict a reviewer reached — it was
+  // where the verdict was written.
+  //
+  // A review row dispatches `writeContainment: "status_only"`, and on that lane
+  // the done gate refuses a close that has no execution run and no PR link
+  // unless a run-attributed durable artifact exists. The only artifact such a
+  // run may author is the status-adjudication document. That rule was stated in
+  // exactly one place — the gate's own 422 — which a run that never attempts
+  // the close never sees. So a reviewer did the work, wrote a correct verdict
+  // as a COMMENT, ended, and the row was re-dispatched: 72 runs across 32 rows
+  // on the Penstock fleet, 9 on one row inside six hours. Writing the document
+  // closed all 32 on the first attempt.
+  //
+  // This block is the pointer on a surface the run reads BEFORE it ends. Keep
+  // it outside the trigger branches: `runtime_failure_streak` is the trigger
+  // that produced the measured loop, and it is also the branch whose verdict
+  // ("route to platform/SRE") feels least like a close, which is exactly when
+  // the carrier is most likely to be guessed.
+  const PRODUCTIVITY_REVIEW_VERDICT_CARRIER_LINES = [
+    "## Recording the verdict",
+    "",
+    "Whichever verdict above you reach, record it on THIS review issue as follows. The verdict is not the part that goes wrong; the carrier is.",
+    "",
+    `1. Write the verdict and its evidence to this issue's \`status-adjudication\` document: \`${ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE}\`.`,
+    "2. Then set this issue's status (`done` for a recorded verdict, or the status your verdict names).",
+    "",
+    "A verdict written only as a comment closes nothing: this review runs on the cheap status-only profile, and the done gate refuses a close with no execution run, no PR link and no run-attributed durable artifact (`no_execution_run_and_no_pr_evidence`). The status-adjudication document is the one artifact this lane may author, and writing it is what clears that gate. Skipping step 1 leaves the row open and re-dispatched, with the verdict already correct.",
+  ];
+
   function buildReviewMarkdown(evidence: ProductivityReviewEvidence, prefix: string) {
     const latestRuns = evidence.latestRuns.length > 0
       ? evidence.latestRuns.map((run) =>
@@ -6186,6 +6217,8 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           // re-read. Pinned by productivity-review-service.test.ts.
           "If you choose \"Block with an unblock owner\", file the escalation in this same run: create a `request_board_approval` approval with this review's source issue in `issueIds`, naming the gate and the exact human action needed. The source link is required and the source must be authorized before the approval is created — an unlinked card reaches a human with no context, and a review run may not attach arbitrary same-company issues. A stated gate with no approval card reaches nobody, and polling a human-only gate is not a substitute. This review runs on the cheap status-only profile, which is permitted to create that one approval type and no other. Creating it is also the only approval write this run has: commenting on, resubmitting, withdrawing and applying are all refused here, including on the card you just filed. So the card must be complete at creation — put the gate, the exact human action and the supporting evidence in the payload rather than planning a follow-up. Anything you establish after filing goes in a comment on this review issue, which is not refused.",
         ]),
+      "",
+      ...PRODUCTIVITY_REVIEW_VERDICT_CARRIER_LINES,
     ].join("\n");
   }
 

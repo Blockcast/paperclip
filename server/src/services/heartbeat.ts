@@ -576,7 +576,7 @@ import {
   findExistingFinishSuccessfulRunHandoffWake,
   findExistingRunLivenessContinuationWake,
   isSuccessfulRunHandoffValidPathSkip,
-  SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
+  SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX,
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
@@ -21891,7 +21891,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(issueComments.companyId, input.run.companyId),
           eq(issueComments.issueId, input.issue.id),
           eq(issueComments.createdByRunId, input.run.id),
-          sql`(${issueComments.body} = ${SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY} or ${issueComments.body} like '## This issue still needs a next step%' or ${issueComments.body} like '## Successful run missing issue disposition%')`,
+          // PEN-7126: `like <prefix>%`, not `= <body>`. The required-notice body now
+          // carries the status-adjudication carrier sentence after that prefix,
+          // and rows written before it carry the prefix alone — an equality test
+          // here would stop recognising this run's own earlier notice and post a
+          // second one. The prefix contains no LIKE metacharacter.
+          sql`(${issueComments.body} like ${`${SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX}%`} or ${issueComments.body} like '## This issue still needs a next step%' or ${issueComments.body} like '## Successful run missing issue disposition%')`,
         ),
       )
       .limit(1)
