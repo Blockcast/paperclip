@@ -11,6 +11,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   issueApprovals,
+  issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
   issues,
@@ -58,6 +59,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRelations);
+    await db.delete(issueRecoveryActions);
     await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
@@ -738,6 +740,39 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       coveredBlockerCount: 2,
       attentionBlockerCount: 0,
     });
+  });
+
+  // BLO-30528: an `active` action is a live waiting path; an `escalated` one is wake-exhausted
+  // and must not hide its dependents. The `active` row is the control that the arm is reached.
+  it.each([
+    { status: "active", expected: { state: "covered", coveredBlockerCount: 1, attentionBlockerCount: 0 } },
+    { status: "escalated", expected: { state: "needs_attention", coveredBlockerCount: 0, attentionBlockerCount: 1 } },
+  ])("treats an $status recovery action on the blocker accordingly (BLO-30528)", async ({ status, expected }) => {
+    const { companyId, agentId } = await createCompany("PBR");
+    const parentId = await insertIssue({ companyId, identifier: "PBR-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PBR-2",
+      title: "Parked assigned blocker",
+      status: "backlog",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: blockerId,
+      kind: "stranded_assigned_issue",
+      status,
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `fingerprint-${randomUUID()}`,
+      nextAction: "Recover the stranded blocker.",
+    });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ unresolvedBlockerCount: 1, ...expected });
   });
 
   it("does not treat cancelled liveness escalation issues as covered waiting paths", async () => {

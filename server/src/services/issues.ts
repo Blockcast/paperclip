@@ -4379,7 +4379,9 @@ async function listIssueBlockerAttentionMap(
       .where(
         and(
           eq(issueRecoveryActions.companyId, companyId),
-          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          // BLO-30528: `escalated` is wake-exhausted, so it is no waiting path; counting it
+          // as `covered` hid dependents in an undrainable queue. Same set as BLO-21523.
+          inArray(issueRecoveryActions.status, [...BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES]),
           inArray(issueRecoveryActions.sourceIssueId, explicitWaitCandidateIds),
         ),
       );
