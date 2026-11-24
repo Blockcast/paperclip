@@ -59,6 +59,7 @@ import {
   isExternalWaitYieldRun,
   isInfraClassErrorCodeRun,
   isInfraFailureRun,
+  RUN_USAGE_TOKEN_KEYS,
   runUsageHasNoModelTokens,
   runUsageTokenCounts,
 } from "./recovery/zero-token-startup-failure.js";
@@ -2556,6 +2557,31 @@ function isZeroTurnRun(run: Pick<HeartbeatRunRow, "status" | "usageJson">): bool
   );
 }
 
+// SQL mirror of `isZeroTurnRun`, built from the same key lists. Per leg: the
+// first key holding a JSON number (or numeric string, as `readTokenCount`
+// accepts) wins, else 0. Null `usage_json` is unknown, so it stays counted.
+// shortcut: the numeric-string regex skips JS `Number` oddities ("", "0x1f",
+// "Infinity"); the single writer emits JSON numbers, so revisit only if that changes.
+function usageLegSql(keys: readonly string[]) {
+  const arms = keys.map(
+    (key) => sql`case
+      when jsonb_typeof(${heartbeatRuns.usageJson} -> ${key}::text) = 'number' then (${heartbeatRuns.usageJson} ->> ${key}::text)::numeric
+      when jsonb_typeof(${heartbeatRuns.usageJson} -> ${key}::text) = 'string'
+        and (${heartbeatRuns.usageJson} ->> ${key}::text) ~ '^\\s*-?[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?\\s*$'
+        then trim(${heartbeatRuns.usageJson} ->> ${key}::text)::numeric
+    end`,
+  );
+  return sql`coalesce(${sql.join(arms, sql`, `)}, 0) = 0`;
+}
+const notZeroTurnRunSql = sql`not (
+  ${inArray(heartbeatRuns.status, [...TERMINAL_RUN_STATUSES])}
+  and ${heartbeatRuns.usageJson} is not null
+  and ${usageLegSql(RUN_USAGE_TOKEN_KEYS.inputTokens)}
+  and ${usageLegSql(RUN_USAGE_TOKEN_KEYS.outputTokens)}
+  and ${usageLegSql(RUN_USAGE_TOKEN_KEYS.cachedInputTokens)}
+  and ${usageLegSql(RUN_USAGE_TOKEN_KEYS.cacheCreationInputTokens)}
+)`;
+
 const PRE_DISPATCH_CANCELLED_RUN_ERROR_CODES = [
   "duplicate_dispatch_suppressed",
   "issue_dependencies_blocked",
@@ -4514,10 +4540,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
   }
 
   async function countIssueRunsSince(companyId: string, agentId: string, issueId: string, since: Date) {
-    // BLO-58522: filtered in JS so `isZeroTurnRun` stays the single definition
-    // (the token keys come in two spellings plus `raw*` twins).
+    // BLO-58522: zero-turn exclusion in SQL so only a count comes back;
+    // `notZeroTurnRunSql` mirrors `isZeroTurnRun` and the tests pin both.
     return db
-      .select({ status: heartbeatRuns.status, usageJson: heartbeatRuns.usageJson })
+      .select({ count: sql<number>`count(*)::int` })
       .from(heartbeatRuns)
       .where(
         and(
@@ -4526,9 +4552,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           issueRunScopeSql(issueId),
           sql`coalesce(${heartbeatRuns.startedAt}, ${heartbeatRuns.createdAt}) >= ${since.toISOString()}::timestamptz`,
           notPreDispatchCancelledSql,
+          notZeroTurnRunSql,
         ),
       )
-      .then((rows) => rows.filter((run) => !isZeroTurnRun(run)).length);
+      .then((rows) => Number(rows[0]?.count ?? 0));
   }
 
   /**
