@@ -9,7 +9,9 @@ import {
   PROCESS_LOST_LIVENESS_NULL_METRIC,
   PROCESS_LOST_TOTAL_METRIC,
   HEARTBEAT_RUN_FAILED_METRIC,
+  EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC,
   __resetMetricsForTest,
+  getMetricsRegistry,
   renderMetrics,
 } from "../services/metrics.js";
 import {
@@ -9938,6 +9940,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       ).toHaveLength(0);
       warnSpy.mockRestore();
+    });
+
+    it("strand log and release-pending age gauge read the same age when the run finished after updatedAt (BLO-55175)", async () => {
+      // BLO-32052 moved the gauge to `greatest(updated_at, run.finished_at)`;
+      // the strand log aged from `updatedAt` alone, so an operator checking one
+      // against the other during a PaperclipRuntimeResourceReconciliationStuck
+      // page got two answers. Here `updatedAt` is months old and the run
+      // finished 45 min ago: the old log clock read months, the gauge 45 min.
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      const finishedAt = new Date(Date.now() - 45 * 60 * 1000);
+      await db.update(heartbeatRuns).set({ finishedAt }).where(eq(heartbeatRuns.id, runId));
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      expect(new Date(reservation!.updatedAt).getTime()).toBeLessThan(finishedAt.getTime());
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) =>
+        name === reservation!.jobName
+          ? { phase: "missing" as const, reason: "NotFound" as const, name }
+          : null,
+      );
+      heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+      const warnSpy = vi.spyOn(logger, "warn");
+      try {
+        await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+        const logged = warnSpy.mock.calls.find(
+          (call) =>
+            call[1] === "external-runtime reservation still unreleased after reclaim sweep refused it"
+            && (call[0] as Record<string, unknown>)?.reservationId === reservation!.id,
+        );
+        expect(logged).toBeDefined();
+        const refusedSeconds = (logged![0] as { refusedSeconds: number }).refusedSeconds;
+
+        __resetMetricsForTest();
+        await heartbeat.refreshOrphanedRuntimeResourceMetrics(new Date());
+        const metric = getMetricsRegistry().getSingleMetric(
+          EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC,
+        );
+        const gaugeSeconds = ((await metric!.get()) as { values: Array<{ value: number }> }).values[0]!.value;
+
+        // Within a couple of seconds: the two reads take `now` a few ms apart.
+        expect(Math.abs(refusedSeconds - 45 * 60)).toBeLessThanOrEqual(5);
+        expect(Math.abs(gaugeSeconds - refusedSeconds)).toBeLessThanOrEqual(2);
+      } finally {
+        warnSpy.mockRestore();
+        heartbeat.__test_unsafelyUntrackActiveRunExecution(runId);
+      }
     });
 
     // PEN-5316. The tests below pin the `refusedBy` SPLIT, not the release
