@@ -78,6 +78,20 @@ function readTokenCount(
 // i.e. the per-run delta — the opposite of `heartbeatRunTokenUsage`, which
 // prefers the `raw*` twins on every leg because it wants the session-cumulative
 // basis. That ordering is the load-bearing difference between the two readers.
+// Key spellings per leg, in precedence order. Exported so a SQL mirror of
+// `runUsageHasNoModelTokens` (productivity-review's churn count) reads the
+// same keys rather than a hand-copied list that drifts.
+export const RUN_USAGE_TOKEN_KEYS = {
+  inputTokens: ["inputTokens", "input_tokens"],
+  outputTokens: ["outputTokens", "output_tokens"],
+  cachedInputTokens: ["cachedInputTokens", "cached_input_tokens", "rawCachedInputTokens"],
+  cacheCreationInputTokens: [
+    "cacheCreationInputTokens",
+    "cache_creation_input_tokens",
+    "rawCacheCreationInputTokens",
+  ],
+} as const;
+
 export function runUsageTokenCounts(
   usage: Record<string, unknown> | null | undefined,
 ): {
@@ -87,18 +101,10 @@ export function runUsageTokenCounts(
   cacheCreationInputTokens: number;
 } {
   return {
-    inputTokens: readTokenCount(usage, ["inputTokens", "input_tokens"]),
-    outputTokens: readTokenCount(usage, ["outputTokens", "output_tokens"]),
-    cachedInputTokens: readTokenCount(usage, [
-      "cachedInputTokens",
-      "cached_input_tokens",
-      "rawCachedInputTokens",
-    ]),
-    cacheCreationInputTokens: readTokenCount(usage, [
-      "cacheCreationInputTokens",
-      "cache_creation_input_tokens",
-      "rawCacheCreationInputTokens",
-    ]),
+    inputTokens: readTokenCount(usage, RUN_USAGE_TOKEN_KEYS.inputTokens),
+    outputTokens: readTokenCount(usage, RUN_USAGE_TOKEN_KEYS.outputTokens),
+    cachedInputTokens: readTokenCount(usage, RUN_USAGE_TOKEN_KEYS.cachedInputTokens),
+    cacheCreationInputTokens: readTokenCount(usage, RUN_USAGE_TOKEN_KEYS.cacheCreationInputTokens),
   };
 }
 

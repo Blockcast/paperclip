@@ -1512,6 +1512,33 @@ describeEmbeddedPostgres("productivity review service", () => {
         await expectHighChurn(seeded.companyId);
       });
 
+      // The count exclusion runs in SQL (`notZeroTurnRunSql`), so it must read
+      // the same key spellings and numeric strings `runUsageTokenCounts` does.
+      // Snake-case + string usage is non-zero; a SQL mirror that read only
+      // camelCase numbers would call it zero-turn and drop it below the bar.
+      it("still counts a run whose non-zero usage is snake_case or a numeric string", async () => {
+        const seeded = await seedAssignedIssue();
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 9,
+          now,
+          withRunComments: true,
+        });
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now: new Date(now.getTime() - 20 * 60 * 1000),
+          status: "cancelled",
+          livenessState: "failed",
+          usageJson: { input_tokens: "1200", output_tokens: 0 },
+        });
+        await expectHighChurn(seeded.companyId);
+      });
+
       // Same count, but usage was never RECORDED (null). Unknown is not zero:
       // the run stays counted. Guard: the `usageJson != null` conjunct.
       it("still counts a terminal run whose usage was never recorded", async () => {
