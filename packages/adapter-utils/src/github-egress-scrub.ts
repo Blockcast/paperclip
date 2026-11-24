@@ -1296,14 +1296,20 @@ const WEBFLOW_OBJECT_ID_RE = /^[0-9a-f]{24}$/;
 const WEBFLOW_DIMENSION_RUN_RE = /^[0-9]{1,4}x[0-9]{1,4}$/;
 /** One Title-case word (`Logo`, `Real`). isPosixPathRun refuses these under 5
  *  characters to close chopped-token families in a name-free rule; here the
- *  host and two ObjectIds already anchor the value, and a random base62 run is
- *  Title-case only ~3% of the time, so a chopped token must clear that on
- *  every run under the run-count cap. */
+ *  host and two ObjectIds already anchor the value. A Title-case run skips the
+ *  entropy test, so it must also read as a word: a vowel and no 4+ consonant
+ *  cluster. That held for every Title-case word in all 93 real filenames
+ *  (`Neighbourhood`, `Streamplay`, `Unpredictable`) and refuses a token formatted
+ *  as Title-case runs (`Xqzwpm-Rtvkls-…`). */
 const WEBFLOW_TITLE_WORD_RUN_RE = /^[A-Z][a-z]+$/;
+const isPronounceableWord = (run: string): boolean => /[aeiouy]/i.test(run) && !/[^aeiouy]{4}/i.test(run);
+/** At most one `WxH` run per filename: one was the measured maximum, and a
+ *  string of them is a digit payload, not a size. */
+const WEBFLOW_MAX_DIMENSION_RUNS = 1;
 
 /** True when a Webflow filename is built of words: each `-`/`_`/`.` run must
- *  pass isPosixPathRun, be one Title-case word, or be a `WxH` size, under the POSIX-path run, content
- *  and mixed-run caps. Webflow sometimes prefixes a second 24-hex asset id,
+ *  pass isPosixPathRun, be one pronounceable Title-case word, or be the one
+ *  `WxH` size, under the POSIX-path run, content and mixed-run caps. Webflow sometimes prefixes a second 24-hex asset id,
  *  which is stripped first. `--` is common in exported names, so empty runs
  *  are skipped. A random base62 run (an Unsplash photo id) is deliberately
  *  NOT admitted: that is what a token chopped into runs looks like. */
@@ -1312,10 +1318,20 @@ function isWebflowAssetFilename(filename: string): boolean {
   if (runs.length > POSIX_PATH_MAX_RUNS) return false;
   let contentLength = 0;
   let mixedRuns = 0;
+  let dimensionRuns = 0;
   for (const run of runs) {
     contentLength += run.length;
     if (contentLength > POSIX_PATH_MAX_CONTENT_LENGTH) return false;
-    if (WEBFLOW_DIMENSION_RUN_RE.test(run) || WEBFLOW_TITLE_WORD_RUN_RE.test(run)) continue;
+    if (WEBFLOW_DIMENSION_RUN_RE.test(run)) {
+      if (++dimensionRuns > WEBFLOW_MAX_DIMENSION_RUNS) return false;
+      continue;
+    }
+    // No fallback to isPosixPathRun: its camel rule admits any Title-case run
+    // of 5+ letters, which would reopen exactly this hole.
+    if (WEBFLOW_TITLE_WORD_RUN_RE.test(run)) {
+      if (!isPronounceableWord(run)) return false;
+      continue;
+    }
     if (!isPosixPathRun(run)) return false;
     if (/[0-9]/.test(run) && /[A-Za-z]/.test(run) && ++mixedRuns > POSIX_PATH_MAX_MIXED_RUNS) return false;
   }
