@@ -8855,6 +8855,41 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   );
 
   it(
+    "BLO-59187: an assignment-recovery retry that yielded for an external wait is re-dispatched, not escalated as a failed retry",
+    async () => {
+      // BLO-50531 (2026-11-24): the retry yielded with a live monitor; the alertmanager
+      // plugin then cancelled the row (clearing the monitor as undeliverable) and reopened
+      // it `todo`. The sweep read the yielded retry as a FAILED retry and escalated
+      // `stranded_assigned_issue`, reassigning the row. A yield is not a failure.
+      const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "cancelled",
+        retryReason: "assignment_recovery",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        resultJson: { yieldedExternalWait: true, issueId: null, serviceName: "alertmanager" },
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(0);
+      expect(result.dispatchRequeued).toBe(1);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).not.toBe("blocked");
+      expect(issue?.assigneeAgentId).toBe(agentId);
+
+      const actions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+      expect(actions).toHaveLength(0);
+    },
+  );
+
+  it(
     "BLO-27463: an external-wait yield whose monitor has lapsed is still seen by the sweep",
     async () => {
       // The bound on the fix above. Admitting the yield to the durable-wait gate must not
