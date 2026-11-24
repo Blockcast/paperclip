@@ -985,6 +985,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     adapterType?: string;
     agentStatus?: "idle" | "error";
     scheduledRetryAttempt?: number;
+    runContextExtra?: Record<string, unknown>;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1049,6 +1050,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           ? "issue_assignment_recovery"
           : input.retryReason ?? "issue_assigned",
         ...(input.retryReason ? { retryReason: input.retryReason } : {}),
+        ...(input.runContextExtra ?? {}),
         ...(input.runSource ? { source: input.runSource } : {}),
       },
       startedAt: now,
@@ -8886,6 +8888,36 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .from(issueRecoveryActions)
         .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
       expect(actions).toHaveLength(0);
+
+      // The redispatch is stamped so a second yield in the same chain is not forgiven.
+      const requeued = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(
+        requeued.some((run) => (run.contextSnapshot as Record<string, unknown> | null)?.externalWaitYieldRedispatch === true),
+      ).toBe(true);
+    },
+  );
+
+  it(
+    "BLO-59187: a stamped yield-redispatch that yields again with its wait gone is escalated, bounding the loop",
+    async () => {
+      const { issueId } = await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "cancelled",
+        retryReason: "assignment_recovery",
+        runErrorCode: "external_wait_yield",
+        runError: "Yielded after persisting an external-service wait",
+        resultJson: { yieldedExternalWait: true, issueId: null, serviceName: "alertmanager" },
+        runContextExtra: { externalWaitYieldRedispatch: true },
+      });
+
+      heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      expect(result.escalated).toBe(1);
+      expect(result.dispatchRequeued).toBe(0);
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe("blocked");
     },
   );
 
