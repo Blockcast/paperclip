@@ -1526,6 +1526,12 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
   // PEN-5830, PEN-5807, PEN-5055 and PEN-4869 exist to remove, arrived at by
   // following the remedy. These assertions pin the axis the fallback names
   // (recorded AT PUSH TIME) and the absence of every live-read spelling.
+  //
+  // PEN-6014 adds the second axis: WHOSE push the record has to be. Two of
+  // the named sources record A push, not necessarily yours, and a co-author's
+  // record is the one case the comparison cannot catch — their sha already IS
+  // the branch head, so the STOP never fires. The two axes fail differently
+  // (stale -> inert, someone else's -> wrong), so each is pinned separately.
   describe("the no-reflog fallback (PEN-5947)", () => {
     const shapes = [
       ["force-flag", ["push", "--force", "origin", "main"]],
@@ -1593,6 +1599,16 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
         // axis is reachable rather than an abstraction the author must apply.
         expect(fallback).toMatch(/Reviewed head:/);
 
+        // The second axis (PEN-6014): WHOSE push that record has to be. The
+        // PR/issue head and a review's `Reviewed head:` record A push, not
+        // necessarily yours. If a co-author pushed after you, the newest such
+        // record is THEIR sha — which already equals the branch head, so the
+        // comparison below agrees, the STOP never fires, and the lease passes
+        // and destroys their commit. This needs its own pin because it fails
+        // in the opposite direction from a stale source: inert vs wrong.
+        expect(fallback).toMatch(/OF YOUR OWN PUSH/);
+        expect(fallback).toMatch(/CO-AUTHOR/);
+
         // No live-read spelling anywhere in the fallback.
         for (const [name, pattern] of LIVE_READS) {
           expect(fallback, `${label}: fallback must not name ${name}`).not.toMatch(pattern);
@@ -1627,7 +1643,14 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
       }
     });
 
-    it("mutation check: the PEN-5830 fallback would have failed these assertions", () => {
+    // The three cases below assert against hand-written literals, NOT against
+    // `forcePushRefusal`. So they prove the patterns DISCRIMINATE — that the
+    // assertions above can fail, and are not vacuous — and they will NOT fail
+    // if the function regresses. The function-level mutation evidence is the
+    // recorded run in the PR body (restore the superseded text in the source,
+    // watch the per-shape assertions above go red). Both kinds are worth
+    // having; only the first is cheap enough to keep in the suite.
+    it("pattern check: the PEN-5830 fallback fails these assertions", () => {
       // Guards against passing vacuously. This is the text that shipped between
       // PEN-5830 and PEN-5947: correct about the reflog, and silent about what
       // to do when there is not one beyond an output that no longer exists.
@@ -1653,7 +1676,36 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
       }
     });
 
-    it("mutation check: a fallback naming gh pr view --json headRefOid is rejected", () => {
+    it("pattern check: the PEN-5947 fallback fails the ownership assertions", () => {
+      // The text that shipped between PEN-5947 and PEN-6014 — the one this
+      // change qualifies. Restoring it here is the mutation: it is correct
+      // about the when-axis and silent about whose push the record has to be.
+      const unqualified = [
+        "                                      #   no entry? a fresh clone has none — the usual agent case. Then",
+        "                                      #   <expected-sha> is a sha RECORDED WHEN YOU PUSHED: what the push",
+        "                                      #   printed, the head the PR or issue captured from it, a review's",
+        "                                      #   `Reviewed head:`. The axis is WHEN the value was captured, not",
+        "                                      #   which tool read it — anything read off the branch now is the",
+        "                                      #   head the lease is compared against, so it can never refuse.",
+      ].join("\n");
+
+      // It passes every PEN-5947 pin. That is the point: those assertions were
+      // all satisfied by the defective text, so the ownership pins are a new
+      // axis rather than a rewording of the old one.
+      expect(unqualified).toMatch(/RECORDED WHEN YOU PUSHED/);
+      expect(unqualified).toMatch(/WHEN the value was captured/);
+      expect(unqualified).toMatch(/Reviewed head:/);
+      expect(unqualified).toMatch(/a fresh clone has none/);
+      for (const [, pattern] of LIVE_READS) {
+        expect(unqualified).not.toMatch(pattern);
+      }
+
+      // ...and fails the ownership pins, which is what the shipped text adds.
+      expect(unqualified).not.toMatch(/OF YOUR OWN PUSH/);
+      expect(unqualified).not.toMatch(/CO-AUTHOR/);
+    });
+
+    it("pattern check: a fallback naming gh pr view --json headRefOid is rejected", () => {
       // The obvious-looking fix, and the one the issue singles out: it returns
       // the branch's current head, the same value `ls-remote` returns, so it is
       // the defect wearing an authoritative-looking shape.

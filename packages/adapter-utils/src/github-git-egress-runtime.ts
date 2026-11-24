@@ -488,6 +488,19 @@ function forcePushRefusal(forcePush: GitForcePush): GitEgressRuntimeError {
   // reason; the test pins their absence, where a refused author will not meet
   // them.
   //
+  // Two of those sources — the head the PR or issue captured, and a review's
+  // `Reviewed head:` — record A push, not necessarily YOURS (PEN-6014). If a
+  // co-author pushed after you, the newest such record is THEIR sha, and the
+  // comparison on the next line cannot catch it: their sha IS the branch head,
+  // so the compare agrees, the STOP never fires, and the lease passes and
+  // destroys their commit — the exact contention the lease exists to stop,
+  // walked through with every check passing. Note the failure DIRECTION,
+  // because it is why both axes are stated and neither replaces the other: a
+  // stale source fails INERT (a lease that can never refuse), someone else's
+  // fails WRONG (a lease that refuses in the safe cases and passes in the
+  // dangerous one). PEN-5807 removed this same hazard from the sibling
+  // `PUSH_REMEDY` text by saying what to look for; this says whose.
+  //
   // `ls-remote` stays on the far side of the comparison: disagreeing with the
   // reflog means a co-author pushed, which is the one case worth stopping for,
   // and is exactly the case the `contention` paragraph below is written for.
@@ -496,9 +509,13 @@ function forcePushRefusal(forcePush: GitForcePush): GitEgressRuntimeError {
     "                                      #   no entry? a fresh clone has none — the usual agent case. Then",
     "                                      #   <expected-sha> is a sha RECORDED WHEN YOU PUSHED: what the push",
     "                                      #   printed, the head the PR or issue captured from it, a review's",
-    "                                      #   `Reviewed head:`. The axis is WHEN the value was captured, not",
-    "                                      #   which tool read it — anything read off the branch now is the",
-    "                                      #   head the lease is compared against, so it can never refuse.",
+    "                                      #   `Reviewed head:`. Take the newest such record OF YOUR OWN PUSH:",
+    "                                      #   a later record may be a CO-AUTHOR's, and theirs already matches",
+    "                                      #   the branch, so the compare below agrees and the lease destroys",
+    "                                      #   their commit. The axis is WHEN the value was captured and WHOSE",
+    "                                      #   push it records — not which tool read it; anything read off the",
+    "                                      #   branch now is the head the lease is compared against, so it can",
+    "                                      #   never refuse.",
     "    git ls-remote origin refs/heads/<branch>   # still <expected-sha>? if not, a co-author pushed — STOP",
     // paperclip:allow-git-push: remediation text shown to the author, not an invocation
     "    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>",
