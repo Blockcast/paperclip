@@ -129,6 +129,11 @@ describe("summarizeCpuProfile (BLO-51594)", () => {
     expect(s.longestBusyMs).toBe(1_400);
     expect(s.maxSampleGapMs).toBe(9_000);
   });
+
+  it("does not count the start-to-first-sample offset as a sampling gap", () => {
+    const s = summarizeCpuProfile({ nodes, samples: [4, 4, 6], timeDeltas: [5e6, 0.7e6, 0.7e6] });
+    expect(s.maxSampleGapMs).toBe(700);
+  });
 });
 
 describe("CPU flight recorder production settings (BLO-57549)", () => {
