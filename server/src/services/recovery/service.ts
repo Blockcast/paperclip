@@ -1743,6 +1743,10 @@ function didAutomaticRecoveryFail(
   expectedRetryReason: "assignment_recovery" | "issue_continuation_needed" | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
 ) {
   if (!latestRun) return false;
+  // BLO-59187: a retry that yielded its slot for an external wait did its job; it did
+  // not fail. If the wait it armed is gone (e.g. a plugin cancelled and reopened the
+  // row, clearing the monitor), the right remedy is another dispatch, not escalation.
+  if (isExternalWaitYieldRun(latestRun)) return false;
 
   const latestContext = parseObject(latestRun.contextSnapshot);
   const latestRetryReason = readNonEmptyString(latestContext.retryReason);
