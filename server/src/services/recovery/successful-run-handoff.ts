@@ -1,6 +1,7 @@
 import { and, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
+import { ISSUE_STATUS_ADJUDICATION_CARRIER_NOTICE, ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE } from "@paperclipai/shared";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 import { isAlertEscalationLadderOriginKind } from "./origins.js";
@@ -8,10 +9,32 @@ import { isAlertEscalationLadderOriginKind } from "./origins.js";
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
 export const DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS = 1;
-export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
+/**
+ * The two notice bodies are PREFIX + carrier sentence, and the prefix is the
+ * part that is matched (PEN-7126).
+ *
+ * The prefixes are the exact bodies these notices carried before the carrier
+ * sentence was appended, so every historical comment still classifies: three
+ * independent matchers read them — `isSuccessfulRunHandoffRequiredNoticeBody`
+ * below, the de-dup predicate in `heartbeat.ts`, and `isSuccessfulRunHandoffComment`
+ * in `ui/src/lib/successful-run-handoff.ts` — and the first two used EQUALITY,
+ * so lengthening the body without this split would have silently stopped
+ * matching every notice already in the database.
+ *
+ * Why lengthen them at all: these two sentences assert a requirement and name
+ * no mechanism. The only surface that named the carrier was the done gate's
+ * 422, which a `status_only` run never triggers, because such a run records its
+ * verdict and ends without attempting the close. See
+ * `ISSUE_STATUS_ADJUDICATION_CARRIER_NOTICE` for the measurement.
+ */
+export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX =
   "Paperclip needs a disposition before this issue can continue.";
-export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY =
+export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_PREFIX =
   "Paperclip could not resolve this issue's missing disposition automatically. The issue is blocked on a recovery owner.";
+export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
+  `${SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX} ${ISSUE_STATUS_ADJUDICATION_CARRIER_NOTICE}`;
+export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY =
+  `${SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_PREFIX} ${ISSUE_STATUS_ADJUDICATION_CARRIER_NOTICE}`;
 export const LEGACY_SUCCESSFUL_RUN_HANDOFF_NOTICE_PREFIXES = [
   "## This issue still needs a next step",
   "## Successful run missing issue disposition",
@@ -180,7 +203,10 @@ function systemNoticePresentation(input: {
 
 export function isSuccessfulRunHandoffRequiredNoticeBody(body: string) {
   const trimmed = body.trim();
-  return trimmed === SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY ||
+  // Prefix, not equality: see the note on the notice constants above. A body
+  // stored before the carrier sentence was appended is the prefix exactly, and
+  // an equality test here would stop recognising it.
+  return trimmed.startsWith(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX) ||
     LEGACY_SUCCESSFUL_RUN_HANDOFF_NOTICE_PREFIXES.some((prefix) => trimmed.startsWith(prefix));
 }
 
@@ -210,6 +236,13 @@ export function buildSuccessfulRunHandoffRequiredNotice(input: {
               "Valid dispositions",
               "done, cancelled, in_review with an owner, blocked with blockers, delegated follow-up, or explicit continuation",
             ),
+            // PEN-7126: the row above enumerates the dispositions and says
+            // nothing about where one is RECORDED, which is the half every
+            // looping review run already had right. This is the half they did
+            // not: the corrective wake for this notice is status-only, and on
+            // that lane a refused close is cleared by this document and by
+            // nothing else.
+            keyValueRow("Status-only close carrier", ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE),
           ],
         },
         {
@@ -385,11 +418,16 @@ function isProductiveSuccessfulRun(input: {
  * Which recovery lane the corrective wake is dispatched on.
  *
  * Resolved once in `decideSuccessfulRunHandoff` and threaded into both the guard
- * context and the instruction text, so the wake can never tell the agent
- * "document or plan updates are not allowed" while dispatching it on a lane
- * where they are. Before BLO-23197 the instruction re-derived that sentence from
- * `issue.workMode` independently, so any escalation not keyed on `workMode`
- * would have contradicted its own payload.
+ * context and the instruction text, so the wake can never bar an agent from a
+ * document write while dispatching it on a lane that permits one. Before
+ * BLO-23197 the instruction re-derived that sentence from `issue.workMode`
+ * independently, so any escalation not keyed on `workMode` would have
+ * contradicted its own payload.
+ *
+ * PEN-7126 widened the same invariant one step: the status-only arm of that
+ * sentence was itself wrong, because the status-only bar exempts one document
+ * key, and a flat prohibition talked a compliant run out of the only write that
+ * clears its own close.
  */
 export type SuccessfulRunHandoffWorkClass = "planning_only" | "status_only";
 
@@ -412,7 +450,10 @@ export function buildSuccessfulRunHandoffInstruction(input: {
       : "Resolve the missing disposition before creating or revising any new artifacts. Choose **exactly one** outcome and perform the matching Paperclip action:",
     "",
     "**Is the issue finished?**",
-    "1. Mark it `done` only after verifying the acceptance criteria and one qualifying completion artifact: a committed, remotely resolvable artifact or PR, a run-attributed durable issue artifact, or the valid checked-out execution path. Otherwise keep it open on the correct continuation path. Mark it `cancelled` only when intentionally stopped.",
+    "1. Mark it `done` only after verifying the acceptance criteria and one qualifying completion artifact: a committed, remotely resolvable artifact or PR, a run-attributed durable issue artifact, or the valid checked-out execution path. Otherwise keep it open on the correct continuation path. Mark it `cancelled` only when intentionally stopped."
+      + (isPlanningContinuation
+        ? ""
+        : ` On this lane the qualifying artifact you can author is the status-adjudication document: \`${ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE}\`. Write it BEFORE the status change, or the done gate refuses the close with \`no_execution_run_and_no_pr_evidence\`.`),
     "",
     "**Does someone else need to look at it?**",
     "2. Move it to `in_review` with a real reviewer path — `executionState.currentParticipant`, a human owner via `assigneeUserId`, a pending issue-thread interaction, or a linked pending approval.",
@@ -425,7 +466,15 @@ export function buildSuccessfulRunHandoffInstruction(input: {
     "",
     isPlanningContinuation
       ? "The plan or issue-document revision is the required deliverable, but it does not satisfy this handoff unless the issue state/path also records one valid disposition."
-      : "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. If this wake is status-only recovery, document or plan updates are not allowed.",
+      // PEN-7126: the old closing clause read "If this wake is status-only
+      // recovery, document or plan updates are not allowed." — true of plans and
+      // deliverable documents, and FALSE of the one key the status-only bar
+      // exempts. It therefore talked a compliant run out of the only write that
+      // clears its own close, which is how 72 runs across 32 review rows each
+      // wrote a correct verdict to a comment and left the row open.
+      : "Comments, document revisions, work-product writes, and continuation summaries are supporting evidence only — they do not satisfy this handoff unless the issue state/path also records one valid disposition. Status-only recovery may not write plans or deliverable documents, with exactly one exception: "
+        + `\`${ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE}\`. `
+        + "That exception is not an optional extra — where the done gate refuses your close for want of execution evidence, it is the only carrier that clears it, and a verdict left in a comment closes nothing.",
   ].join("\n");
 }
 

@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
+  SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_PREFIX,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
+  SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX,
+  buildSuccessfulRunHandoffInstruction,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildFinishSuccessfulRunHandoffIdempotencyKey,
   buildSuccessfulRunHandoffExhaustedNotice,
@@ -15,6 +18,7 @@ import {
   type IssueRow,
 } from "./successful-run-handoff.js";
 import { ALERTMANAGER_ORIGIN_KIND, isAlertEscalationLadderOriginKind } from "./origins.js";
+import { ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY, ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE } from "@paperclipai/shared";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
 const run = {
@@ -135,7 +139,12 @@ describe("successful run handoff decision", () => {
     });
     expect(decision.instruction).toContain("normal-model planning continuation");
     expect(decision.instruction).toContain("Complete the required plan or issue-document update");
-    expect(decision.instruction).not.toContain("document or plan updates are not allowed");
+    // PEN-7126: this used to read `not.toContain("document or plan updates are
+    // not allowed")`. That clause has been replaced, so the old assertion is now
+    // vacuous — it can no longer fail on any input. Re-pointed at the sentence
+    // that replaced it, which is still status-only-specific and still must not
+    // appear on the planning lane.
+    expect(decision.instruction).not.toContain("Status-only recovery may not write plans or deliverable documents");
   });
 
   // BLO-23197. The deadlock: a status-only run is refused an issue-document
@@ -177,7 +186,9 @@ describe("successful run handoff decision", () => {
     // to re-derive this sentence from `workMode` independently, so on a
     // `standard` issue it would have told the agent document updates were
     // barred while granting a lane that permits them.
-    expect(decision.instruction).not.toContain("document or plan updates are not allowed");
+    // PEN-7126: re-pointed from the retired "document or plan updates are not
+    // allowed" clause, which no longer exists and so could not fail here.
+    expect(decision.instruction).not.toContain("Status-only recovery may not write plans or deliverable documents");
     expect(decision.instruction).toContain("Complete the required plan or issue-document update");
   });
 
@@ -616,6 +627,61 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+
+  // PEN-7126. These two bodies assert that a disposition is REQUIRED. Until
+  // this test existed, neither named the carrier, and the only surface that did
+  // was the done gate's 422 — which a `status_only` run never triggers, because
+  // it records its verdict and ends without attempting the close. 72 runs
+  // across 32 review rows each wrote a correct verdict to a comment and left
+  // the row open. Pinning the KEY, not the prose: the sentence may be reworded,
+  // but a message that demands a disposition and does not say where one goes
+  // regenerates the loop.
+  it("names the status-adjudication carrier in both disposition notices (PEN-7126)", () => {
+    for (const body of [
+      SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
+      SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
+    ]) {
+      expect(body).toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY);
+      expect(body).toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE);
+    }
+    // Control: the key is not already present in the prefixes, so the
+    // assertions above are testing the appended sentence rather than passing on
+    // text that was there all along.
+    expect(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX).not.toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY);
+    expect(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_PREFIX).not.toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY);
+  });
+
+  // The body grew, and three matchers read it. Two of them used equality, so
+  // without a stable prefix every notice already stored would have stopped
+  // classifying the moment the carrier sentence landed.
+  it("still recognizes a notice body stored before the carrier sentence was appended (PEN-7126)", () => {
+    expect(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY.startsWith(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX)).toBe(true);
+    expect(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY.startsWith(SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_PREFIX)).toBe(true);
+    expect(isSuccessfulRunHandoffRequiredNoticeBody(SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_PREFIX)).toBe(true);
+  });
+
+  // The status-only instruction used to close with "document or plan updates
+  // are not allowed", which is true of plans and deliverable documents and
+  // false of the one key the status-only bar exempts — so it talked a compliant
+  // run out of the write that clears its own close.
+  it("tells a status-only handoff run which document clears the done gate (PEN-7126)", () => {
+    const statusOnly = buildSuccessfulRunHandoffInstruction({
+      issueIdentifier: "PEN-1",
+      sourceRunId: "22222222-2222-4222-8222-222222222222",
+      workClass: "status_only",
+    });
+    expect(statusOnly).toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE);
+    expect(statusOnly).toContain("Status-only recovery may not write plans or deliverable documents");
+    expect(statusOnly).toContain("a verdict left in a comment closes nothing");
+    // Control: the planning lane is a different instruction and must not have
+    // silently inherited the status-only carve-out, which does not apply there.
+    const planningOnly = buildSuccessfulRunHandoffInstruction({
+      issueIdentifier: "PEN-1",
+      sourceRunId: "22222222-2222-4222-8222-222222222222",
+      workClass: "planning_only",
+    });
+    expect(planningOnly).not.toContain(ISSUE_STATUS_ADJUDICATION_DOCUMENT_ROUTE);
   });
 });
 
