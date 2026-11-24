@@ -134,6 +134,11 @@ describe("summarizeCpuProfile (BLO-51594)", () => {
     const s = summarizeCpuProfile({ nodes, samples: [4, 4, 6], timeDeltas: [5e6, 0.7e6, 0.7e6] });
     expect(s.maxSampleGapMs).toBe(700);
   });
+
+  it("ignores a trailing timeDeltas entry with no next sample", () => {
+    const s = summarizeCpuProfile({ nodes, samples: [4, 4, 6], timeDeltas: [0, 0.7e6, 0.7e6, 9e6] });
+    expect(s.maxSampleGapMs).toBe(700);
+  });
 });
 
 describe("CPU flight recorder production settings (BLO-57549)", () => {

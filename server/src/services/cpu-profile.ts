@@ -221,8 +221,8 @@ export function summarizeCpuProfile(profile: CpuProfile, top = 5): CpuProfileSum
     .sort((a, b) => b[1] - a[1])
     .slice(0, top)
     .map(([id, selfUs]) => ({ selfMs: Math.round(selfUs / 1000), stack: stackOf(id) }));
-  // timeDeltas[0] is profile start -> first sample, not a gap between samples.
-  const maxSampleGapUs = deltas.slice(1).reduce((m, d) => Math.max(m, d), 0);
+  // timeDeltas[0] is profile start -> first sample; entries past the last sample pair have no next sample.
+  const maxSampleGapUs = deltas.slice(1, samples.length).reduce((m, d) => Math.max(m, d), 0);
   return { longestBusyMs: Math.round(best.us / 1000), topFrames, maxSampleGapMs: Math.round(maxSampleGapUs / 1000) };
 }
 
