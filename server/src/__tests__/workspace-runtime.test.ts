@@ -8323,16 +8323,17 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
   // BLO-55723 / BLO-54736: two prepares raced the repair inside one second. The peer
   // quarantined to the same second-resolution rescue name, so our `checkout -b` collided
   // ("already exists") and the row was blocked although the tree was already repaired.
-  async function runRaceWithPeerRepair(peerRepairs: boolean) {
-    const expectedBranch = peerRepairs ? "PAP-470-recorded" : "PAP-471-recorded";
-    const actualBranch = peerRepairs ? "PAP-470-live" : "PAP-471-live";
+  async function runRaceWithPeerRepair(peer: boolean | "leaves-merge-in-progress", key = peer === true ? "PAP-470" : "PAP-471") {
+    const peerRepairs = peer !== false;
+    const expectedBranch = `${key}-recorded`;
+    const actualBranch = `${key}-live`;
     const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
     const ids = await seedDirtyQuarantineRecords({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
-      sourceIdentifier: peerRepairs ? "PAP-470" : "PAP-471",
+      sourceIdentifier: key,
       claimant: "none",
     });
     const recorder: WorkspaceOperationRecorder = {
@@ -8346,6 +8347,10 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
             await readGit(worktreePath, ["add", "-A"]);
             await readGit(worktreePath, ["commit", "-m", "peer rescue"]);
             await readGit(worktreePath, ["checkout", expectedBranch]);
+            if (peer === "leaves-merge-in-progress") {
+              const mergeHead = await readGit(worktreePath, ["rev-parse", "--git-path", "MERGE_HEAD"]);
+              await fs.writeFile(path.resolve(worktreePath, mergeHead), `${await readGit(worktreePath, ["rev-parse", "HEAD"])}\n`);
+            }
           } else {
             await readGit(worktreePath, ["checkout", actualBranch]);
           }
@@ -8370,6 +8375,34 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     const { attempt, worktreePath } = await runRaceWithPeerRepair(false);
     await expect(attempt).rejects.toMatchObject({ code: "workspace_validation_failed" });
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
+  }, 20_000);
+
+  it("still fails a rescue-branch collision when the peer left a git operation in progress", async () => {
+    const { attempt } = await runRaceWithPeerRepair("leaves-merge-in-progress", "PAP-472");
+    await expect(attempt).rejects.toMatchObject({ code: "workspace_validation_failed" });
+  }, 20_000);
+
+  // Ally review on #3858: a failure AFTER our own repair restored the tree (here the final
+  // operation record) must not be mistaken for a peer's repair just because the tree reads clean.
+  it("keeps a post-restore repair failure fatal even though the worktree reads repaired", async () => {
+    const expectedBranch = "PAP-473-recorded";
+    const actualBranch = "PAP-473-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot, worktreePath, expectedBranch, actualBranch, sourceIdentifier: "PAP-473", claimant: "none",
+    });
+    const recorder: WorkspaceOperationRecorder = {
+      ...createWorkspaceOperationRecorderDouble().recorder,
+      recordOperation: async (op) => {
+        if (op.command == null && op.metadata?.rescueCommitSha) throw new Error("operation log write failed");
+        const result = await op.run();
+        return { id: "op", status: result.status ?? "succeeded" } as unknown as WorkspaceOperation;
+      },
+    };
+    const attempt = restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids, recorder });
+    await expect(attempt).rejects.toMatchObject({ code: "workspace_validation_failed" });
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
   }, 20_000);
 
   // BLO-55723: the recorded branch was deleted (closed PR) while the worktree sat
