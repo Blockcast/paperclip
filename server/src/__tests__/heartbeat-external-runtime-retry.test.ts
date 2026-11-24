@@ -12,6 +12,7 @@ import {
   externalRuntimeReservations,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issues,
   pluginEventOutbox,
   projects,
@@ -41,6 +42,7 @@ import {
 import { acquireBranchRunClaim, computeBranchClaimKey } from "../services/branch-run-claims.js";
 import { refreshExternalRuntimeReservationStrandMetrics } from "../services/external-runtime-reservation-strand-metrics.js";
 import { renderMetrics } from "../services/metrics.js";
+import { getRunLogStore } from "../services/run-log-store.js";
 
 const mockAdapterExecute = vi.hoisted(() => vi.fn());
 const mockListAgentJobRunStatuses = vi.hoisted(() => vi.fn(async () => null));
@@ -2022,7 +2024,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
   // worker. A succeeded Job seen while the reservation still reads `launched`
   // used to be claimed as `job_complete` at once, so the owner's write was
   // refused and ~46% of succeeded runs kept no usage and no cost_events row.
-  async function seedSucceededJobWithLaunchedReservation(name: string, lastActivityAt?: Date) {
+  async function seedSucceededJobWithLaunchedReservation(
+    name: string,
+    lastActivityAt?: Date,
+    phase: "succeeded" | "failed" = "succeeded",
+  ) {
     const placeholder = randomUUID();
     const seeded = await seedRunningRunWithObservedJob({
       name,
@@ -2035,7 +2041,14 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       },
       lastActivityAt,
     });
-    const job = terminalJobFor(seeded);
+    const job = phase === "failed"
+      ? {
+          ...terminalJobFor(seeded),
+          phase: "failed" as const,
+          reason: "BackoffLimitExceeded",
+          message: "Job has reached the specified backoff limit",
+        }
+      : terminalJobFor(seeded);
     await db
       .update(externalRuntimeReservations)
       .set({ expectedJobName: job.name, jobName: job.name, jobUid: job.uid })
@@ -2080,6 +2093,151 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0]);
     expect(run?.status).toBe("succeeded");
     expect((run?.resultJson as Record<string, any> | null)?.externalLifecycleRecovery?.reason).toBe("job_complete");
+  }, 120_000);
+
+  // BLO-58923: a failed Job gets the same owner grace. Only the owner reads the
+  // provider's terminal result in time; the reaper's run-log read raced the
+  // 429 line by seconds and booked a bare `job_failed`.
+  it("leaves a failed Job to its owner inside the stale window (BLO-58923)", async () => {
+    const { runId } = await seedSucceededJobWithLaunchedReservation("FailedJobOwnerGraceCo", undefined, "failed");
+
+    await heartbeat.reapOrphanedRuns();
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0]);
+    expect(run?.status).toBe("running");
+  }, 120_000);
+
+  // BLO-58923: once the owner is gone the reaper books the failed Job itself.
+  // When the run log ends on a provider 429, the issue's continuation must
+  // wait for the recorded reset instead of failing again and stranding it.
+  // 8 min: past the 5-min owner grace above, inside the 15-min stale window.
+  async function seedFailedContinuationWithLog(name: string, terminalEvent: Record<string, unknown> | null) {
+    const seeded = await seedSucceededJobWithLaunchedReservation(
+      name,
+      new Date(Date.now() - 8 * 60 * 1000),
+      "failed",
+    );
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId: seeded.companyId,
+      title: "Continue after a provider refusal",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: seeded.agentId,
+      checkoutRunId: seeded.runId,
+      executionRunId: seeded.runId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `M${seeded.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}-1`,
+    });
+    const store = getRunLogStore();
+    const handle = await store.begin(seeded);
+    await store.append(handle, { stream: "system", chunk: "starting\n", ts: new Date().toISOString() });
+    if (terminalEvent) {
+      await store.append(handle, {
+        stream: "stdout",
+        chunk: `${JSON.stringify(terminalEvent)}\n`,
+        ts: new Date().toISOString(),
+      });
+    }
+    await db
+      .update(heartbeatRuns)
+      .set({
+        logStore: handle.store,
+        logRef: handle.logRef,
+        contextSnapshot: {
+          issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.continuation_recovery",
+        },
+      })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    return { ...seeded, issueId };
+  }
+
+  function refusalEvent(input: { status: number; isError?: boolean; resetAt: Date }) {
+    return {
+      type: "result",
+      subtype: "success",
+      is_error: input.isError ?? true,
+      api_error_status: input.status,
+      terminal_reason: "api_error",
+      num_turns: 1,
+      result:
+        `API Error: Request rejected (${input.status}) · All Claude subscription capacity for this tenant is ` +
+        `rate-limited; capacity may reset at ${input.resetAt.toISOString()}; retry in 1800s`,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    };
+  }
+
+  it("parks a failed continuation at the recorded 429 reset instead of stranding its issue (BLO-58923)", async () => {
+    const resetAt = new Date(Date.now() + 30 * 60 * 1000);
+    const { companyId, runId, issueId } = await seedFailedContinuationWithLog(
+      "FailedContinuation429Co",
+      refusalEvent({ status: 429, resetAt }),
+    );
+
+    await heartbeat.reapOrphanedRuns();
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0]);
+    const resultJson = run?.resultJson as Record<string, any> | null;
+    // The 429 stays a job_failed explanation, never a recoverable family.
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("job_failed");
+    expect(resultJson?.errorFamily).toBeUndefined();
+    expect(resultJson?.externalLifecycleRecovery?.providerRefusalStatusCode).toBe(429);
+    expect(resultJson?.providerCapacityResetProvenance?.source).toBe("server_parse_provider_capacity_horizon");
+
+    const park = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows);
+    expect(park).toHaveLength(1);
+    expect(park[0]).toMatchObject({
+      status: "scheduled_retry",
+      scheduledRetryReason: "issue_continuation_needed",
+      scheduledRetryAttempt: 1,
+    });
+    expect(park[0].scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(new Date(resultJson!.providerCapacityResetAt).getTime());
+
+    // The park is the issue's execution path, so the stranded sweep leaves it.
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((r) => r[0]);
+    expect(issue?.status).toBe("in_progress");
+    const comments = await db.select().from(issueComments).where(eq(issueComments.companyId, companyId));
+    expect(comments.map((c) => c.body).join("\n")).not.toContain("no live execution path");
+  }, 120_000);
+
+  it.each([
+    { label: "the log has no result event", event: () => null, priorAttempt: null },
+    { label: "the result is not an error", event: () => refusalEvent({ status: 429, isError: false, resetAt: new Date(Date.now() + 1_800_000) }), priorAttempt: null },
+    { label: "the refusal is a 529", event: () => refusalEvent({ status: 529, resetAt: new Date(Date.now() + 1_800_000) }), priorAttempt: null },
+    { label: "the park cap is spent", event: () => refusalEvent({ status: 429, resetAt: new Date(Date.now() + 1_800_000) }), priorAttempt: 12 },
+  ])("still strands a failed continuation when $label (BLO-58923)", async ({ label, event, priorAttempt }) => {
+    const { companyId, runId, issueId } = await seedFailedContinuationWithLog(
+      `FailedContinuationStrand${label.replace(/\W/g, "")}Co`,
+      event(),
+    );
+    if (priorAttempt !== null) {
+      await db
+        .update(heartbeatRuns)
+        .set({ scheduledRetryReason: "issue_continuation_needed", scheduledRetryAttempt: priorAttempt })
+        .where(eq(heartbeatRuns.id, runId));
+    }
+
+    await heartbeat.reapOrphanedRuns();
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0]);
+    expect(run?.errorCode).toBe("job_failed");
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((r) => r[0]);
+    expect(issue?.status).toBe("blocked");
+    const parks = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(parks.filter((row) => row.status === "scheduled_retry")).toEqual([]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.companyId, companyId));
+    expect(comments.map((c) => c.body).join("\n")).toContain("during terminal run recovery");
   }, 120_000);
 
   it.each([

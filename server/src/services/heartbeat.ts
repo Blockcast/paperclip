@@ -2214,19 +2214,33 @@ export async function probeStaleKillReviewEvidence(
 export function readPrReviewProviderCapacityRefusalRetryNotBefore(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
 ): Date | null {
+  const notBefore = readServerJobFailedProviderCapacityNotBefore(run);
+  if (!notBefore) return null;
+  const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
+  if (recovery.reviewEvidenceFound !== false) return null;
+  return isPrReviewRetryContext(parseObject(run.contextSnapshot)) ? notBefore : null;
+}
+
+/**
+ * The reset instant the server's external-lifecycle terminal path recorded for
+ * a `job_failed` run whose log ended on a provider 429 (PEN-3129), or null.
+ *
+ * Only that path's own write is trusted. The adapter-owner path strips these
+ * keys from adapter output, so a matching provenance source cannot be forged.
+ * The recorded instant is already bounded by `PROVIDER_CAPACITY_MAX_HORIZON_MS`.
+ */
+export function readServerJobFailedProviderCapacityNotBefore(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson">,
+): Date | null {
   if (run.errorCode !== "job_failed") return null;
   const resultJson = parseObject(run.resultJson);
   const recovery = parseObject(resultJson.externalLifecycleRecovery);
   if (recovery.providerRefusalStatusCode !== 429) return null;
-  if (recovery.reviewEvidenceFound !== false) return null;
-  // Only the server terminal path's own write. The adapter-owner path strips
-  // these keys from adapter output, so a matching source cannot be forged.
   const provenance = parseObject(resultJson.providerCapacityResetProvenance);
   if (provenance.source !== PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE) return null;
   const resetAt = readNonEmptyString(resultJson.providerCapacityResetAt);
   const parsed = resetAt ? new Date(resetAt) : null;
-  if (!parsed || Number.isNaN(parsed.getTime())) return null;
-  return isPrReviewRetryContext(parseObject(run.contextSnapshot)) ? parsed : null;
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed : null;
 }
 
 export function shouldScheduleAutomaticRunRetry(
@@ -32687,8 +32701,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // well under the Job TTL (900s): a dead owner's Job GC'd before this
             // branch sees it again would be finalized `job_missing` (failed, not
             // retried) instead of `job_complete`.
+            //
+            // BLO-58923: a FAILED Job gets the same grace. Only the owner reads
+            // the provider's terminal result in time: the 429 line reached the
+            // durable run log 3-6 s after this branch booked a bare
+            // `job_failed`, so the run-log read below missed it and a
+            // continuation that hit the same window stranded its issue.
             if (
-              jobStatus.phase === "succeeded"
+              (jobStatus.phase === "succeeded" || jobStatus.phase === "failed")
               && lastSignalRef
               && now.getTime() - lastSignalRef < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS
             ) continue;
@@ -44154,13 +44174,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
 
+      const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
+      const now = new Date();
+      // BLO-58923: a run the provider refused with a 429 recorded when capacity
+      // returns. A continuation started before then fails the same way, and a
+      // failed continuation used to block the issue as stranded. Park the
+      // continuation at the recorded reset instead, up to the rate-limit cap.
+      const capacityNotBefore =
+        issue.status === "in_progress" ? readServerJobFailedProviderCapacityNotBefore(run) : null;
+      const capacityParkAttempt =
+        (run.scheduledRetryReason === retryReason ? (run.scheduledRetryAttempt ?? 0) : 0) + 1;
+      const capacityPark =
+        capacityNotBefore !== null && capacityParkAttempt <= RATE_LIMIT_HEARTBEAT_RETRY_MAX_ATTEMPTS;
       const shouldBlockImmediately =
         !recoveryAgentInvokable ||
         !recoveryAgent ||
         isNonRetryablePrReviewTerminalOutcome(run) ||
         isWorkspaceValidationFailedRun(run) ||
         isConfigurationIncompleteFailedRun(run) ||
-        didAutomaticRecoveryFail(run, issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed");
+        (didAutomaticRecoveryFail(run, retryReason) && !capacityPark);
       if (shouldBlockImmediately) {
         const workspaceValidationFailure = isWorkspaceValidationFailedRun(run);
         const configurationIncompleteFailure = isConfigurationIncompleteFailedRun(run);
@@ -44193,11 +44225,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
 
-      const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =
         issue.status === "todo" ? "issue.assignment_recovery" : "issue.continuation_recovery";
-      const now = new Date();
+      const capacityParkAt = capacityPark
+        ? jitterTransientRetryFloor({
+            dueAt: new Date(Math.max(capacityNotBefore.getTime(), now.getTime())),
+            now,
+          }).dueAt
+        : null;
       const recoveryContextSnapshot = withRecoveryModelProfileHint({
         issueId: issue.id,
         taskId: issue.id,
@@ -44254,12 +44290,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           agentId: recoveryAgent.id,
           invocationSource: "automation",
           triggerDetail: "system",
-          status: "queued",
+          status: capacityParkAt ? "scheduled_retry" : "queued",
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: recoveryContextSnapshot,
           responsibleUserId,
           sessionIdBefore: recoverySessionBefore,
           retryOfRunId: run.id,
+          ...(capacityParkAt
+            ? {
+                scheduledRetryAt: capacityParkAt,
+                scheduledRetryAttempt: capacityParkAttempt,
+                scheduledRetryReason: retryReason,
+              }
+            : {}),
           updatedAt: now,
         })
         .returning()
@@ -44273,6 +44316,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         })
         .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
+      // A parked continuation is the issue's execution path but is not runnable
+      // yet; the scheduled-retry promoter queues it at `capacityParkAt`.
+      if (capacityParkAt) {
+        return completePromotion({ kind: "released" as const }, { retainPrimaryCheckoutPromotion: true });
+      }
       return completePromotion(
         {
           kind: "queued_recovery" as const,
