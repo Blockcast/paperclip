@@ -3082,6 +3082,8 @@ describe("BLO-59104: Webflow asset paths", () => {
   it.each([
     ["opaque token in the filename slot", `src="${path(`${SYNTHETIC_OPAQUE_VALUE}.png`)}"`],
     ["random base62 run in the filename", `src="${path("resource-database-9jqag0Gk3uQ-unsplash.jpg")}"`],
+    ["a token formatted as Title-case runs", `src="${path("Xqzwpm-Rtvkls-Bnmhgf-Wqerty-Plokij-Uyhgtf.png")}"`],
+    ["a token formatted as WxH runs", `src="${path("1234x5678-9876x5432-4321x8765.png")}"`],
     ["binding name outside src/srcset/href", `token="${path("Group%2085.svg")}"`],
     ["a different host", `src="/cdn.example.com/${SITE}/${ASSET}_Group%2085.svg"`],
     ["a 40-hex segment where an ObjectId belongs", `src="/cdn.prod.website-files.com/${"a1".repeat(20)}/${ASSET}_hero.png"`],
