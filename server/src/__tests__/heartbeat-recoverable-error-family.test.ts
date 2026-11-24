@@ -34,6 +34,7 @@ import {
   RECOVERABLE_AGENT_STATUS_ERROR_CODES,
   readHeartbeatRunErrorFamily,
   readPrReviewProviderCapacityRefusalRetryNotBefore,
+  readServerJobFailedProviderCapacityNotBefore,
   readTransientRecoveryContractFromRun,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
@@ -430,6 +431,23 @@ describe("BLO-45251: a pr_review 429 park retries once no review exists at head"
     const run = { errorCode: "job_failed", resultJson, contextSnapshot };
     expect(shouldScheduleAutomaticRunRetry(run)).toBe(false);
     expect(readPrReviewProviderCapacityRefusalRetryNotBefore(run)).toBeNull();
+  });
+
+  // BLO-58923: the issue-continuation park reads the same server-written
+  // reset without the pr_review legs, and nothing else.
+  it("reads the server-recorded reset for an issue run", () => {
+    const run = { errorCode: "job_failed", resultJson: fd6dce90({ reviewEvidenceFound: undefined }) };
+    expect(readServerJobFailedProviderCapacityNotBefore(run)?.toISOString()).toBe(resetAt);
+  });
+
+  it.each([
+    ["no 429 evidence", "job_failed", fd6dce90({ providerRefusalStatusCode: undefined })],
+    ["a non-429 refusal", "job_failed", fd6dce90({ providerRefusalStatusCode: 529 })],
+    ["no parsed reset instant", "job_failed", fd6dce90({}, { providerCapacityResetAt: undefined })],
+    ["adapter-forged provenance", "job_failed", fd6dce90({}, { providerCapacityResetProvenance: { source: "adapter" } })],
+    ["another error code", "adapter_failed", fd6dce90()],
+  ])("reads no server reset when %s", (_label, errorCode, resultJson) => {
+    expect(readServerJobFailedProviderCapacityNotBefore({ errorCode, resultJson })).toBeNull();
   });
 });
 
