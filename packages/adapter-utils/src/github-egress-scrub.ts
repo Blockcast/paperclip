@@ -1272,6 +1272,65 @@ function isGbrainSourceId(value: string): boolean {
   return true;
 }
 
+/** BLO-59104: a Webflow-exported static asset path, `/cdn.prod.website-files.com/<site>/<asset>_<filename>`,
+ *  bound to an HTML `src`, `srcset` or `href`. Every Webflow page in
+ *  `Blockcast/blockcast.github.io` carries these (250 bindings, one shape), and
+ *  the two 24-hex ObjectIds put any such value over the entropy floor, so every
+ *  agent edit to those pages was refused.
+ *
+ *  Bounded the way this file bounds every exemption: a binding-name anchor AND
+ *  a fixed shape — here a LITERAL host plus exactly two 24-lowercase-hex
+ *  segments, which are public ObjectIds, not credentials. Only that scaffolding
+ *  is exonerated. The free-text filename after `<asset>_` is still judged,
+ *  under its own bounded word test (isWebflowAssetFilename) or, failing that,
+ *  the ordinary entropy test, so an opaque token there is still refused. The
+ *  value usually arrives truncated at the first `%` (ASSIGNMENT_RE's
+ *  alphabet), so the filename may be partial. */
+const WEBFLOW_ASSET_VALUE_NAMES = new Set(["src", "srcset", "href"]);
+const WEBFLOW_ASSET_PATH_RE = /^\/cdn\.prod\.website-files\.com\/[0-9a-f]{24}\/[0-9a-f]{24}_(.*)$/;
+/** Webflow page ids are the same public 24-hex ObjectId class; the Astro port
+ *  carries them as a `webflowPageId` prop on every exported page. */
+const WEBFLOW_OBJECT_ID_VALUE_NAMES = new Set(["webflowPageId"]);
+const WEBFLOW_OBJECT_ID_RE = /^[0-9a-f]{24}$/;
+/** Image-size runs Webflow's exporter writes into filenames (`256x256`). */
+const WEBFLOW_DIMENSION_RUN_RE = /^[0-9]{1,4}x[0-9]{1,4}$/;
+/** One Title-case word (`Logo`, `Real`). isPosixPathRun refuses these under 5
+ *  characters to close chopped-token families in a name-free rule; here the
+ *  host and two ObjectIds already anchor the value, and a random base62 run is
+ *  Title-case only ~3% of the time, so a chopped token must clear that on
+ *  every run under the run-count cap. */
+const WEBFLOW_TITLE_WORD_RUN_RE = /^[A-Z][a-z]+$/;
+
+/** True when a Webflow filename is built of words: each `-`/`_`/`.` run must
+ *  pass isPosixPathRun, be one Title-case word, or be a `WxH` size, under the POSIX-path run, content
+ *  and mixed-run caps. Webflow sometimes prefixes a second 24-hex asset id,
+ *  which is stripped first. `--` is common in exported names, so empty runs
+ *  are skipped. A random base62 run (an Unsplash photo id) is deliberately
+ *  NOT admitted: that is what a token chopped into runs looks like. */
+function isWebflowAssetFilename(filename: string): boolean {
+  const runs = filename.replace(/^[0-9a-f]{24}_/, "").split(/[-._]+/).filter((run) => run !== "");
+  if (runs.length > POSIX_PATH_MAX_RUNS) return false;
+  let contentLength = 0;
+  let mixedRuns = 0;
+  for (const run of runs) {
+    contentLength += run.length;
+    if (contentLength > POSIX_PATH_MAX_CONTENT_LENGTH) return false;
+    if (WEBFLOW_DIMENSION_RUN_RE.test(run) || WEBFLOW_TITLE_WORD_RUN_RE.test(run)) continue;
+    if (!isPosixPathRun(run)) return false;
+    if (/[0-9]/.test(run) && /[A-Za-z]/.test(run) && ++mixedRuns > POSIX_PATH_MAX_MIXED_RUNS) return false;
+  }
+  return true;
+}
+
+function isWebflowAssetPath(name: string, value: string): boolean {
+  if (WEBFLOW_OBJECT_ID_VALUE_NAMES.has(name)) return WEBFLOW_OBJECT_ID_RE.test(value);
+  if (!WEBFLOW_ASSET_VALUE_NAMES.has(name)) return false;
+  const match = WEBFLOW_ASSET_PATH_RE.exec(value);
+  if (match === null) return false;
+  const filename = match[1] as string;
+  return isWebflowAssetFilename(filename) || !isOpaqueSecretValue(filename);
+}
+
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
   if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
@@ -1287,6 +1346,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
   if (GBRAIN_SOURCE_ID_VALUE_NAMES.has(name) && isGbrainSourceId(value)) return true;
   if (GIT_OBJECT_NAME_VALUE_NAMES.has(name) && GIT_COMMIT_SHA_RE.test(value)) return true;
   if (UUID_VALUE_NAMES.has(name) && CANONICAL_UUID_RE.test(value)) return true;
+  if (isWebflowAssetPath(name, value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
 

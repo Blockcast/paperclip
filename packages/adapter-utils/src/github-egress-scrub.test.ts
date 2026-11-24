@@ -3057,3 +3057,36 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 });
+
+// BLO-59104: Webflow-exported asset paths in Blockcast/blockcast.github.io.
+// The two 24-hex ids are SYNTHETIC; the filenames are the real public ones.
+describe("BLO-59104: Webflow asset paths", () => {
+  const SITE = "0123456789abcdef01234567";
+  const ASSET = "89abcdef0123456789abcdef";
+  const path = (filename: string) => `/cdn.prod.website-files.com/${SITE}/${ASSET}_${filename}`;
+
+  it.each([
+    `<img src="${path("Group%2085.svg")}" loading="lazy" alt="" />`,
+    `<img src="${path("image_61.png")}" loading="lazy" />`,
+    `srcset="${path("RW3-Ventures-Logo-Color-Transparent-p-500.png")} 500w"`,
+    `href="${path("Blockcast_X_Profile_256x256.png")}"`,
+    `src="${path("Video-Game-Logo-Streamplay--Streamline-Ultimate.svg")}"`,
+    `src="${path(`${ASSET}_Group%20115.png`)}"`,
+    `webflowPageId="${SITE}"`,
+  ])("passes a real Webflow binding byte-exact: %s", (line) => {
+    const result = scrubGitHubEgressText(line);
+    expect(result.redacted).toBe(false);
+    expect(result.text).toBe(line);
+  });
+
+  it.each([
+    ["opaque token in the filename slot", `src="${path(`${SYNTHETIC_OPAQUE_VALUE}.png`)}"`],
+    ["random base62 run in the filename", `src="${path("resource-database-9jqag0Gk3uQ-unsplash.jpg")}"`],
+    ["binding name outside src/srcset/href", `token="${path("Group%2085.svg")}"`],
+    ["a different host", `src="/cdn.example.com/${SITE}/${ASSET}_Group%2085.svg"`],
+    ["a 40-hex segment where an ObjectId belongs", `src="/cdn.prod.website-files.com/${"a1".repeat(20)}/${ASSET}_hero.png"`],
+    ["webflowPageId that is not 24-hex", `webflowPageId="${SYNTHETIC_OPAQUE_VALUE}"`],
+  ])("still refuses %s", (_label, line) => {
+    expect(scrubGitHubEgressText(line).classes).toEqual(["high-entropy-assignment"]);
+  });
+});
