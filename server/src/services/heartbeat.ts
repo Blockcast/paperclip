@@ -6238,6 +6238,20 @@ export function isRateLimitExhausted(
   return false;
 }
 
+// OpenCode's terminal JSONL errors reach the server as adapter errorMessage,
+// without the api_error_status that the Claude result envelope carries. Match
+// observed provider signatures at the start, never in model prose or log tails.
+export function isOpenCodeK8sProviderCapacityFailure(
+  adapterType: string,
+  outcome: RunSessionOutcome,
+  result: Pick<AdapterExecutionResult, "errorCode" | "errorFamily" | "errorMessage">,
+): boolean {
+  if (adapterType !== "opencode_k8s" || outcome !== "failed" || result.errorFamily) return false;
+  if (result.errorCode && result.errorCode !== "adapter_failed") return false;
+  const message = result.errorMessage?.trimStart() ?? "";
+  return /^(?:Too Many Requests:\s*All ChatGPT subscription capacity for this tenant is rate-limited|Our servers are currently overloaded)\b/i.test(message);
+}
+
 function looksLikeRetryableDeadlineExceeded(value: unknown): boolean {
   return typeof value === "string" && /(?:deadline[_\s-]*exceeded|upstream request timeout|gateway timeout|504\b)/i.test(value);
 }
@@ -41728,7 +41742,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const looksRateLimited = isRateLimitExhausted(adapterResult.resultJson, {
         errorMessage: adapterResult.errorMessage,
       });
-      if (outcome === "succeeded" && isK8sAdapter(agent.adapterType) && isRetryableK8sCcrotateThrottleResult(adapterResult)) {
+      const openCodeProviderCapacityFailure = isOpenCodeK8sProviderCapacityFailure(agent.adapterType, outcome, adapterResult);
+      if (openCodeProviderCapacityFailure) {
+        // A terminal refusal can follow billable work. Use the bounded retry
+        // family, without advertising zero progress to ccrotate or recovery.
+        rateLimitExhaustedOverride = true;
+      } else if (outcome === "succeeded" && isK8sAdapter(agent.adapterType) && isRetryableK8sCcrotateThrottleResult(adapterResult)) {
         outcome = "failed";
         providerThrottledNoProgressOverride = true;
       } else if (
@@ -42028,7 +42047,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         usageBasis: adapterResult.usageBasis ?? null,
       });
       const normalizedUsage = sessionUsageResolution.normalizedUsage;
-      const runErrorMessage = rateLimitExhaustedOverride
+      const runErrorMessage = openCodeProviderCapacityFailure
+        ? redactCurrentUserText(adapterResult.errorMessage ?? "Provider capacity unavailable", currentUserRedactionOptions)
+        : rateLimitExhaustedOverride
         ? "Run hit Anthropic rate limit (out of extra usage); scheduled for transient retry"
         : providerThrottledNoProgressOverride
           ? "Run hit provider throttle/deadline before any token usage; scheduled for transient retry"
