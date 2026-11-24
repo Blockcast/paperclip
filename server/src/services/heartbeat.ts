@@ -3100,6 +3100,13 @@ const EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_AFTER_MS = 30 * 60 * 1000;
 // whole pending backlog into a 30 s log storm. One attributable line per row
 // per hour keeps the diagnostic and loses the flood.
 const EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_INTERVAL_MS = 60 * 60 * 1000;
+// BLO-55175: the one clock for "how long has this reservation been releasable",
+// shared by the PEN-3640 strand log and the BLO-32052 release-pending age gauge
+// so the two cannot disagree on the same row during a
+// PaperclipRuntimeResourceReconciliationStuck page. A reservation still
+// `launched` under a terminal run becomes releasable at the run's finish;
+// `greatest` ignores a null `finished_at`. Requires `heartbeat_runs` joined.
+const externalRuntimeReservationReleasableAt = sql`greatest(${externalRuntimeReservations.updatedAt}, ${heartbeatRuns.finishedAt})`;
 // Size at which the per-row log-state map is swept for stale entries. Well
 // above any plausible simultaneous strand count, so steady state never pays
 // for the scan.
@@ -30591,6 +30598,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reservation: externalRuntimeReservations,
         run: heartbeatRuns,
         adapterType: agents.adapterType,
+        // BLO-55175: same clock as the release-pending age gauge.
+        releasableAt: sql<Date | string>`${externalRuntimeReservationReleasableAt}`,
       })
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
@@ -30654,9 +30663,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // only showing up as a rising gauge.
     //
     // Two separate clocks, and the distinction is load-bearing (Ally
-    // suggestion 1). The GATE is time spent refused — `updatedAt`, the same
-    // clock `isolationSetupGraceActive` already uses below. `reservedAt` would
-    // gate on how long the run has existed, so a run cancelled after 30+ min
+    // suggestion 1). The GATE is time spent refused — time since the row became
+    // releasable, `greatest(updatedAt, run.finishedAt)` (BLO-55175), the same
+    // clock the release-pending age gauge reads, so log and gauge agree.
+    // `reservedAt` would gate on how long the run has existed, so a run cancelled after 30+ min
     // would warn on the very first pass while its Job is still legitimately
     // terminating. Both are logged: `refusedSeconds` is the strand signal,
     // `heldSeconds` is what the leaked slot has cost.
@@ -30671,10 +30681,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // moment the other signals most need to stay legible.
     const noteStuckSkip = (
       reservation: typeof externalRuntimeReservations.$inferSelect,
+      releasableAt: Date | string,
       refusedBy: string,
     ) => {
       const now = Date.now();
-      const refusedMs = now - new Date(reservation.updatedAt).getTime();
+      const refusedMs = now - new Date(releasableAt).getTime();
       if (refusedMs < EXTERNAL_RUNTIME_RESERVATION_STUCK_LOG_AFTER_MS) return;
       const lastLoggedAtMs = stuckReservationLastLoggedAtMs.get(reservation.id);
       if (
@@ -30709,7 +30720,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     };
 
-    for (const { reservation, run, adapterType } of pending) {
+    for (const { reservation, run, adapterType, releasableAt } of pending) {
       // BLO-21460 (Ally important 1): isolate per-row failures. The release
       // write below can reject on transient pool or serialization errors, and
       // a deterministic single-row failure would otherwise abort the rest of
@@ -30748,11 +30759,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           activeRunExecutions.has(reservation.runId)
           && !(adapterType && hasExternalLifecycle(adapterType))
         ) {
-          noteStuckSkip(reservation, "active_run_execution");
+          noteStuckSkip(reservation, releasableAt, "active_run_execution");
           continue;
         }
         if (ambiguousRunIds.has(reservation.runId)) {
-          noteStuckSkip(reservation, "ambiguous_job_identity");
+          noteStuckSkip(reservation, releasableAt, "ambiguous_job_identity");
           continue;
         }
         const observed = jobRunStatuses?.get(reservation.runId) ?? null;
@@ -30777,11 +30788,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // could not name. The `logger.error` above carries `observed` but not
           // `refusedSeconds`/`heldSeconds`, and it is not rate-limited, so it
           // cannot be joined to the other five or counted beside them.
-          noteStuckSkip(reservation, "job_identity_mismatch");
+          noteStuckSkip(reservation, releasableAt, "job_identity_mismatch");
           continue;
         }
         if (observed?.phase === "active") {
-          noteStuckSkip(reservation, "job_active");
+          noteStuckSkip(reservation, releasableAt, "job_active");
           continue;
         }
 
@@ -30796,7 +30807,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           (reservation.isolationMode === "shared" || reservation.isolationMode === "workspace") &&
           Date.now() - new Date(reservation.updatedAt).getTime() < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS;
         if (isolationSetupGraceActive) {
-          noteStuckSkip(reservation, "isolation_setup_grace");
+          noteStuckSkip(reservation, releasableAt, "isolation_setup_grace");
           continue;
         }
         // Both bundled external adapters await onMeta before createNamespacedJob.
@@ -30864,6 +30875,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // causes would re-create exactly the conflation this change removes.
           noteStuckSkip(
             reservation,
+            releasableAt,
             jobName
               ? (exactRefusedBy ?? "job_refusal_unattributed")
               : "launch_unfinished",
@@ -31204,10 +31216,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const [releasePendingSnapshot] = await db
       .select({
         count: sql<number>`count(*)`,
-        // BLO-32052: age from when the row became releasable, not from launch. A
-        // reservation still `launched` under a terminal run becomes releasable at
-        // the run's finish; `greatest` ignores a null `finished_at`.
-        oldestUpdatedAt: sql<Date | null>`min(greatest(${externalRuntimeReservations.updatedAt}, ${heartbeatRuns.finishedAt}))`,
+        // BLO-32052: age from when the row became releasable, not from launch.
+        oldestUpdatedAt: sql<Date | null>`min(${externalRuntimeReservationReleasableAt})`,
       })
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
