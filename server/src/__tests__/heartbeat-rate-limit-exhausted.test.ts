@@ -12,6 +12,7 @@ import {
   ZERO_TOKEN_STREAK_SCAN_LIMIT,
   countConsecutiveZeroTokenCompletedRuns,
   isRateLimitExhausted,
+  isOpenCodeK8sProviderCapacityFailure,
   isRetryableK8sCcrotateThrottleResult,
   K8S_REPLACEMENT_LAUNCH_FAILURE_AFTER_THROTTLE_KEY,
   k8sCcrotateRetryDelayMs,
@@ -126,6 +127,37 @@ describe("isRateLimitExhausted", () => {
         errorMessage: "Generic error 401: not our format",
       }),
     ).toBe(false);
+  });
+});
+
+describe("OpenCode Kubernetes provider capacity failures", () => {
+  const refusal = "Too Many Requests: All ChatGPT subscription capacity for this tenant is rate-limited; capacity resets by 2026-11-24T08:00:00.000Z; Pod exited: Error (exit 1)";
+  const overload = "Our servers are currently overloaded. Please try again later.";
+
+  it.each([refusal, overload])("recognizes the terminal adapter error: %s", (errorMessage) => {
+    expect(isOpenCodeK8sProviderCapacityFailure("opencode_k8s", "failed", {
+      errorMessage,
+      errorCode: "adapter_failed",
+    })).toBe(true);
+  });
+
+  it("preserves successful runs, other adapters, and specific infrastructure failures", () => {
+    const result = { errorMessage: refusal };
+    expect(isOpenCodeK8sProviderCapacityFailure("opencode_k8s", "succeeded", result)).toBe(false);
+    expect(isOpenCodeK8sProviderCapacityFailure("opencode_k8s", "cancelled", result)).toBe(false);
+    expect(isOpenCodeK8sProviderCapacityFailure("claude_k8s", "failed", result)).toBe(false);
+    expect(isOpenCodeK8sProviderCapacityFailure("opencode_k8s", "failed", {
+      ...result, errorCode: "k8s_pod_schedule_failed",
+    })).toBe(false);
+  });
+
+  it.each([
+    "Model not found: openai/gpt-6.1-sol",
+    `Pod exited: Error (exit 1) — pod log tail: ${refusal}`,
+    "Too Many Requests: GitHub API rate limit exceeded",
+    "Our servers are currently overloadedness",
+  ])("does not classify unrelated adapter errors: %s", (errorMessage) => {
+    expect(isOpenCodeK8sProviderCapacityFailure("opencode_k8s", "failed", { errorMessage })).toBe(false);
   });
 });
 
