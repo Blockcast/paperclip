@@ -1738,17 +1738,28 @@ function buildExecutionReviewParticipantUnavailableComment(latestRun: LatestIssu
   );
 }
 
+const EXTERNAL_WAIT_YIELD_REDISPATCH_KEY = "externalWaitYieldRedispatch";
+
+function externalWaitYieldRedispatchContext(latestRun: LatestIssueRun): Record<string, unknown> {
+  return isExternalWaitYieldRun(latestRun) ? { [EXTERNAL_WAIT_YIELD_REDISPATCH_KEY]: true } : {};
+}
+
 function didAutomaticRecoveryFail(
   latestRun: LatestIssueRun,
   expectedRetryReason: "assignment_recovery" | "issue_continuation_needed" | typeof EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
 ) {
   if (!latestRun) return false;
+  const latestContext = parseObject(latestRun.contextSnapshot);
   // BLO-59187: a retry that yielded its slot for an external wait did its job; it did
   // not fail. If the wait it armed is gone (e.g. a plugin cancelled and reopened the
   // row, clearing the monitor), the right remedy is another dispatch, not escalation.
-  if (isExternalWaitYieldRun(latestRun)) return false;
+  // Forgiven ONCE per chain: the redispatch is stamped (`externalWaitYieldRedispatchContext`),
+  // and a stamped retry that yields with its wait gone again counts as failed, so a
+  // yield -> wait-cleared -> redispatch cycle cannot keep the row hot forever.
+  if (isExternalWaitYieldRun(latestRun) && latestContext[EXTERNAL_WAIT_YIELD_REDISPATCH_KEY] !== true) {
+    return false;
+  }
 
-  const latestContext = parseObject(latestRun.contextSnapshot);
   const latestRetryReason = readNonEmptyString(latestContext.retryReason);
   return latestRetryReason === expectedRetryReason &&
     UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
@@ -11020,6 +11031,7 @@ export function recoveryService(
           source: "issue.execution_review_recovery",
           retryOfRunId: participantLatestRun.id,
           extraContext: {
+            ...externalWaitYieldRedispatchContext(participantLatestRun),
             currentStageId: pendingExecutionState.currentStageId ?? null,
             currentStageType: pendingExecutionState.currentStageType ?? null,
             reviewRecoveryInstruction:
@@ -11329,6 +11341,7 @@ export function recoveryService(
             retryReason: "assignment_recovery",
             source: "issue.assignment_recovery",
             retryOfRunId: latestRun.id,
+            extraContext: externalWaitYieldRedispatchContext(latestRun),
           })
         );
         if (queued) {
