@@ -1297,25 +1297,30 @@ const WEBFLOW_DIMENSION_RUN_RE = /^[0-9]{1,4}x[0-9]{1,4}$/;
 /** One Title-case word (`Logo`, `Real`). isPosixPathRun refuses these under 5
  *  characters to close chopped-token families in a name-free rule; here the
  *  host and two ObjectIds already anchor the value. A Title-case run skips the
- *  entropy test, so it must also read as a word: a vowel and no 4+ consonant
- *  cluster. That held for every Title-case word in all 93 real filenames
- *  (`Neighbourhood`, `Streamplay`, `Unpredictable`) and refuses a token formatted
- *  as Title-case runs (`Xqzwpm-Rtvkls-…`). */
+ *  entropy test, so it must be one of the words actually measured in real
+ *  Webflow filenames (all 190 paths in Blockcast/blockcast.github.io, split on
+ *  `-`/`_`/`.`/`%XX`). A pronounceability rule still admitted a 6-run
+ *  high-entropy token (Ally review on 66320cdb). 42 words x 6 runs is ~32 bits, not a credential.
+ *  shortcut: a new Webflow asset with an unlisted word is refused; add it here. */
 const WEBFLOW_TITLE_WORD_RUN_RE = /^[A-Z][a-z]+$/;
-const isPronounceableWord = (run: string): boolean => /[aeiouy]/i.test(run) && !/[^aeiouy]{4}/i.test(run);
+const WEBFLOW_TITLE_WORDS = new Set([
+  "Agustin", "Asset", "Blockcast", "Blue", "Broadcast", "Capacity", "Color", "Content",
+  "Delivery", "Estate", "Frame", "Game", "Glenn", "Group", "Illustrations", "Integration",
+  "Layer", "Lisa", "Logo", "Monetization", "Monetizing", "Neighbourhood", "Network",
+  "Omar", "Polygon", "Profile", "Quality", "Real", "Scaling", "Screenshot", "Serve",
+  "Streamline", "Streamplay", "Traffic", "Transparent", "Ultimate", "Unicast",
+  "Unpredictable", "Untitled", "Ventures", "Video", "Wordmark",
+]);
 /** At most one `WxH` run per filename: one was the measured maximum, and a
  *  string of them is a digit payload, not a size. */
 const WEBFLOW_MAX_DIMENSION_RUNS = 1;
 /** At most six Title-case runs per filename, the corpus maximum
- *  (`Video-Game-Logo-Streamplay--Streamline-Ultimate`, 180 real paths). A
- *  Title-case run skips the entropy test, so without a count a token can be
- *  spelled as many pronounceable runs (`Xqazwm-Rtvakl-…` x15). Six such runs is
- *  no more than isPosixPathValue already exonerates on any `/`-led value
- *  with no name anchor at all. */
+ *  (`Video-Game-Logo-Streamplay--Streamline-Ultimate`, 190 real paths), so a
+ *  string of listed words cannot carry more than ~32 bits. */
 const WEBFLOW_MAX_TITLE_WORD_RUNS = 6;
 
 /** True when a Webflow filename is built of words: each `-`/`_`/`.` run must
- *  pass isPosixPathRun, be one pronounceable Title-case word, or be the one
+ *  pass isPosixPathRun, be one listed Title-case word, or be the one
  *  `WxH` size, under the POSIX-path run, content and mixed-run caps. Webflow sometimes prefixes a second 24-hex asset id,
  *  which is stripped first. `--` is common in exported names, so empty runs
  *  are skipped. A random base62 run (an Unsplash photo id) is deliberately
@@ -1337,7 +1342,7 @@ function isWebflowAssetFilename(filename: string): boolean {
     // No fallback to isPosixPathRun: its camel rule admits any Title-case run
     // of 5+ letters, which would reopen exactly this hole.
     if (WEBFLOW_TITLE_WORD_RUN_RE.test(run)) {
-      if (!isPronounceableWord(run) || ++titleWordRuns > WEBFLOW_MAX_TITLE_WORD_RUNS) return false;
+      if (!WEBFLOW_TITLE_WORDS.has(run) || ++titleWordRuns > WEBFLOW_MAX_TITLE_WORD_RUNS) return false;
       continue;
     }
     if (!isPosixPathRun(run)) return false;
