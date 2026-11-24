@@ -3083,6 +3083,8 @@ describe("BLO-59104: Webflow asset paths", () => {
     ["opaque token in the filename slot", `src="${path(`${SYNTHETIC_OPAQUE_VALUE}.png`)}"`],
     ["random base62 run in the filename", `src="${path("resource-database-9jqag0Gk3uQ-unsplash.jpg")}"`],
     ["a token formatted as Title-case runs", `src="${path("Xqzwpm-Rtvkls-Bnmhgf-Wqerty-Plokij-Uyhgtf.png")}"`],
+    // Every run is a pronounceable Title-case word, so only the run count refuses it.
+    ["a token formatted as seven pronounceable Title-case runs", `src="${path("Xqazwm-Rtvakl-Bnmagu-Jqevtx-Kzompr-Wfixel-Ydovcn.png")}"`],
     ["a token formatted as WxH runs", `src="${path("1234x5678-9876x5432-4321x8765.png")}"`],
     ["binding name outside src/srcset/href", `token="${path("Group%2085.svg")}"`],
     ["a different host", `src="/cdn.example.com/${SITE}/${ASSET}_Group%2085.svg"`],
