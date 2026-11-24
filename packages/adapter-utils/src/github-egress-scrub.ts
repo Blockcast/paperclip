@@ -1306,6 +1306,13 @@ const isPronounceableWord = (run: string): boolean => /[aeiouy]/i.test(run) && !
 /** At most one `WxH` run per filename: one was the measured maximum, and a
  *  string of them is a digit payload, not a size. */
 const WEBFLOW_MAX_DIMENSION_RUNS = 1;
+/** At most six Title-case runs per filename, the corpus maximum
+ *  (`Video-Game-Logo-Streamplay--Streamline-Ultimate`, 180 real paths). A
+ *  Title-case run skips the entropy test, so without a count a token can be
+ *  spelled as many pronounceable runs (`Xqazwm-Rtvakl-…` x15). Six such runs is
+ *  no more than isPosixPathValue already exonerates on any `/`-led value
+ *  with no name anchor at all. */
+const WEBFLOW_MAX_TITLE_WORD_RUNS = 6;
 
 /** True when a Webflow filename is built of words: each `-`/`_`/`.` run must
  *  pass isPosixPathRun, be one pronounceable Title-case word, or be the one
@@ -1319,6 +1326,7 @@ function isWebflowAssetFilename(filename: string): boolean {
   let contentLength = 0;
   let mixedRuns = 0;
   let dimensionRuns = 0;
+  let titleWordRuns = 0;
   for (const run of runs) {
     contentLength += run.length;
     if (contentLength > POSIX_PATH_MAX_CONTENT_LENGTH) return false;
@@ -1329,7 +1337,7 @@ function isWebflowAssetFilename(filename: string): boolean {
     // No fallback to isPosixPathRun: its camel rule admits any Title-case run
     // of 5+ letters, which would reopen exactly this hole.
     if (WEBFLOW_TITLE_WORD_RUN_RE.test(run)) {
-      if (!isPronounceableWord(run)) return false;
+      if (!isPronounceableWord(run) || ++titleWordRuns > WEBFLOW_MAX_TITLE_WORD_RUNS) return false;
       continue;
     }
     if (!isPosixPathRun(run)) return false;
