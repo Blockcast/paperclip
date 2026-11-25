@@ -5799,15 +5799,27 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     name: "write-prompt",
     image: runtimePromptUrl ? selfPod.image : "busybox:1.36",
     imagePullPolicy: "IfNotPresent",
-    command: runtimePromptUrl
-      ? ["node", "-e", DOWNLOAD_RUNTIME_PROMPT]
-      : ["sh", "-c", initCommandParts.join("; ")],
+    // initCommandParts is not only the prompt write: it also creates the isolation roots under
+    // /runtime-cache, the Chrome BrowserMetrics link, the tool-child RLIMIT files and the mcp.json
+    // copy, and the main container fails at startup without them. A runtime-prompt Job therefore
+    // runs every step first and the downloader last, so the downloader's exit status is the init
+    // container's. Replacing the whole command with the downloader dropped them all and every run
+    // died on `mkdir /runtime-cache/paperclip-runs/<run>/workspace: Permission denied`.
+    command: [
+      "sh",
+      "-c",
+      (runtimePromptUrl
+        ? [...initCommandParts, `exec node -e ${quoteShellArg(DOWNLOAD_RUNTIME_PROMPT)}`]
+        : initCommandParts
+      ).join("; "),
+    ],
     ...(initEnv.length > 0 ? { env: initEnv } : {}),
     volumeMounts: initVolumeMounts,
     securityContext,
     resources: {
       requests: { cpu: "10m", memory: "16Mi" },
-      limits: { cpu: "100m", memory: "64Mi" },
+      // A node process needs more than busybox's 64Mi; the opencode adapter's downloader uses 128Mi.
+      limits: { cpu: "100m", memory: runtimePromptUrl ? "128Mi" : "64Mi" },
     },
   };
 
