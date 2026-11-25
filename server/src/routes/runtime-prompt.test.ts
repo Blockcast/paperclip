@@ -46,6 +46,21 @@ describe("runtime prompt route", () => {
     );
   });
 
+  it("does not serve the one-shot prompt a second time", async () => {
+    mockReadRuntimePrompt
+      .mockResolvedValueOnce(Buffer.from("rendered prompt"))
+      .mockResolvedValueOnce(null);
+    const app = createApp({
+      type: "agent",
+      source: "agent_jwt",
+      runId: "run-1",
+      agentId: "agent-1",
+      companyId: "company-1",
+    });
+    expect((await request(app).get("/api/heartbeat-runs/run-1/runtime-prompt")).status).toBe(200);
+    expect((await request(app).get("/api/heartbeat-runs/run-1/runtime-prompt")).status).toBe(404);
+  });
+
   it.each([
     { type: "agent", source: "agent_jwt", runId: "run-2", agentId: "agent-1", companyId: "company-1" },
     { type: "agent", source: "agent_api_key", runId: "run-1", agentId: "agent-1", companyId: "company-1" },
