@@ -2674,7 +2674,9 @@ describe("buildJobManifest", () => {
       });
       const init = result.job.spec?.template?.spec?.initContainers?.[0];
       expect(init?.image).toBe(selfPod.image);
-      expect(init?.command?.[0]).toBe("node");
+      // The downloader runs last inside the same `sh -c` as the setup steps.
+      expect(init?.command?.slice(0, 2)).toEqual(["sh", "-c"]);
+      expect(init?.command?.[2]).toMatch(/; exec node -e '/);
       expect(init?.env).toContainEqual({
         name: "PAPERCLIP_RUNTIME_PROMPT_URL",
         value: `https://paperclip.example/api/heartbeat-runs/${ctx.runId}/runtime-prompt`,
@@ -2687,6 +2689,63 @@ describe("buildJobManifest", () => {
       });
       expect(result.promptSecret).toBeNull();
       expect(JSON.stringify(result.job)).not.toContain(result.prompt);
+    });
+
+    // Regression: the runtime-prompt path replaced the write-prompt command with the downloader
+    // alone, so the isolation-root mkdirs, Chrome link and tool-RLIMIT files never ran and every
+    // claude_k8s run died on `mkdir /runtime-cache/paperclip-runs/<run>/workspace: Permission denied`.
+    it("keeps every write-prompt setup step when the prompt is downloaded from the runtime API", () => {
+      // Run isolation is what puts the per-run roots on the /runtime-cache emptyDir, and the
+      // claude container has no way to create them itself.
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+      const ctxWithToken = { ...ctx, authToken: "signed-run-token" };
+      const selfPodWithApi = { ...selfPod, inheritedEnv: { PAPERCLIP_API_URL: "https://paperclip.example" } };
+      const initScript = (runtimePromptPath?: string) => {
+        const { job } = buildJobManifest({
+          ctx: ctxWithToken,
+          selfPod: selfPodWithApi,
+          ...(runtimePromptPath ? { runtimePromptPath } : {}),
+        });
+        const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
+        return init?.command?.[2] ?? "";
+      };
+      const baseline = initScript();
+      const downloaded = initScript(`/api/heartbeat-runs/${ctx.runId}/runtime-prompt`);
+      // Everything the env-var path runs except the prompt write itself.
+      const setupSteps = baseline.split("; ").filter((step) => !step.includes("PROMPT_CONTENT"));
+      expect(setupSteps.length).toBeGreaterThan(3);
+      for (const step of setupSteps) {
+        expect(downloaded).toContain(step);
+      }
+      expect(baseline).toContain("mkdir -p");
+      expect(baseline).toContain("rlimit.sh");
+      // The path the broken build died on: the run's workspace root must be created by the init
+      // container, ahead of the downloader.
+      const workspaceRoot = "'/runtime-cache/paperclip-runs/run-abc12345/workspace'";
+      expect(downloaded).toContain(workspaceRoot);
+      expect(downloaded.indexOf(workspaceRoot)).toBeLessThan(downloaded.indexOf("exec node -e"));
+      // The downloader is the last command, so its exit status is the init container's.
+      expect(downloaded.lastIndexOf("exec node -e")).toBeGreaterThan(downloaded.lastIndexOf(setupSteps[setupSteps.length - 1]!));
+      expect(downloaded).not.toContain("PROMPT_CONTENT");
+    });
+
+    it("sizes the init container for the node downloader only when it is used", () => {
+      const ctxWithToken = { ...ctx, authToken: "signed-run-token" };
+      const selfPodWithApi = { ...selfPod, inheritedEnv: { PAPERCLIP_API_URL: "https://paperclip.example" } };
+      const limit = (runtimePromptPath?: string) =>
+        buildJobManifest({ ctx: ctxWithToken, selfPod: selfPodWithApi, ...(runtimePromptPath ? { runtimePromptPath } : {}) })
+          .job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")?.resources?.limits?.memory;
+      expect(limit()).toBe("64Mi");
+      expect(limit(`/api/heartbeat-runs/${ctx.runId}/runtime-prompt`)).toBe("128Mi");
     });
 
     it("returns null promptSecret for small prompts", () => {
