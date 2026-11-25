@@ -187,7 +187,7 @@ when they were written.
 
 <!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3817`**
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3863`**
 (`asBoolean(config.enableGitHubPublishBroker, false)`). Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
 is re-resolved against the tree by `scripts/check-doc-line-anchors.mjs` on every PR, so these
@@ -195,9 +195,9 @@ numbers are checked continuously rather than as of any one reading:
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:4659`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:4712`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:5276`** (`!narrowWritableSurface`)) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:5329`** (`!narrowWritableSurface`)) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -262,28 +262,28 @@ The chain:
 
 <!-- anchor-file: server/src/services/heartbeat.ts -->
 
-1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8818`
+1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8854`
    (`function parseIssueAssigneeAdapterOverrides(`), parses
    `issue.assigneeAdapterOverrides.adapterConfig` with `parseObject` and **no key allowlist** —
    arbitrary keys pass.
-2. `mergeModelProfileAdapterConfig`, defined at `:7480`
+2. `mergeModelProfileAdapterConfig`, defined at `:7516`
    (`export function mergeModelProfileAdapterConfig(input: {`), is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` at `:39158`
+3. The merged object becomes `executionRunConfig` at `:39218`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
-4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3304`
+4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3326`
    (`function withAgentScopedEnvProvenance(`), re-asserts agent values for
    `AGENT_SCOPE_ONLY_ENV_KEYS` — three keys, **inside `env`**. It does nothing for top-level
    `adapterConfig` keys.
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:38554`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:38614`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
-The code already knows this class of problem. The comment at `:3287`
+The code already knows this class of problem. The comment at `:3309`
 (`is issue.assigneeAdapterOverrides.adapterConfig.`) says it in as many words:
 
 > `issueAdapterConfig` is `issue.assigneeAdapterOverrides.adapterConfig`.
@@ -552,7 +552,7 @@ runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface`
 `mode === "shared"` branch and its rationale comment in
 `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1335-1348`**
 (`if (mode === "shared") {`), with
-`narrowWritableSurface` itself defined at **`:4240`**
+`narrowWritableSurface` itself defined at **`:4293`**
 (`const narrowWritableSurface = isolation.enabled && dataClaimName !== "";`); before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
 ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
@@ -563,7 +563,7 @@ and `config.isolationMode` is not `isolated`/`isolate` — in
 `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1290`**
 (`const SHARED_JOB_ISOLATION: JobIsolation = {`)
 and returned at **`:1415`** (`return SHARED_JOB_ISOLATION`). The comment at
-**`:4218`** (`only a config-only run`) names it: *"only a config-only run
+**`:4271`** (`only a config-only run`) names it: *"only a config-only run
 with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
 therefore a property of **the server supplying a descriptor on every render**, not of configuration.
 A run path that stops supplying one renders broad — and once the gate is on, that stops being a
@@ -1080,8 +1080,8 @@ closed unmerged. A ledger that reads `merged` as the discharge condition would c
 outstanding forever. Re-verified at source — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
 (`server/src/services/agent-config-key-pins.ts:99`
 (`const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([`)), `withAgentScopedConfigProvenance`
-(defined `server/src/services/heartbeat.ts:3331`
-(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7490`
+(defined `server/src/services/heartbeat.ts:3353`
+(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7526`
 (`return withAgentScopedConfigProvenance(`)), `BROKERED_POD_COMPOSITION_CONFIG_KEYS`
 (`server/src/services/agent-config-key-pins.ts:272`
 (`const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([`), three keys),
