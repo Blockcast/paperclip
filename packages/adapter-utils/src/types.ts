@@ -236,6 +236,8 @@ export interface AdapterExecutionContext {
   onExternalRuntimeLaunched?: (identity: { jobName: string; jobUid: string }) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
+  /** Stage a private rendered prompt for an out-of-process adapter runtime. */
+  stageRuntimePrompt?: (prompt: string) => Promise<string>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   authToken?: string;
 }
