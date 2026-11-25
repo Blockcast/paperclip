@@ -23,6 +23,7 @@ import { folderRoutes } from "./routes/folders.js";
 import { summarySlotRoutes } from "./routes/summary-slots.js";
 import { teamsCatalogRoutes } from "./routes/teams-catalog.js";
 import { agentRoutes } from "./routes/agents.js";
+import { runtimePromptRoutes } from "./routes/runtime-prompt.js";
 import { projectRoutes } from "./routes/projects.js";
 import { issueRoutes } from "./routes/issues.js";
 import { issueTreeControlRoutes } from "./routes/issue-tree-control.js";
@@ -597,6 +598,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   api.use(builtInAgentRoutes(db));
   api.use(summarySlotRoutes(db));
   api.use(teamsCatalogRoutes(db));
+  api.use(runtimePromptRoutes(db));
   api.use(agentRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(assetRoutes(db, opts.storageService));
   api.use(projectRoutes(db));

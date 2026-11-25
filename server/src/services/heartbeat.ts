@@ -660,6 +660,7 @@ import { parseExecutionPolicyBootstrapEnv } from "./execution-policy-bootstrap.j
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { environmentRunOrchestrator, EnvironmentRunError } from "./environment-run-orchestrator.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
+import { stageRuntimePrompt as persistRuntimePrompt } from "./runtime-prompt.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
@@ -41419,6 +41420,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 onRuntimeProgress: async (progress) => {
                   await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
                 },
+                stageRuntimePrompt: agent.adapterType === "opencode_k8s" && authToken
+                  ? (prompt) => persistRuntimePrompt(db, {
+                      runId: run.id,
+                      companyId: agent.companyId,
+                      agentId: agent.id,
+                      prompt,
+                    })
+                  : undefined,
                 onExternalRuntimeLaunched: executionReservation
                   ? async ({ jobName, jobUid }) => {
                        const stamped = await recordExternalRuntimeJobIdentity(db, {

@@ -69,6 +69,7 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import { sweepExpiredRuntimePrompts } from "./services/runtime-prompt.js";
 import {
   HEARTBEAT_TIMER_LEASE,
   SCHEDULER_LEASE_RENEW_INTERVAL_MS,
@@ -1258,6 +1259,7 @@ export async function startServer(): Promise<StartedServer> {
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
   let workerHeartbeat: ReturnType<typeof heartbeatService> | null = null;
   let heartbeatSchedulerStopped = false;
+  let nextRuntimePromptSweepAt = 0;
   let heartbeatStartupRecoveryPending = false;
   /**
    * BLO-49303. Holds the recovery gate closed from `onAcquire` until the
@@ -2315,6 +2317,12 @@ export async function startServer(): Promise<StartedServer> {
         }
 
         if (heartbeatSchedulerStopped) return;
+        if (Date.now() >= nextRuntimePromptSweepAt) {
+          nextRuntimePromptSweepAt = Date.now() + 60_000;
+          trackHeartbeatSchedulerWork(sweepExpiredRuntimePrompts(db).catch((err) => {
+            logger.error({ err }, "runtime prompt expiry sweep failed");
+          }));
+        }
         trackHeartbeatSchedulerWork(routines
           .tickScheduledTriggers(new Date())
           .then((result) => {
