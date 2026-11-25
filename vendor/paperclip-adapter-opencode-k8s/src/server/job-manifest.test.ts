@@ -1532,6 +1532,15 @@ describe("buildJobManifest — volume wiring branches", () => {
     expect(volumes.find((v) => v.name === "prompt-secret")?.secret?.secretName).toBe("prompt-x");
   });
 
+  it("unwraps a gzip prompt before running the agent, without embedding it in init env", () => {
+    const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod, promptSecretName: "prompt-x", promptSecretGzip: true });
+    const spec = result.job.spec?.template.spec;
+    const init = spec?.initContainers?.find((container) => container.name === "write-prompt");
+    expect(init?.command?.[2]).toContain("gzip -dc /tmp/prompt-secret/prompt.gz > /tmp/prompt/prompt.txt");
+    expect(init?.env?.some((env) => env.name === "PROMPT_CONTENT")).toBeFalsy();
+    expect(init?.volumeMounts).toContainEqual({ name: "prompt-secret", mountPath: "/tmp/prompt-secret", readOnly: true });
+  });
+
   it("mounts the data PVC at /paperclip when selfPod has a pvcClaimName", () => {
     const selfPod = { ...mockSelfPod, pvcClaimName: "paperclip-data" };
     const result = buildJobManifest({ ctx: mockCtx, selfPod });

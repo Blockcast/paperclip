@@ -398,6 +398,8 @@ export interface JobBuildInput {
    * Required when the prompt exceeds LARGE_PROMPT_THRESHOLD_BYTES.
    */
   promptSecretName?: string;
+  /** Read the gzip-encoded Secret key instead of the plain prompt key. */
+  promptSecretGzip?: boolean;
   /**
    * Claim name of the dedicated agent DB PVC (dedicated_pvc mode) or null for ephemeral emptyDir.
    * When provided (string or null), mounts /opencode-db and sets OPENCODE_DB=/opencode-db.
@@ -1918,7 +1920,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               // the main container writes; OPENCODE_CONFIG is only needed when
               // MCP entries replace that config source.
               const cmdParts = input.promptSecretName
-                ? ["cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
+                ? [input.promptSecretGzip
+                  ? "gzip -dc /tmp/prompt-secret/prompt.gz > /tmp/prompt/prompt.txt"
+                  : "cp /tmp/prompt-secret/prompt /tmp/prompt/prompt.txt"]
                 : [`printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt`];
               const initEnv: k8s.V1EnvVar[] = input.promptSecretName
                 ? []
@@ -1939,7 +1943,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                 name: "write-prompt",
                 image: "busybox:1.36",
                 imagePullPolicy: "IfNotPresent",
-                command: ["sh", "-c", cmdParts.join("; ")],
+                command: ["sh", "-c", cmdParts.join(" && ")],
                 ...(initEnv.length > 0 ? { env: initEnv } : {}),
                 volumeMounts: initVolumeMounts,
                 securityContext,

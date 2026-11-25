@@ -15,11 +15,15 @@ import {
 import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
+import { promisify } from "node:util";
+import { gzip } from "node:zlib";
 import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath, readRunIsolationDescriptor, sanitizeLabelValue } from "./job-manifest.js";
 import { SHARED_DOC_SECRET_VOLUME_NAME } from "./shared-doc-overlay.js";
 import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
+const MAX_PROMPT_SECRET_BYTES = 1024 * 1024;
+const gzipAsync = promisify(gzip);
 // How many consecutive transient (non-404) job-status read failures to tolerate
 // before giving up the completion wait. At POLL_INTERVAL_MS each, this rides out
 // brief apiserver blips without aborting a healthy run (BLO-10448).
@@ -1849,15 +1853,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath } = firstBuild;
 
-  // For prompts larger than the threshold, store in a K8s Secret
+  // Keep the per-run Secret transport; gzip prompts that exceed the API's
+  // decoded Secret data limit instead of dropping any prompt content.
   let promptSecretName: string | undefined;
+  let compressedPrompt: Buffer | undefined;
   let job = firstBuild.job;
   let envSecret = firstBuild.envSecret ?? null;
   let mcpConfigSecret = firstBuild.mcpConfigSecret ?? null;
   let sharedDocsSecret = firstBuild.sharedDocsSecret ?? null;
-  if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
+  const promptBytes = Buffer.byteLength(prompt, "utf-8");
+  if (promptBytes > LARGE_PROMPT_THRESHOLD_BYTES) {
+    if (promptBytes > MAX_PROMPT_SECRET_BYTES) {
+      compressedPrompt = await gzipAsync(prompt);
+    }
     promptSecretName = `${jobName}-prompt`;
-    const rebuilt = buildJobManifest({ ...buildArgs, promptSecretName });
+    const rebuilt = buildJobManifest({
+      ...buildArgs,
+      promptSecretName,
+      ...(compressedPrompt ? { promptSecretGzip: true } : {}),
+    });
     job = rebuilt.job;
     envSecret = rebuilt.envSecret ?? null;
     mcpConfigSecret = rebuilt.mcpConfigSecret ?? null;
@@ -1899,11 +1913,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // Create the prompt Secret before the Job
   if (promptSecretName) {
+    if (compressedPrompt && compressedPrompt.byteLength > MAX_PROMPT_SECRET_BYTES) {
+      const errorMessage = `Prompt Secret exceeds Kubernetes limit: ${promptBytes} raw bytes, ${compressedPrompt.byteLength} gzip bytes, limit ${MAX_PROMPT_SECRET_BYTES} bytes`;
+      await onLog("stderr", `[paperclip] ${errorMessage}\n`);
+      return { exitCode: null, signal: null, timedOut: false, errorMessage, errorCode: "k8s_job_create_failed" };
+    }
     const promptSecret: k8s.V1Secret = {
       apiVersion: "v1",
       kind: "Secret",
       metadata: { name: promptSecretName, namespace, labels: job.metadata?.labels },
-      stringData: { prompt },
+      ...(compressedPrompt
+        ? { data: { "prompt.gz": compressedPrompt.toString("base64") } }
+        : { stringData: { prompt } }),
     };
     try {
       await coreApi.createNamespacedSecret({ namespace, body: promptSecret });
@@ -1919,6 +1940,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Failed to create prompt Secret: ${msg}`,
         errorCode: "k8s_job_create_failed",
       };
+    }
+    if (compressedPrompt) {
+      await onLog("stdout", `[paperclip] Created gzip prompt Secret for job ${jobName} (${promptBytes} raw bytes, ${compressedPrompt.byteLength} gzip bytes)\n`);
     }
   }
 
