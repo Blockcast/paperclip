@@ -1330,9 +1330,16 @@ test("the real corpus still has anchors to check, and most of them are enforced"
   // checker would report clean while asserting nothing at all. A `drifted` anchor
   // is still one the checker resolved and judged, so it counts as enforced:
   // counting `ok` alone made master drift trip this floor (11 anchors drifted
-  // under the merge-queue tree, ok fell 35 -> 24; run 42602310293).
+  // under the merge-queue tree, ok fell 35 -> 24; run 42602310293). So does a
+  // `stale-number` anchor (PEN-6674): its construct was located, exactly once, so the
+  // detector is demonstrably reading what the document cites and only the line
+  // number is stale. Leaving that status out re-created the same tripwire when #3876
+  // moved code under 13 PEN-5016 anchors: ok fell 35 -> 22, below the floor, and
+  // `policy` went red on master and on every merge-queue entry (run 45587868108).
+  const enforced = (f) =>
+    f.status === "ok" || f.status === "drifted" || f.status === "stale-number";
   assert.ok(
-    findings.filter((f) => f.status === "ok" || f.status === "drifted").length >= 25,
+    findings.filter(enforced).length >= 25,
     "too few anchors are actually enforced",
   );
   assert.ok(
