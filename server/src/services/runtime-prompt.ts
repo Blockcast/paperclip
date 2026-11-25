@@ -1,4 +1,4 @@
-import { and, eq, gt, lte } from "drizzle-orm";
+import { and, eq, gt, inArray, lte } from "drizzle-orm";
 import {
   heartbeatRunRuntimePrompts,
   heartbeatRuns,
@@ -72,18 +72,21 @@ export async function readRuntimePrompt(
   now = new Date(),
 ): Promise<Buffer | null> {
   const row = await db
-    .select({ prompt: heartbeatRunRuntimePrompts.prompt })
-    .from(heartbeatRunRuntimePrompts)
-    .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, heartbeatRunRuntimePrompts.runId))
-    .where(
-      and(
-        eq(heartbeatRunRuntimePrompts.runId, input.runId),
-        eq(heartbeatRuns.companyId, input.companyId),
-        eq(heartbeatRuns.agentId, input.agentId),
-        gt(heartbeatRunRuntimePrompts.expiresAt, now),
-        eq(heartbeatRuns.status, "running"),
+    .delete(heartbeatRunRuntimePrompts)
+    .where(and(
+      eq(heartbeatRunRuntimePrompts.runId, input.runId),
+      gt(heartbeatRunRuntimePrompts.expiresAt, now),
+      inArray(
+        heartbeatRunRuntimePrompts.runId,
+        db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, input.runId),
+          eq(heartbeatRuns.companyId, input.companyId),
+          eq(heartbeatRuns.agentId, input.agentId),
+          eq(heartbeatRuns.status, "running"),
+        )),
       ),
-    )
+    ))
+    .returning({ prompt: heartbeatRunRuntimePrompts.prompt })
     .then((rows) => rows[0] ?? null);
   return row ? Buffer.from(row.prompt) : null;
 }

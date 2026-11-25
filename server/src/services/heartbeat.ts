@@ -41420,7 +41420,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 onRuntimeProgress: async (progress) => {
                   await recordCurrentHeartbeatRunRuntimeProgress(run, progress, issueId);
                 },
-                stageRuntimePrompt: agent.adapterType === "opencode_k8s" && authToken
+                stageRuntimePrompt: (agent.adapterType === "opencode_k8s" || agent.adapterType === "claude_k8s") && authToken
                   ? (prompt) => persistRuntimePrompt(db, {
                       runId: run.id,
                       companyId: agent.companyId,
