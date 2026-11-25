@@ -2105,6 +2105,7 @@ describe("execute: job creation", () => {
     try {
       const result = await execute(makeCtx({
         authToken: "signed-run-token",
+        config: { podScheduleTimeoutSec: 0 },
         stageRuntimePrompt,
       } as Partial<AdapterExecutionContext>));
       expect(stageRuntimePrompt).toHaveBeenCalledWith(expect.any(String));
