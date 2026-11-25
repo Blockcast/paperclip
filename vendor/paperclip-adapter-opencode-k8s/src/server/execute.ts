@@ -1853,6 +1853,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const firstBuild = buildJobManifest(buildArgs);
   const { jobName, namespace, prompt, opencodeArgs, promptMetrics, podLogPath } = firstBuild;
 
+  const { stageRuntimePrompt } = ctx as AdapterExecutionContext & {
+    stageRuntimePrompt?: (prompt: string) => Promise<string>;
+  };
   // Keep the per-run Secret transport; gzip prompts that exceed the API's
   // decoded Secret data limit instead of dropping any prompt content.
   let promptSecretName: string | undefined;
@@ -1862,7 +1865,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let mcpConfigSecret = firstBuild.mcpConfigSecret ?? null;
   let sharedDocsSecret = firstBuild.sharedDocsSecret ?? null;
   const promptBytes = Buffer.byteLength(prompt, "utf-8");
-  if (promptBytes > LARGE_PROMPT_THRESHOLD_BYTES) {
+  if (stageRuntimePrompt) {
+    try {
+      const runtimePromptPath = await stageRuntimePrompt(prompt);
+      const rebuilt = buildJobManifest({ ...buildArgs, runtimePromptPath });
+      job = rebuilt.job;
+      envSecret = rebuilt.envSecret ?? null;
+      mcpConfigSecret = rebuilt.mcpConfigSecret ?? null;
+      sharedDocsSecret = rebuilt.sharedDocsSecret ?? null;
+    } catch {
+      await onLog("stderr", "[paperclip] Failed to prepare the runtime prompt download\n");
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: "Failed to prepare the runtime prompt download",
+        errorCode: "k8s_job_create_failed",
+      };
+    }
+  } else if (promptBytes > LARGE_PROMPT_THRESHOLD_BYTES) {
     if (promptBytes > MAX_PROMPT_SECRET_BYTES) {
       compressedPrompt = await gzipAsync(prompt);
     }
