@@ -107,7 +107,7 @@ RUN usermod -u "$USER_UID" --non-unique node \
 # replay smoke next to the pin so every runtime image proves the released binary.
 ARG CLAUDE_CODE_VERSION=2.1.322
 ARG CODEX_CLI_VERSION=0.167.0
-ARG OPENCODE_AI_VERSION=1.19.5
+ARG OPENCODE_AI_VERSION=1.19.6
 ARG GEMINI_CLI_VERSION=0.50.0
 COPY scripts/smoke/opencode-responses-replay.mjs /tmp/opencode-responses-replay.mjs
 RUN --mount=type=cache,target=/root/.npm,sharing=locked \
