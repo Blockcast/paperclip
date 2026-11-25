@@ -13,6 +13,7 @@ import {
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import { buildJobManifest, buildPodLogPath } from "./job-manifest.js";
 
 // Mock node:fs/promises so tailPodLogFile (used by execute()) reads a
@@ -1881,12 +1882,12 @@ describe("execute — external cancel polling", () => {
 describe("execute — large-prompt Secret path", () => {
   const LARGE_PROMPT = "x".repeat(300 * 1024); // 300 KiB > 256 KiB threshold
 
-  function mockLargePrompt() {
+  function mockLargePrompt(prompt = LARGE_PROMPT) {
     vi.mocked(buildJobManifest).mockReturnValue({
       job: MOCK_JOB as ReturnType<typeof buildJobManifest>["job"],
       jobName: JOB_NAME,
       namespace: NAMESPACE,
-      prompt: LARGE_PROMPT,
+      prompt,
       opencodeArgs: [],
       promptMetrics: null,
       podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
@@ -1929,6 +1930,46 @@ describe("execute — large-prompt Secret path", () => {
     const secretOrder = coreApi.createNamespacedSecret.mock.invocationCallOrder[0];
     const jobOrder = batchApi.createNamespacedJob.mock.invocationCallOrder[0];
     expect(secretOrder).toBeLessThan(jobOrder);
+  });
+
+  it("preserves an oversized UTF-8 prompt in a Secret accepted before Job creation", async () => {
+    const prompt = "🧪 context\n".repeat(90_000);
+    expect(Buffer.byteLength(prompt)).toBeGreaterThan(1024 * 1024);
+    mockLargePrompt(prompt);
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+    coreApi.createNamespacedSecret.mockImplementation(async ({ body }) => {
+      const bytes = Buffer.byteLength(body.stringData?.prompt ?? "")
+        + Buffer.from(body.data?.["prompt.gz"] ?? "", "base64").byteLength;
+      if (bytes > 1024 * 1024) throw new Error("422 FieldValueTooLong");
+      return {};
+    });
+
+    await execute(makeCtx());
+
+    expect(batchApi.createNamespacedJob).toHaveBeenCalledOnce();
+    expect(vi.mocked(buildJobManifest).mock.calls[1][0]).toMatchObject({ promptSecretGzip: true });
+    const { body } = coreApi.createNamespacedSecret.mock.calls[0][0];
+    expect(body.stringData).toBeUndefined();
+    expect(gunzipSync(Buffer.from(body.data["prompt.gz"], "base64")).toString("utf8")).toBe(prompt);
+  });
+
+  it("reports size without submitting a Secret or Job if gzip still exceeds the API limit", async () => {
+    const prompt = createHash("shake256", { outputLength: 1100 * 1024 }).update("oversized prompt fixture").digest("base64");
+    mockLargePrompt(prompt);
+    const coreApi = makeCoreApi();
+    const batchApi = makeBatchApi();
+    vi.mocked(getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof getCoreApi>);
+    vi.mocked(getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof getBatchApi>);
+
+    expect(await execute(makeCtx())).toMatchObject({
+      errorCode: "k8s_job_create_failed",
+      errorMessage: expect.stringMatching(/^Prompt Secret exceeds Kubernetes limit: \d+ raw bytes, \d+ gzip bytes, limit 1048576 bytes$/),
+    });
+    expect(coreApi.createNamespacedSecret).not.toHaveBeenCalled();
+    expect(batchApi.createNamespacedJob).not.toHaveBeenCalled();
   });
 
   it("patches the Secret with a Job ownerReference after Job creation", async () => {
