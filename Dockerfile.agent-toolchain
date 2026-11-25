@@ -502,6 +502,10 @@ ENV CARGO_HOME=/home/node/.cargo
 # satisfied regardless of the base distro's codec versions. libnuma1 is
 # libx265.so.199's transitive dep and is not otherwise pulled in.
 #
+# BLO-33389: the :stable publisher tag later moved to a trixie-built ffmpeg linking
+# libx265.so.215 / libvpx.so.9. Install those from apt too so either publisher
+# base loads (the .199/.7 copies below stay for the bookworm-built digest).
+#
 # libsrt.so.1.5 is a THIRD drift, missed when this stage was written: trixie
 # ships libsrt.so.1.5 only via libsrt1.5-openssl/libsrt1.5-gnutls, and neither
 # is installed here, so the copied binary could not load at all. Copy it from
@@ -511,6 +515,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
        libx264-164 libaom3 libopus0 libnuma1 \
        libfreetype6 libharfbuzz0b libfontconfig1 libgomp1 libssl3 \
+       libx265-215 libvpx9 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=ffmpeg-publisher \
      /usr/lib/x86_64-linux-gnu/libx265.so.199* /usr/lib/x86_64-linux-gnu/
