@@ -3764,7 +3764,32 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Build Job manifest
-    const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle, promptBundleProjection, promptBundleSkillLinks });
+    const { stageRuntimePrompt } = effectiveCtx as AdapterExecutionContext & {
+      stageRuntimePrompt?: (prompt: string) => Promise<string>;
+    };
+    let built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle, promptBundleProjection, promptBundleSkillLinks });
+    if (stageRuntimePrompt) {
+      try {
+        const runtimePromptPath = await stageRuntimePrompt(built.prompt);
+        built = buildJobManifest({
+          ctx: effectiveCtx,
+          selfPod,
+          promptBundle,
+          promptBundleProjection,
+          promptBundleSkillLinks,
+          runtimePromptPath,
+        });
+      } catch {
+        await onLog("stderr", "[paperclip] Failed to prepare the runtime prompt download\n");
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Failed to prepare the runtime prompt download",
+          errorCode: "k8s_job_create_failed",
+        };
+      }
+    }
     const job = built.job;
     jobName = built.jobName;
     namespace = built.namespace;
