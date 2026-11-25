@@ -4196,6 +4196,15 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/heartbeat-runs/{runId}/runtime-prompt",
+  tags: ["runs"],
+  summary: "Read the staged runtime prompt for the calling run (agent JWT of that run only)",
+  request: { params: z.object({ runId: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/heartbeat-runs/{runId}/workspace-operations",
   tags: ["runs"],
   summary: "List workspace operations for a run",
