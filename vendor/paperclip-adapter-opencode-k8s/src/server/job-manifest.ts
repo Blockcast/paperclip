@@ -977,6 +977,71 @@ function providerConfig(agent: { id: string; name?: string | null }): Record<str
   return {
     anthropic: { options: { headers } },
     openai: { options: { chunkTimeout: OPENAI_PROVIDER_CHUNK_TIMEOUT_MS, headers } },
+    [PENSTOCK_KIMI_PROVIDER_ID]: penstockKimiProvider(headers),
+  };
+}
+
+/**
+ * Kimi Code subscription (kimi.ai) served THROUGH Penstock, selected with a
+ * `penstock-kimi/<model>` agent model (e.g. `penstock-kimi/kimi-for-coding`).
+ *
+ * Penstock relays any vault-held custom provider at
+ * `/v1/providers/<id>/<upstream path>` with the org key as bearer, so this block
+ * points the openai-compatible SDK at `${OPENAI_BASE_URL}/providers/kimi/coding/v1`
+ * (OPENAI_BASE_URL is `https://api.penstock.run/v1` on this fleet). The Kimi
+ * credential lives only in the vault node; the Job holds the Penstock org key it
+ * already holds for the `openai` provider, so nothing new is exposed to agents.
+ *
+ * Deliberately NOT configurable per agent: a baseURL taken from adapterConfig
+ * would let anyone who can edit an agent aim `{env:OPENAI_API_KEY}` (the org key)
+ * at an arbitrary host. Both values are `{env:...}` placeholders that opencode
+ * resolves inside the pod. An agent never selects this provider unless its model
+ * says so, so the block is inert for every other agent; if the vault has no `kimi`
+ * custom provider the request fails with a Penstock 4xx, it does not fall back.
+ *
+ * Model ids come from the `kimi-code-plan-global` entry on models.dev. The upstream HOST is
+ * owned by the vault node's custom-provider config, not by this block (kimi.ai and kimi.com
+ * accounts use different hosts and keys).
+ */
+const PENSTOCK_KIMI_PROVIDER_ID = "penstock-kimi";
+const PENSTOCK_KIMI_MODELS: ReadonlyArray<{ id: string; name: string; context: number; output: number }> = [
+  // Context windows are the `context_length` values the live Kimi Code `/models` returned for a
+  // global (kimi.ai) subscription on 2026-11-26 (opencode-kimi-subscription's model cache);
+  // output limits stay conservative because `/models` does not report them. Every model is
+  // thinking-only. The two `highspeed` variants cost 2x usage on the same shared quota
+  // (K3.1 Pro Highspeed is labelled "2x Usage Cost" upstream), so prefer the plain ids.
+  { id: "kimi-for-coding", name: "Kimi For Coding", context: 1_048_576, output: 32_768 },
+  { id: "kimi-for-coding-highspeed", name: "Kimi For Coding HighSpeed", context: 262_144, output: 32_768 },
+  { id: "k3", name: "Kimi K3", context: 1_048_576, output: 65_536 },
+  { id: "k3-256k", name: "Kimi K3-256K", context: 262_144, output: 65_536 },
+  { id: "k3.1-pro", name: "Kimi K3.1 Pro", context: 1_048_576, output: 65_536 },
+  { id: "k3.1-pro-highspeed", name: "Kimi K3.1 Pro Highspeed (2x usage cost)", context: 1_048_576, output: 65_536 },
+];
+
+function penstockKimiProvider(headers: Record<string, string>): Record<string, unknown> {
+  return {
+    name: "Kimi Code (via Penstock)",
+    npm: "@ai-sdk/openai-compatible",
+    options: {
+      baseURL: "{env:OPENAI_BASE_URL}/providers/kimi/coding/v1",
+      apiKey: "{env:OPENAI_API_KEY}",
+      chunkTimeout: OPENAI_PROVIDER_CHUNK_TIMEOUT_MS,
+      headers,
+    },
+    models: Object.fromEntries(
+      PENSTOCK_KIMI_MODELS.map((m) => [
+        m.id,
+        {
+          name: m.name,
+          tool_call: true,
+          reasoning: true,
+          // These models reject any temperature other than 1, so hide the knob (as
+          // opencode-kimi-subscription does) and opencode never sends a default.
+          temperature: false,
+          limit: { context: m.context, output: m.output },
+        },
+      ]),
+    ),
   };
 }
 

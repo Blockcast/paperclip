@@ -2136,6 +2136,80 @@ describe("buildJobManifest — environment.config wiring (Phase E.2)", () => {
       };
       expect(parsed.provider?.openai?.options?.chunkTimeout).toBe(240_000);
     });
+    // Kimi Code subscription through Penstock's custom-provider relay
+    // (/v1/providers/kimi/...). The block rides both config paths because
+    // opencode does not merge config sources, and it must never take its host
+    // or key from adapterConfig: only {env:...} placeholders resolved in the pod.
+    type KimiProviderShape = {
+      provider?: {
+        "penstock-kimi"?: {
+          npm?: string;
+          options?: { baseURL?: string; apiKey?: string; headers?: Record<string, string>; chunkTimeout?: number };
+          models?: Record<string, { tool_call?: boolean; reasoning?: boolean; temperature?: boolean; limit?: { context?: number; output?: number } }>;
+        };
+      };
+    };
+
+    function expectKimiProvider(parsed: KimiProviderShape): void {
+      const kimi = parsed.provider?.["penstock-kimi"];
+      expect(kimi?.npm).toBe("@ai-sdk/openai-compatible");
+      expect(kimi?.options?.baseURL).toBe("{env:OPENAI_BASE_URL}/providers/kimi/coding/v1");
+      expect(kimi?.options?.apiKey).toBe("{env:OPENAI_API_KEY}");
+      expect(kimi?.options?.headers).toEqual({ "x-penstock-session": "agent:Test Agent" });
+      expect(kimi?.options?.chunkTimeout).toBe(240_000);
+      expect(Object.keys(kimi?.models ?? {}).sort()).toEqual(
+        ["k3", "k3-256k", "k3.1-pro", "k3.1-pro-highspeed", "kimi-for-coding", "kimi-for-coding-highspeed"].sort(),
+      );
+      expect(kimi?.models?.["kimi-for-coding"]).toEqual({
+        name: "Kimi For Coding",
+        tool_call: true,
+        reasoning: true,
+        temperature: false,
+        limit: { context: 1_048_576, output: 32_768 },
+      });
+      // Kimi rejects temperature != 1: every model must hide the knob so none is sent.
+      for (const model of Object.values(kimi?.models ?? {})) expect(model.temperature).toBe(false);
+    }
+
+    it("defines the penstock-kimi provider on the default (no-MCP) opencode.json", () => {
+      const result = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      expectKimiProvider(JSON.parse(match![1].replace(/'\\''/g, "'")) as KimiProviderShape);
+    });
+
+    it("defines the penstock-kimi provider on the MCP-path Secret-backed opencode.json", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: {
+          mcpServers: {
+            paperclip: { command: "node", args: ["/app/packages/mcp-server/dist/stdio.js"] },
+          },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      expectKimiProvider(JSON.parse(result.mcpConfigSecret!.data["opencode.json"]!) as KimiProviderShape);
+    });
+
+    it("keeps the penstock-kimi host and key fixed when adapterConfig tries to set them", () => {
+      const ctx: JobBuildInput["ctx"] = {
+        ...mockCtx,
+        config: {
+          env: { OPENAI_BASE_URL: "https://evil.example/v1", KIMI_BASE_URL: "https://evil.example" },
+          provider: { "penstock-kimi": { options: { baseURL: "https://evil.example", apiKey: "stolen" } } },
+        },
+      };
+      const result = buildJobManifest({ ctx, selfPod: mockSelfPod });
+      const cmd = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      const match = cmd.match(/echo '([^']+(?:'\\''[^']*)*)' > \S*opencode\/opencode\.json/);
+      expect(match).toBeTruthy();
+      const json = match![1].replace(/'\\''/g, "'");
+      expectKimiProvider(JSON.parse(json) as KimiProviderShape);
+      expect(json).not.toContain("evil.example");
+      expect(json).not.toContain("stolen");
+    });
+
     // Per-agent Penstock attribution: every agent Job shares the one org API
     // key, so without a per-agent client-session header the whole fleet melts
     // into a single UNTAGGED bucket on the org_penstock consumption dashboard.
