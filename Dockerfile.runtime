@@ -23,9 +23,13 @@ RUN rm -f /etc/apt/apt.conf.d/docker-clean \
 # releases, so packages inherited from the base stay vulnerable even on a fresh
 # runtime build (BLO-54733: libbrotli1, libsqlite3-0, libpcre2-8-0, apt; same
 # cause as BLO-51885).
+# APT_EPOCH (ISO week) invalidates this layer even on a registry cache hit, so
+# Debian security fixes land weekly (BLO-58805). Its value is part of the RUN env.
+ARG APT_EPOCH
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-  apt-get update \
+  : "apt-epoch=${APT_EPOCH:?}" \
+  && apt-get update \
   && apt-get -y upgrade \
   && apt-get install -y --no-install-recommends \
        ca-certificates gosu curl git wget ripgrep python3 \

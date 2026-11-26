@@ -196,7 +196,8 @@ jobs:
             exit 1
           fi
           runtime_base_image="${runtime_base_ref%:*}@${runtime_base_digest}"
-          runtime_tag="$(scripts/container-base-tag.sh runtime "$runtime_base_image")"
+          apt_epoch="$(date -u +%G-W%V)"
+          runtime_tag="$(APT_EPOCH="$apt_epoch" scripts/container-base-tag.sh runtime "$runtime_base_image")"
           runtime_image="harbor.blockcast.net/paperclip/paperclip-runtime:${runtime_tag}"
           ffmpeg_ref="registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher:stable"
           ffmpeg_digest=""
@@ -245,6 +246,7 @@ jobs:
           fi
           {
             echo "runtime_base_image=${runtime_base_image}"
+            echo "apt_epoch=${apt_epoch}"
             echo "runtime_image=${runtime_image}"
             echo "runtime_exists=${runtime_exists}"
             echo "ffmpeg_image=${ffmpeg_image}"
@@ -266,6 +268,7 @@ jobs:
           sbom: false
           build-args: |
             RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}
+            APT_EPOCH=${{ steps.bases.outputs.apt_epoch }}
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip/paperclip-runtime:latest
           cache-to: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')) && 'type=inline' || '' }}
           tags: |

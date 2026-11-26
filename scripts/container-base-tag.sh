@@ -22,6 +22,8 @@ case "${1:-}" in
       printf 'paperclip-container-base-tag-v1\n'
       printf 'label=runtime\n'
       printf 'runtime-base-image=%s\n' "$runtime_base_image"
+      # Debian security updates move no other input, so roll the tag weekly (BLO-58805).
+      printf 'apt-epoch=%s\n' "${APT_EPOCH:?APT_EPOCH is required (date -u +%G-W%V)}"
       for file in \
         Dockerfile.runtime \
         scripts/smoke/opencode-responses-replay.mjs \
