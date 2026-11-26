@@ -506,15 +506,16 @@ describe("paperclip agent Dockerfile", () => {
     const script = path.join(repoRoot, "scripts/container-base-tag.sh");
     const tagScript = readFileSync(script, "utf8");
     const runtimeBaseImage = `harbor.blockcast.net/paperclip/node@sha256:${"c".repeat(64)}`;
-    const runtimeTag = execFileSync("bash", [script, "runtime", runtimeBaseImage], {
-      cwd: repoRoot,
-      encoding: "utf8",
-    }).trim();
-    const changedRuntimeBaseTag = execFileSync(
-      "bash",
-      [script, "runtime", `harbor.blockcast.net/paperclip/node@sha256:${"d".repeat(64)}`],
-      { cwd: repoRoot, encoding: "utf8" },
-    ).trim();
+    const runtimeTagFor = (base: string, aptEpoch: string) =>
+      execFileSync("bash", [script, "runtime", base], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, APT_EPOCH: aptEpoch },
+      }).trim();
+    const runtimeTag = runtimeTagFor(runtimeBaseImage, "2026-W48");
+    const changedRuntimeBaseTag = runtimeTagFor(`harbor.blockcast.net/paperclip/node@sha256:${"d".repeat(64)}`, "2026-W48");
+    // BLO-58805: a new ISO week must roll the tag so Debian security fixes land.
+    const changedAptEpochTag = runtimeTagFor(runtimeBaseImage, "2026-W49");
     const runtimeImage = `harbor.blockcast.net/paperclip/paperclip-runtime:${runtimeTag}`;
     const ffmpegImage = `registry.blockcast.net/blockcast/pim-multicast-gateway/ffmpeg-publisher@sha256:${"a".repeat(64)}`;
     const toolchainTag = execFileSync("bash", [script, "agent-toolchain", runtimeImage, ffmpegImage], {
@@ -529,6 +530,7 @@ describe("paperclip agent Dockerfile", () => {
 
     expect(runtimeTag).toMatch(/^runtime-[a-f0-9]{20}$/);
     expect(changedRuntimeBaseTag).not.toBe(runtimeTag);
+    expect(changedAptEpochTag).not.toBe(runtimeTag);
     expect(tagScript).toContain("scripts/smoke/opencode-responses-replay.mjs");
     expect(toolchainTag).toMatch(/^toolchain-[a-f0-9]{20}$/);
     expect(changedFfmpegTag).not.toBe(toolchainTag);
